@@ -17,7 +17,12 @@ from runpod_sdxl_image_studio.services.lora_catalog_service import (
     LoraCatalogError,
     LoraCatalogService,
 )
-from runpod_sdxl_image_studio.ui.components.lora_editor import render_state_updates
+from runpod_sdxl_image_studio.ui.components.lora_editor import (
+    LoraEditorComponents,
+    component_output_count_for_rows,
+    preserve_component_updates,
+    render_state_updates,
+)
 
 
 @dataclass(frozen=True)
@@ -206,6 +211,8 @@ def make_select_handler(
 def make_save_handler(
     catalog: LoraCatalogService,
     max_loras: int = 8,
+    *,
+    lora_editor: LoraEditorComponents | None = None,
 ) -> Callable[..., tuple[object, ...]]:
     def handler(
         selected: str | None,
@@ -228,7 +235,7 @@ def make_save_handler(
         if not selected:
             return (
                 "LoRAを選択してください。",
-                *metadata_save_preserve_updates(max_loras),
+                *metadata_save_preserve_updates(max_loras, lora_editor=lora_editor),
             )
         try:
             metadata = catalog.update_metadata(
@@ -260,7 +267,7 @@ def make_save_handler(
         except (LoraCatalogError, ValidationError, ValueError):
             return (
                 "入力値を確認してください。",
-                *metadata_save_preserve_updates(max_loras),
+                *metadata_save_preserve_updates(max_loras, lora_editor=lora_editor),
             )
 
     return handler
@@ -269,6 +276,8 @@ def make_save_handler(
 def make_favorite_handler(
     catalog: LoraCatalogService,
     max_loras: int = 8,
+    *,
+    lora_editor: LoraEditorComponents | None = None,
 ) -> Callable[..., tuple[object, ...]]:
     def handler(
         selected: str | None,
@@ -281,16 +290,20 @@ def make_favorite_handler(
         generation_category: str | None = None,
         generation_state: object = None,
     ) -> tuple[object, ...]:
-        output_count = 8 + 7 * max_loras
         if not selected:
-            return (gr.skip(), "LoRAを選択してください。") + (gr.skip(),) * (output_count - 2)
+            return (
+                gr.skip(),
+                "LoRAを選択してください。",
+                *metadata_favorite_preserve_updates(max_loras, lora_editor=lora_editor),
+            )
         try:
             metadata_id = UUID(selected)
         except ValueError:
             return (
                 gr.Checkbox(value=not favorite),
                 "選択対象のUUIDが不正です。",
-            ) + (gr.skip(),) * (output_count - 2)
+                *metadata_favorite_preserve_updates(max_loras, lora_editor=lora_editor),
+            )
         try:
             catalog.set_favorite(metadata_id, favorite)
             updates = _metadata_change_updates(
@@ -315,7 +328,7 @@ def make_favorite_handler(
             return (
                 gr.Checkbox(value=current.is_favorite if current else not favorite),
                 "保存に失敗しました。",
-                *(gr.skip() for _ in range(output_count - 2)),
+                *metadata_favorite_preserve_updates(max_loras, lora_editor=lora_editor),
             )
 
     return handler
@@ -384,18 +397,37 @@ def build_catalog_list_updates(
     )
 
 
-def metadata_save_preserve_updates(max_loras: int) -> tuple[object, ...]:
+def metadata_save_preserve_updates(
+    max_loras: int | None = None,
+    *,
+    lora_editor: LoraEditorComponents | None = None,
+) -> tuple[object, ...]:
     """Preserve every save-event output except its user-facing message."""
 
+    row_updates = (
+        preserve_component_updates(lora_editor)
+        if lora_editor is not None
+        else tuple(gr.skip() for _ in range(component_output_count_for_rows(max_loras or 0)))
+    )
     return (
         gr.skip(),  # result_list
         gr.skip(),  # selected
         gr.skip(),  # category_filter
         gr.skip(),  # generation choices
         gr.skip(),  # generation state
-        *(gr.skip() for _ in range(7 * max_loras)),
+        *row_updates,
         gr.skip(),  # add button
     )
+
+
+def metadata_favorite_preserve_updates(
+    max_loras: int | None = None,
+    *,
+    lora_editor: LoraEditorComponents | None = None,
+) -> tuple[object, ...]:
+    """Preserve the shared outputs after favorite's checkbox and message."""
+
+    return metadata_save_preserve_updates(max_loras, lora_editor=lora_editor)
 
 
 def _metadata_change_updates(

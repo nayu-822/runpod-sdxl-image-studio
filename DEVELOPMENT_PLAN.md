@@ -371,4 +371,22 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 
 Phase 2A is complete: multiple ordered LoRA selection, model/CLIP strengths, checkpoint-internal or external VAE selection, fixed workflow mapping, capability prevalidation, and bounded UI editing are implemented. See [PHASE_2A_IMPLEMENTATION.md](PHASE_2A_IMPLEMENTATION.md).
 
-Phase 2B remains for LoRA metadata and catalog features such as trigger words, categories, favorites, recommendations, previews, search, and presets.
+## Phase 2B status
+
+Phase 2B is complete: the SQLite LoRA metadata catalog, categories, favorites,
+recommendations, trigger words, previews, search, safe failure handling, and
+generation-form synchronization are implemented. LoRA presets remain deferred.
+
+## Phase 3A status
+
+Phase 3A is complete for the initial history foundation. Generation, Job, and
+Artifact records are persisted through Alembic-backed SQLite repositories.
+Resolved settings snapshots, status transitions, prompt IDs, UTC timestamps,
+image hashes, relative artifact paths, WebP history thumbnails, JSON sidecars,
+history paging, detail display, restore, derived regeneration, favorites, and
+notes are implemented. Basic unfinished-generation recovery checks prompt IDs
+without automatically resubmitting prompts.
+
+Phase 3B retains advanced history search (model, LoRA, seed, prompt, resolution,
+kind/status combinations), presets, preset schema migration, prompt diffs,
+recent-setting shortcuts, seed-copy helpers, and advanced derivation-tree UI.

@@ -1,4 +1,4 @@
-"""In-memory generation and progress models for Phase 1B."""
+"""Typed generation, progress, and result models."""
 
 from __future__ import annotations
 
@@ -6,7 +6,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import UUID
+
+if TYPE_CHECKING:
+    from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
 
 
 class GenerationStatus(StrEnum):
@@ -18,6 +22,50 @@ class GenerationStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class GenerationKind(StrEnum):
+    STANDARD = "standard"
+    DERIVED = "derived"
+    UPSCALE = "upscale"
+
+
+class GenerationErrorCode(StrEnum):
+    VALIDATION = "validation_error"
+    WORKFLOW = "workflow_error"
+    COMFYUI_CONNECTION = "comfyui_connection_error"
+    COMFYUI_PROMPT = "comfyui_prompt_error"
+    COMFYUI_EXECUTION = "comfyui_execution_error"
+    HISTORY_TIMEOUT = "history_timeout"
+    OUTPUT_NOT_FOUND = "output_not_found"
+    IMAGE_DOWNLOAD = "image_download_error"
+    IMAGE_VALIDATION = "image_validation_error"
+    STORAGE = "storage_error"
+    DATABASE = "database_error"
+    RECOVERY = "recovery_error"
+
+
+def is_valid_status_transition(current: GenerationStatus, target: GenerationStatus) -> bool:
+    """Return whether a persisted generation may move to ``target``."""
+
+    if current is target:
+        return True
+    allowed = {
+        GenerationStatus.PENDING: {
+            GenerationStatus.QUEUED,
+            GenerationStatus.FAILED,
+        },
+        GenerationStatus.QUEUED: {
+            GenerationStatus.RUNNING,
+            GenerationStatus.COMPLETED,
+            GenerationStatus.FAILED,
+        },
+        GenerationStatus.RUNNING: {
+            GenerationStatus.COMPLETED,
+            GenerationStatus.FAILED,
+        },
+    }
+    return target in allowed.get(current, set())
+
+
 @dataclass(frozen=True)
 class GenerationProgress:
     prompt_id: str = ""
@@ -27,6 +75,28 @@ class GenerationProgress:
     maximum: int | None = None
     percentage: float | None = None
     message: str = ""
+
+
+@dataclass(frozen=True)
+class Generation:
+    """Persisted generation record represented independently of SQLAlchemy."""
+
+    id: UUID
+    kind: GenerationKind
+    status: GenerationStatus
+    parent_generation_id: UUID | None
+    settings_snapshot: GenerationSettingsSnapshot
+    workflow_template_id: str
+    workflow_template_version: str
+    comfy_prompt_id: str | None
+    favorite: bool
+    user_note: str | None
+    error_code: str | None
+    error_summary: str | None
+    created_at: datetime
+    started_at: datetime | None
+    completed_at: datetime | None
+    updated_at: datetime
 
 
 @dataclass(frozen=True)

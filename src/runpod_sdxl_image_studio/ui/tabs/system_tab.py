@@ -5,12 +5,17 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
+from uuid import UUID
 
 import gradio as gr
 from pydantic import ValidationError
 
 from runpod_sdxl_image_studio.adapters.comfyui.models import ComfyUICapabilities
-from runpod_sdxl_image_studio.domain.generation import GenerationProgress, GenerationStatus
+from runpod_sdxl_image_studio.domain.generation import (
+    GenerationKind,
+    GenerationProgress,
+    GenerationStatus,
+)
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
 from runpod_sdxl_image_studio.services.comfyui_service import ComfyUIService
 from runpod_sdxl_image_studio.services.generation_service import GenerationService
@@ -70,6 +75,7 @@ class GenerationTabComponents:
     progress: gr.Markdown
     result_image: gr.Image
     result_details: gr.Markdown
+    restored_from_generation: gr.State
 
 
 def capability_refresh_outputs(generation: GenerationTabComponents) -> tuple[Any, ...]:
@@ -120,7 +126,9 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
         width = gr.Number(value=1024, precision=0, label="Width")
         height = gr.Number(value=1024, precision=0, label="Height")
     with gr.Row():
-        seed_mode = gr.Radio(["Random", "Fixed"], value="Random", label="Seed mode")
+        seed_mode = gr.Radio(
+            ["Random", "Fixed", "Previous seed"], value="Random", label="Seed mode"
+        )
         seed = gr.Number(value=-1, precision=0, label="Seed")
     with gr.Accordion("Advanced", open=False):
         with gr.Row():
@@ -166,6 +174,7 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
         progress=progress,
         result_image=result_image,
         result_details=result_details,
+        restored_from_generation=gr.State(None),
     )
 
 
@@ -263,6 +272,7 @@ def make_generate_handler(
         scheduler: str | None,
         vae: str | None = None,
         lora_state: object = None,
+        restored_from_generation_id: str | None = None,
         progress: gr.Progress = _DEFAULT_PROGRESS,
     ) -> tuple[object, ...]:
         del size_preset
@@ -296,7 +306,33 @@ def make_generate_handler(
         def on_progress(update: GenerationProgress) -> None:
             report_gradio_progress(progress, update)
 
-        result = await service.generate(generation_settings, on_progress)
+        if seed_mode == "Previous seed" and not restored_from_generation_id:
+            return (
+                gr.Button("Generate", interactive=True),
+                "",
+                None,
+                "復元元Generationがありません。",
+            )
+        parent_id: UUID | None = None
+        if restored_from_generation_id:
+            try:
+                parent_id = UUID(restored_from_generation_id)
+            except ValueError:
+                return (
+                    gr.Button("Generate", interactive=True),
+                    "",
+                    None,
+                    "復元元Generationが不正です。",
+                )
+        if parent_id is None:
+            result = await service.generate(generation_settings, on_progress)
+        else:
+            result = await service.generate(
+                generation_settings,
+                on_progress,
+                parent_generation_id=parent_id,
+                kind=GenerationKind.DERIVED,
+            )
         if result.status is GenerationStatus.COMPLETED and result.stored_image is not None:
             details = (
                 f"Generation ID: `{result.generation_id}`\n"

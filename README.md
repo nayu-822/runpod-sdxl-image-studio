@@ -1,5 +1,20 @@
 # RunPod SDXL Image Studio
 
+## Phase 3A: 生成履歴・snapshot・再生成
+
+Phase 3A adds SQLite-backed `Generation`, `GenerationJob`, and
+`GenerationArtifact` records. Resolved generation settings, including the
+実使用seed and ordered LoRA strengths, are stored as schema-versioned JSON
+snapshots. Completed images receive relative-path image, thumbnail, and UTF-8
+sidecar metadata artifacts under `<IMAGE_STUDIO_DATA_DIR>/generations/YYYY-MM-DD/`.
+
+The history tab supports date/status/favorite/kind-capable paging through the
+service API, detail display, setting restoration, same-condition derived
+generation, favorites, and 2,000-character notes. Unfinished records can be
+checked without resubmitting prompts. Phase 3B features such as advanced
+search, presets, prompt diff, and batch generation remain deferred. Gradio 5
+(`>=5,<6`) remains the supported version.
+
 ## Phase 2B: LoRA metadata catalog
 
 Phase 2B adds a local SQLite catalog for LoRA metadata. The default database is

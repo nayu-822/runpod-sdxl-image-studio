@@ -87,6 +87,12 @@ class Settings(BaseSettings):
     lora_thumbnail_max_edge: int = Field(
         512, validation_alias="IMAGE_STUDIO_LORA_THUMBNAIL_MAX_EDGE"
     )
+    history_page_size: int = Field(20, validation_alias="IMAGE_STUDIO_HISTORY_PAGE_SIZE")
+    history_thumbnail_max_edge: int = Field(
+        384, validation_alias="IMAGE_STUDIO_HISTORY_THUMBNAIL_MAX_EDGE"
+    )
+    stale_pending_seconds: int = Field(300, validation_alias="IMAGE_STUDIO_STALE_PENDING_SECONDS")
+    recovery_max_items: int = Field(50, validation_alias="IMAGE_STUDIO_RECOVERY_MAX_ITEMS")
     max_trigger_words: int = Field(50, validation_alias="IMAGE_STUDIO_MAX_TRIGGER_WORDS")
     max_compatible_models: int = Field(20, validation_alias="IMAGE_STUDIO_MAX_COMPATIBLE_MODELS")
 
@@ -128,11 +134,36 @@ class Settings(BaseSettings):
         "lora_thumbnail_max_edge",
         "max_trigger_words",
         "max_compatible_models",
+        "history_page_size",
+        "history_thumbnail_max_edge",
+        "stale_pending_seconds",
+        "recovery_max_items",
     )
     @classmethod
     def validate_positive_integer(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("configured limits must be greater than zero")
+        return value
+
+    @field_validator("history_page_size")
+    @classmethod
+    def validate_history_page_size(cls, value: int) -> int:
+        if value > 100:
+            raise ValueError("history_page_size must not exceed 100")
+        return value
+
+    @field_validator("history_thumbnail_max_edge")
+    @classmethod
+    def validate_history_thumbnail_edge(cls, value: int) -> int:
+        if value > 2048:
+            raise ValueError("history_thumbnail_max_edge must not exceed 2048")
+        return value
+
+    @field_validator("recovery_max_items")
+    @classmethod
+    def validate_recovery_max_items(cls, value: int) -> int:
+        if value > 100:
+            raise ValueError("recovery_max_items must not exceed 100")
         return value
 
     @field_validator("max_upscale_factor")

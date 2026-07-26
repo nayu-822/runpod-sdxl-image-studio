@@ -36,11 +36,16 @@ from runpod_sdxl_image_studio.services.lora_catalog_service import (
     LoraCatalogError,
     LoraCatalogService,
 )
+from runpod_sdxl_image_studio.ui.components.lora_editor import (
+    build_lora_editor,
+    component_outputs,
+)
 from runpod_sdxl_image_studio.ui.tabs.lora_management_tab import (
     build_catalog_list_updates,
     make_favorite_handler,
     make_save_handler,
     make_select_handler,
+    metadata_save_preserve_updates,
 )
 
 
@@ -280,6 +285,15 @@ def test_metadata_changes_refresh_catalog_and_generation_views(tmp_path: Path) -
     invalid = favorite("not-a-uuid", True)
     assert invalid[0].value is False
     assert "UUID" in invalid[1]
+
+
+def test_metadata_save_preserve_updates_follow_editor_output_structure() -> None:
+    with gr.Blocks():
+        editor = build_lora_editor(2)
+        updates = metadata_save_preserve_updates(lora_editor=editor)
+
+    assert len(updates) == 6 + len(component_outputs(editor))
+    assert 1 + len(updates) == 7 + 7 * 2
 
 
 def _assert_skip_updates(updates: tuple[object, ...]) -> None:

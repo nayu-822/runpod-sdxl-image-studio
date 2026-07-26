@@ -6,7 +6,7 @@ import json
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import Boolean, DateTime, Index, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from runpod_sdxl_image_studio.domain.lora_metadata import LoraMetadata
@@ -77,6 +77,81 @@ class LoraMetadataModel(Base):
             updated_at=metadata.updated_at,
         )
 
+
+class GenerationModel(Base):
+    __tablename__ = "generations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    parent_generation_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("generations.id", ondelete="RESTRICT"), nullable=True
+    )
+    settings_snapshot_json: Mapped[str] = mapped_column(Text, nullable=False)
+    snapshot_schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    workflow_template_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    workflow_template_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    comfy_prompt_id: Mapped[str | None] = mapped_column(String(100), nullable=True, unique=True)
+    favorite: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    user_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class GenerationArtifactModel(Base):
+    __tablename__ = "generation_artifacts"
+    __table_args__ = (
+        UniqueConstraint("generation_id", "artifact_type", "sha256", name="uq_generation_artifact"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    generation_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("generations.id", ondelete="CASCADE"), nullable=False
+    )
+    artifact_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    local_path: Mapped[str] = mapped_column(String(1000), nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    width: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    height: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mime_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class GenerationJobModel(Base):
+    __tablename__ = "generation_jobs"
+    __table_args__ = (UniqueConstraint("generation_id", name="uq_generation_job_generation"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    generation_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("generations.id", ondelete="CASCADE"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    comfy_prompt_id: Mapped[str | None] = mapped_column(String(100), nullable=True, unique=True)
+    progress_value: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    progress_maximum: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    current_node: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+Index("ix_generations_created_at", GenerationModel.created_at)
+Index("ix_generations_status", GenerationModel.status)
+Index("ix_generations_kind", GenerationModel.kind)
+Index("ix_generations_favorite", GenerationModel.favorite)
+Index("ix_generations_parent", GenerationModel.parent_generation_id)
+Index("ix_generations_prompt", GenerationModel.comfy_prompt_id)
+Index("ix_generation_artifacts_generation", GenerationArtifactModel.generation_id)
+Index("ix_generation_jobs_generation", GenerationJobModel.generation_id)
+Index("ix_generation_jobs_prompt", GenerationJobModel.comfy_prompt_id)
 
 Index("ix_lora_metadata_category", LoraMetadataModel.category)
 Index("ix_lora_metadata_favorite", LoraMetadataModel.is_favorite)

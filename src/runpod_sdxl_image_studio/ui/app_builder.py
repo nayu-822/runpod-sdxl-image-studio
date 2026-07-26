@@ -11,14 +11,31 @@ from runpod_sdxl_image_studio.adapters.database.engine import (
     create_image_studio_engine,
     create_session_factory,
 )
+from runpod_sdxl_image_studio.adapters.database.repositories.generation_repository import (
+    GenerationArtifactRepository,
+    GenerationJobRepository,
+    GenerationRepository,
+)
 from runpod_sdxl_image_studio.adapters.database.repositories.lora_metadata_repository import (
     LoraMetadataRepository,
+)
+from runpod_sdxl_image_studio.adapters.storage.generation_metadata_storage import (
+    GenerationMetadataStorage,
+)
+from runpod_sdxl_image_studio.adapters.storage.history_thumbnail_storage import (
+    HistoryThumbnailStorage,
 )
 from runpod_sdxl_image_studio.adapters.storage.local_storage import LocalStorageAdapter
 from runpod_sdxl_image_studio.adapters.storage.lora_thumbnail_storage import LoraThumbnailStorage
 from runpod_sdxl_image_studio.config import Settings, get_settings
 from runpod_sdxl_image_studio.domain.lora_search import append_trigger_words
 from runpod_sdxl_image_studio.services.comfyui_service import ComfyUIService
+from runpod_sdxl_image_studio.services.generation_history_service import (
+    GenerationHistoryService,
+)
+from runpod_sdxl_image_studio.services.generation_recovery_service import (
+    GenerationRecoveryService,
+)
 from runpod_sdxl_image_studio.services.generation_service import GenerationService
 from runpod_sdxl_image_studio.services.lora_catalog_service import (
     LoraCatalogError,
@@ -33,6 +50,20 @@ from runpod_sdxl_image_studio.ui.components.lora_editor import (
     remove_lora_row,
     render_state_updates,
     update_lora_row,
+)
+from runpod_sdxl_image_studio.ui.tabs.history_tab import (
+    build_history_tab,
+    make_history_detail_handler,
+    make_history_refresh_handler,
+    make_restore_handler,
+    next_history_page,
+    previous_history_page,
+)
+from runpod_sdxl_image_studio.ui.tabs.history_tab import (
+    make_favorite_handler as make_history_favorite_handler,
+)
+from runpod_sdxl_image_studio.ui.tabs.history_tab import (
+    make_note_handler as make_history_note_handler,
 )
 from runpod_sdxl_image_studio.ui.tabs.lora_management_tab import (
     build_lora_management_tab,
@@ -77,6 +108,10 @@ def build_app(
     client = ComfyUIClient(app_settings)
     comfyui_service = service or ComfyUIService(client)
     database_engine = create_image_studio_engine(app_settings)
+    session_factory = create_session_factory(database_engine)
+    generation_repository = GenerationRepository(session_factory)
+    artifact_repository = GenerationArtifactRepository(session_factory)
+    job_repository = GenerationJobRepository(session_factory)
     catalog_service = LoraCatalogService(
         LoraMetadataRepository(create_session_factory(database_engine)),
         LoraThumbnailStorage(
@@ -96,6 +131,24 @@ def build_app(
         comfyui_service.refresh_capabilities,
         app_settings,
         lora_catalog_service=catalog_service,
+        generation_repository=generation_repository,
+        artifact_repository=artifact_repository,
+        job_repository=job_repository,
+        thumbnail_storage=HistoryThumbnailStorage(app_settings),
+        metadata_storage=GenerationMetadataStorage(app_settings.data_dir),
+    )
+    history_service = GenerationHistoryService(
+        generation_repository,
+        artifact_repository,
+        app_settings,
+    )
+    recovery_service = GenerationRecoveryService(
+        client,
+        generation_repository,
+        job_repository,
+        artifact_repository,
+        app_settings,
+        completed_prompt_handler=generation_service.recover_prompt,
     )
     with gr.Blocks(title=APP_TITLE, css=APP_CSS) as demo:
         gr.Markdown(f"# {APP_TITLE}")
@@ -108,6 +161,8 @@ def build_app(
             )
         with gr.Tab("LoRA管理"):
             lora_management = build_lora_management_tab(catalog_service)
+        with gr.Tab("履歴"):
+            history = build_history_tab()
 
         capability_inputs = [
             generation.checkpoint,
@@ -327,7 +382,11 @@ def build_app(
             ],
         )
         lora_management.save_button.click(
-            fn=make_save_handler(catalog_service, app_settings.max_loras),
+            fn=make_save_handler(
+                catalog_service,
+                app_settings.max_loras,
+                lora_editor=generation.lora_editor,
+            ),
             inputs=[
                 lora_management.selected,
                 lora_management.display_name,
@@ -358,7 +417,11 @@ def build_app(
             ],
         )
         lora_management.favorite.change(
-            fn=make_favorite_handler(catalog_service, app_settings.max_loras),
+            fn=make_favorite_handler(
+                catalog_service,
+                app_settings.max_loras,
+                lora_editor=generation.lora_editor,
+            ),
             inputs=[
                 lora_management.selected,
                 lora_management.favorite,
@@ -392,6 +455,150 @@ def build_app(
             inputs=[lora_management.selected],
             outputs=[lora_management.message, lora_management.thumbnail_preview],
         )
+        history.refresh_button.click(
+            fn=make_history_refresh_handler(history_service, recovery_service),
+            inputs=[
+                history.page_state,
+                history.date_filter,
+                history.status_filter,
+                history.kind_filter,
+                history.favorite_filter,
+            ],
+            outputs=[
+                history.page_state,
+                history.thumbnail_gallery,
+                history.cards,
+                history.selected,
+                history.page,
+                history.previous_button,
+                history.next_button,
+                history.message,
+            ],
+        )
+        history.previous_button.click(
+            fn=previous_history_page,
+            inputs=[history.page_state],
+            outputs=[history.page_state],
+        ).then(
+            fn=make_history_refresh_handler(history_service, recovery_service),
+            inputs=[
+                history.page_state,
+                history.date_filter,
+                history.status_filter,
+                history.kind_filter,
+                history.favorite_filter,
+            ],
+            outputs=[
+                history.page_state,
+                history.thumbnail_gallery,
+                history.cards,
+                history.selected,
+                history.page,
+                history.previous_button,
+                history.next_button,
+                history.message,
+            ],
+        )
+        history.next_button.click(
+            fn=next_history_page,
+            inputs=[history.page_state],
+            outputs=[history.page_state],
+        ).then(
+            fn=make_history_refresh_handler(history_service, recovery_service),
+            inputs=[
+                history.page_state,
+                history.date_filter,
+                history.status_filter,
+                history.kind_filter,
+                history.favorite_filter,
+            ],
+            outputs=[
+                history.page_state,
+                history.thumbnail_gallery,
+                history.cards,
+                history.selected,
+                history.page,
+                history.previous_button,
+                history.next_button,
+                history.message,
+            ],
+        )
+        history.selected.change(
+            fn=make_history_detail_handler(history_service),
+            inputs=[history.selected],
+            outputs=[
+                history.detail,
+                history.image,
+                history.favorite,
+                history.note,
+                history.message,
+            ],
+        )
+        history.favorite.change(
+            fn=make_history_favorite_handler(history_service),
+            inputs=[history.selected, history.favorite],
+            outputs=[history.favorite, history.message],
+        )
+        history.save_note_button.click(
+            fn=make_history_note_handler(history_service),
+            inputs=[history.selected, history.note],
+            outputs=[history.message],
+        )
+        restore_outputs = [
+            history.message,
+            generation.positive_prompt,
+            generation.negative_prompt,
+            generation.checkpoint,
+            generation.vae,
+            generation.width,
+            generation.height,
+            generation.seed_mode,
+            generation.seed,
+            generation.steps,
+            generation.cfg_scale,
+            generation.sampler,
+            generation.scheduler,
+            generation.lora_editor.state,
+            generation.restored_from_generation,
+        ]
+        history.restore_button.click(
+            fn=make_restore_handler(history_service),
+            inputs=[history.selected],
+            outputs=restore_outputs,
+        )
+        generation_inputs = [
+            generation.checkpoint,
+            generation.positive_prompt,
+            generation.negative_prompt,
+            generation.size_preset,
+            generation.width,
+            generation.height,
+            generation.seed_mode,
+            generation.seed,
+            generation.steps,
+            generation.cfg_scale,
+            generation.sampler,
+            generation.scheduler,
+            generation.vae,
+            generation.lora_editor.state,
+            generation.restored_from_generation,
+        ]
+        regenerate_event = history.regenerate_button.click(
+            fn=make_restore_handler(history_service),
+            inputs=[history.selected],
+            outputs=restore_outputs,
+        )
+        regenerate_event.then(
+            fn=make_generate_handler(generation_service, app_settings.max_loras),
+            inputs=generation_inputs,
+            outputs=[
+                generation.generate_button,
+                generation.progress,
+                generation.result_image,
+                generation.result_details,
+            ],
+            concurrency_limit=1,
+        )
         generate_event = generation.generate_button.click(
             fn=disable_generate_button,
             outputs=[generation.generate_button],
@@ -399,22 +606,7 @@ def build_app(
         )
         generate_event.then(
             fn=make_generate_handler(generation_service, app_settings.max_loras),
-            inputs=[
-                generation.checkpoint,
-                generation.positive_prompt,
-                generation.negative_prompt,
-                generation.size_preset,
-                generation.width,
-                generation.height,
-                generation.seed_mode,
-                generation.seed,
-                generation.steps,
-                generation.cfg_scale,
-                generation.sampler,
-                generation.scheduler,
-                generation.vae,
-                generation.lora_editor.state,
-            ],
+            inputs=generation_inputs,
             outputs=[
                 generation.generate_button,
                 generation.progress,

@@ -20,20 +20,40 @@ from runpod_sdxl_image_studio.adapters.comfyui.exceptions import (
 from runpod_sdxl_image_studio.adapters.comfyui.models import PromptHistory
 from runpod_sdxl_image_studio.adapters.comfyui.websocket_client import ComfyUIWebSocketClient
 from runpod_sdxl_image_studio.adapters.comfyui.workflow_adapter import WorkflowAdapter
+from runpod_sdxl_image_studio.adapters.database.repositories.generation_repository import (
+    GenerationArtifactRepositoryProtocol,
+    GenerationJobRepositoryProtocol,
+    GenerationRepositoryError,
+    GenerationRepositoryProtocol,
+)
 from runpod_sdxl_image_studio.adapters.storage.exceptions import StorageError
+from runpod_sdxl_image_studio.adapters.storage.generation_metadata_storage import (
+    GenerationMetadataStorage,
+)
+from runpod_sdxl_image_studio.adapters.storage.history_thumbnail_storage import (
+    HistoryThumbnailStorage,
+)
 from runpod_sdxl_image_studio.adapters.storage.local_storage import LocalStorageAdapter
 from runpod_sdxl_image_studio.config import Settings, get_settings
 from runpod_sdxl_image_studio.domain.generation import (
+    GenerationErrorCode,
+    GenerationKind,
     GenerationProgress,
     GenerationResult,
     GenerationStatus,
 )
+from runpod_sdxl_image_studio.domain.generation_artifact import ArtifactType, GenerationArtifact
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
+from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
 from runpod_sdxl_image_studio.domain.job import GenerationJob
 from runpod_sdxl_image_studio.domain.system_status import CapabilityRefreshResult
 
 logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[GenerationProgress], None]
+
+
+class HistoryTimeoutError(ComfyUIPromptError):
+    """History polling reached its configured attempt limit."""
 
 
 class CapabilitiesProvider(Protocol):
@@ -59,6 +79,11 @@ class GenerationService:
         *,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         id_factory: Callable[[], UUID] = uuid4,
+        generation_repository: GenerationRepositoryProtocol | None = None,
+        artifact_repository: GenerationArtifactRepositoryProtocol | None = None,
+        job_repository: GenerationJobRepositoryProtocol | None = None,
+        thumbnail_storage: HistoryThumbnailStorage | None = None,
+        metadata_storage: GenerationMetadataStorage | None = None,
     ) -> None:
         self._client = client
         self._workflow_adapter = workflow_adapter
@@ -69,6 +94,11 @@ class GenerationService:
         self._lora_catalog_service = lora_catalog_service
         self._sleep = sleep
         self._id_factory = id_factory
+        self._generation_repository = generation_repository
+        self._artifact_repository = artifact_repository
+        self._job_repository = job_repository
+        self._thumbnail_storage = thumbnail_storage
+        self._metadata_storage = metadata_storage
         self._jobs: dict[UUID, GenerationJob] = {}
         self._results: dict[UUID, GenerationResult] = {}
         self._lock = asyncio.Lock()
@@ -82,20 +112,89 @@ class GenerationService:
 
         return self._results.get(generation_id)
 
+    async def recover_prompt(self, generation_id: UUID, prompt_id: str) -> bool:
+        """Complete one existing prompt from history without submitting it again."""
+
+        if self._generation_repository is None or self._job_repository is None:
+            return False
+        try:
+            generation = self._generation_repository.get_by_id(generation_id)
+            job = self._job_repository.get_by_generation(generation_id)
+            if generation is None or job is None:
+                return False
+            if generation.status in {
+                GenerationStatus.COMPLETED,
+                GenerationStatus.FAILED,
+                GenerationStatus.CANCELLED,
+            }:
+                return True
+            history = await self._client.get_prompt_history(prompt_id)
+            if history.is_failed:
+                self._generation_repository.mark_failed(
+                    generation_id,
+                    GenerationErrorCode.COMFYUI_EXECUTION.value,
+                    "ComfyUIで生成が失敗しました。",
+                )
+                self._job_repository.mark_failed(
+                    job.id,
+                    GenerationErrorCode.COMFYUI_EXECUTION.value,
+                    "ComfyUIで生成が失敗しました。",
+                )
+                return False
+            if not history.is_completed or not history.outputs:
+                return False
+            image_bytes = await self._client.get_output_image(history.outputs[0])
+            stored_image = self._storage.store_image(
+                image_bytes, generation_id, generation.created_at
+            )
+            recovery_job = GenerationJob(
+                generation_id=generation_id,
+                status=GenerationStatus.RUNNING,
+                id=job.id,
+                prompt_id=prompt_id,
+                created_at=generation.created_at,
+                stored_image=stored_image,
+            )
+            self._persist_artifacts(
+                recovery_job,
+                generation.settings_snapshot.to_generation_settings(),
+                generation.created_at,
+                generation.kind,
+                generation.parent_generation_id,
+            )
+            self._generation_repository.mark_completed(generation_id)
+            self._job_repository.mark_completed(job.id)
+            return True
+        except (ComfyUIError, GenerationRepositoryError, StorageError, ValueError) as exc:
+            logger.warning(
+                "Generation recovery failed generation=%s prompt_id=%s error=%s",
+                generation_id,
+                prompt_id,
+                type(exc).__name__,
+            )
+            return False
+
     async def generate(
         self,
         settings: GenerationSettings,
         progress_callback: ProgressCallback | None = None,
+        *,
+        parent_generation_id: UUID | None = None,
+        kind: GenerationKind = GenerationKind.STANDARD,
     ) -> GenerationResult:
         """Run one generation and retain its result in memory."""
 
         async with self._lock:
-            return await self._generate_locked(settings, progress_callback)
+            return await self._generate_locked(
+                settings, progress_callback, parent_generation_id, kind
+            )
 
     async def _generate_locked(
         self,
         settings: GenerationSettings,
         progress_callback: ProgressCallback | None,
+        parent_generation_id: UUID | None,
+        kind: GenerationKind,
     ) -> GenerationResult:
         generation_id = self._id_factory()
         created_at = datetime.now(UTC)
@@ -103,6 +202,23 @@ class GenerationService:
         resolved_settings = settings.model_copy(update={"seed": seed})
         job = GenerationJob(generation_id=generation_id, status=GenerationStatus.PENDING)
         self._jobs[generation_id] = job
+        if not self._persist_pending(
+            resolved_settings, generation_id, kind, parent_generation_id, created_at, job
+        ):
+            job.status = GenerationStatus.FAILED
+            job.error_message = "生成履歴を保存できませんでした。"
+            self._persist_failed(job, GenerationRepositoryError("pending record failed"))
+            result = GenerationResult(
+                generation_id=generation_id,
+                prompt_id="",
+                status=GenerationStatus.FAILED,
+                seed=seed,
+                stored_image=None,
+                error_message=job.error_message,
+                created_at=created_at,
+            )
+            self._results[generation_id] = result
+            return result
         self._emit(
             progress_callback,
             GenerationProgress(
@@ -118,7 +234,14 @@ class GenerationService:
 
         try:
             await asyncio.wait_for(
-                self._run_job(job, resolved_settings, created_at, progress_callback),
+                self._run_job(
+                    job,
+                    resolved_settings,
+                    created_at,
+                    progress_callback,
+                    kind,
+                    parent_generation_id,
+                ),
                 timeout=self._settings.generation_timeout_seconds,
             )
             result = self._result_for_job(job, seed, created_at)
@@ -139,6 +262,7 @@ class GenerationService:
             logger.error("Generation job failed: %s", type(exc).__name__)
             job.status = GenerationStatus.FAILED
             job.error_message = _safe_generation_error(exc)
+            self._persist_failed(job, exc)
             result = GenerationResult(
                 generation_id=generation_id,
                 prompt_id=job.prompt_id or "",
@@ -151,12 +275,64 @@ class GenerationService:
         self._results[generation_id] = result
         return result
 
+    def _persist_pending(
+        self,
+        settings: GenerationSettings,
+        generation_id: UUID,
+        kind: GenerationKind,
+        parent_generation_id: UUID | None,
+        created_at: datetime,
+        job: GenerationJob,
+    ) -> bool:
+        if self._generation_repository is None:
+            return True
+        try:
+            snapshot = GenerationSettingsSnapshot.from_settings(settings)
+            self._generation_repository.create_pending(
+                snapshot,
+                kind=kind,
+                parent_generation_id=parent_generation_id,
+                generation_id=generation_id,
+                created_at=created_at,
+            )
+            if self._job_repository is not None:
+                persisted_job = self._job_repository.create(
+                    job.__class__(
+                        generation_id=job.generation_id,
+                        status=GenerationStatus.PENDING,
+                        id=job.id,
+                        created_at=created_at,
+                    )
+                )
+                job.id = persisted_job.id
+            return True
+        except (GenerationRepositoryError, ValueError) as exc:
+            logger.error("Generation persistence failed before prompt: %s", type(exc).__name__)
+            return False
+
+    def _persist_failed(self, job: GenerationJob, error: Exception) -> None:
+        code = _generation_error_code(error)
+        summary = _safe_generation_error(error)
+        try:
+            if self._generation_repository is not None:
+                self._generation_repository.mark_failed(job.generation_id, code, summary)
+            if self._job_repository is not None:
+                self._job_repository.mark_failed(job.id, code, summary)
+        except GenerationRepositoryError:
+            logger.error(
+                "Failed to persist failed generation id=%s prompt_id=%s",
+                job.generation_id,
+                job.prompt_id or "",
+            )
+
     async def _run_job(
         self,
         job: GenerationJob,
         settings: GenerationSettings,
         created_at: datetime,
         progress_callback: ProgressCallback | None,
+        kind: GenerationKind,
+        parent_generation_id: UUID | None,
     ) -> None:
         capabilities_result = await self._capabilities_provider()
         capabilities = capabilities_result.capabilities
@@ -171,6 +347,17 @@ class GenerationService:
             raise ComfyUIPromptError("ComfyUI rejected workflow nodes")
         job.prompt_id = queued.prompt_id
         job.status = GenerationStatus.QUEUED
+        try:
+            if self._generation_repository is not None:
+                self._generation_repository.mark_queued(job.generation_id, queued.prompt_id)
+            if self._job_repository is not None:
+                self._job_repository.update_prompt_id(job.id, queued.prompt_id)
+        except GenerationRepositoryError:
+            logger.error(
+                "Failed to persist prompt id generation=%s prompt_id=%s",
+                job.generation_id,
+                queued.prompt_id,
+            )
         self._emit(
             progress_callback,
             GenerationProgress(
@@ -188,6 +375,7 @@ class GenerationService:
         try:
             async for progress in self._websocket_client.watch_prompt(queued.prompt_id, client_id):
                 job.status = progress.state
+                self._persist_progress(job, progress)
                 self._emit(progress_callback, progress)
                 if progress.state is GenerationStatus.FAILED:
                     websocket_failed = True
@@ -220,7 +408,112 @@ class GenerationService:
             job.generation_id,
             created_at,
         )
+        self._persist_artifacts(job, settings, created_at, kind, parent_generation_id)
         job.status = GenerationStatus.COMPLETED
+        try:
+            if self._generation_repository is not None:
+                self._generation_repository.mark_completed(job.generation_id)
+            if self._job_repository is not None:
+                self._job_repository.mark_completed(job.id)
+        except GenerationRepositoryError:
+            logger.error("Failed to persist completion generation=%s", job.generation_id)
+
+    def _persist_progress(self, job: GenerationJob, progress: GenerationProgress) -> None:
+        try:
+            if (
+                progress.state is GenerationStatus.RUNNING
+                and self._generation_repository is not None
+            ):
+                self._generation_repository.mark_running(job.generation_id)
+            if self._job_repository is not None:
+                self._job_repository.update_progress(
+                    job.id, progress.value, progress.maximum, progress.current_node
+                )
+        except GenerationRepositoryError:
+            logger.warning("Failed to persist progress generation=%s", job.generation_id)
+
+    def _persist_artifacts(
+        self,
+        job: GenerationJob,
+        settings: GenerationSettings,
+        created_at: datetime,
+        kind: GenerationKind,
+        parent_generation_id: UUID | None,
+    ) -> None:
+        if self._artifact_repository is None or job.stored_image is None:
+            return
+        image = job.stored_image
+        try:
+            self._artifact_repository.add(
+                GenerationArtifact(
+                    id=self._id_factory(),
+                    generation_id=job.generation_id,
+                    artifact_type=ArtifactType.IMAGE,
+                    local_path=self._storage.relative_path(image.path),
+                    sha256=image.sha256,
+                    size_bytes=image.size_bytes,
+                    width=image.width,
+                    height=image.height,
+                    mime_type=image.mime_type,
+                    created_at=created_at,
+                )
+            )
+        except (GenerationRepositoryError, StorageError, OSError) as exc:
+            logger.warning(
+                "Generation artifact persistence warning generation=%s error=%s",
+                job.generation_id,
+                type(exc).__name__,
+            )
+            return
+        if self._metadata_storage is not None:
+            try:
+                payload = _sidecar_payload(job, settings, image, kind, parent_generation_id)
+                sidecar_path = self._metadata_storage.save_for_image(image.path, payload)
+                self._artifact_repository.add(
+                    GenerationArtifact(
+                        id=self._id_factory(),
+                        generation_id=job.generation_id,
+                        artifact_type=ArtifactType.METADATA,
+                        local_path=self._metadata_storage.relative_path(sidecar_path),
+                        sha256=self._metadata_storage.sha256(sidecar_path),
+                        size_bytes=sidecar_path.stat().st_size,
+                        width=None,
+                        height=None,
+                        mime_type="application/json",
+                        created_at=created_at,
+                    )
+                )
+            except (GenerationRepositoryError, StorageError, OSError) as exc:
+                logger.warning(
+                    "Generation sidecar warning generation=%s error=%s",
+                    job.generation_id,
+                    type(exc).__name__,
+                )
+        if self._thumbnail_storage is not None:
+            try:
+                thumbnail_path = self._thumbnail_storage.save(
+                    image.path, job.generation_id, created_at
+                )
+                self._artifact_repository.add(
+                    GenerationArtifact(
+                        id=self._id_factory(),
+                        generation_id=job.generation_id,
+                        artifact_type=ArtifactType.THUMBNAIL,
+                        local_path=self._thumbnail_storage.relative_path(thumbnail_path),
+                        sha256=self._thumbnail_storage.sha256(thumbnail_path),
+                        size_bytes=thumbnail_path.stat().st_size,
+                        width=None,
+                        height=None,
+                        mime_type="image/webp",
+                        created_at=created_at,
+                    )
+                )
+            except (GenerationRepositoryError, StorageError, OSError) as exc:
+                logger.warning(
+                    "Generation thumbnail warning generation=%s error=%s",
+                    job.generation_id,
+                    type(exc).__name__,
+                )
 
     async def _poll_history(self, prompt_id: str) -> PromptHistory:
         last_error: ComfyUIError | None = None
@@ -236,7 +529,7 @@ class GenerationService:
                 await self._sleep(self._settings.history_poll_interval_seconds)
         if last_error is not None:
             raise last_error
-        raise ComfyUIPromptError("ComfyUI history did not become available")
+        raise HistoryTimeoutError("ComfyUI history did not become available")
 
     @staticmethod
     def _result_for_job(
@@ -310,3 +603,53 @@ def _safe_generation_error(error: Exception) -> str:
     if isinstance(error, TimeoutError):
         return "画像生成が制限時間を超えました。"
     return "画像生成に失敗しました。"
+
+
+def _generation_error_code(error: Exception) -> str:
+    if isinstance(error, WorkflowError):
+        return GenerationErrorCode.WORKFLOW.value
+    if isinstance(error, StorageError):
+        return GenerationErrorCode.STORAGE.value
+    if isinstance(error, ComfyUIWebSocketError):
+        return GenerationErrorCode.COMFYUI_EXECUTION.value
+    if isinstance(error, HistoryTimeoutError):
+        return GenerationErrorCode.HISTORY_TIMEOUT.value
+    if isinstance(error, ComfyUIPromptError):
+        return GenerationErrorCode.COMFYUI_PROMPT.value
+    if isinstance(error, ComfyUIError):
+        return GenerationErrorCode.COMFYUI_CONNECTION.value
+    if isinstance(error, TimeoutError):
+        return GenerationErrorCode.HISTORY_TIMEOUT.value
+    return (
+        GenerationErrorCode.DATABASE.value
+        if isinstance(error, GenerationRepositoryError)
+        else "generation_error"
+    )
+
+
+def _sidecar_payload(
+    job: GenerationJob,
+    settings: GenerationSettings,
+    image: object,
+    kind: GenerationKind,
+    parent_generation_id: UUID | None,
+) -> dict[str, object]:
+    stored = image
+    return {
+        "schema_version": 1,
+        "generation_id": str(job.generation_id),
+        "kind": kind.value,
+        "parent_generation_id": str(parent_generation_id) if parent_generation_id else None,
+        "created_at": job.created_at.isoformat() if job.created_at else None,
+        "completed_at": datetime.now(UTC).isoformat(),
+        "settings": GenerationSettingsSnapshot.from_settings(settings).model_dump(mode="json"),
+        "workflow_template_id": settings.workflow_template_id,
+        "workflow_template_version": settings.workflow_template_version,
+        "comfy_prompt_id": job.prompt_id,
+        "image": {
+            "sha256": stored.sha256,  # type: ignore[attr-defined]
+            "width": stored.width,  # type: ignore[attr-defined]
+            "height": stored.height,  # type: ignore[attr-defined]
+            "mime_type": stored.mime_type,  # type: ignore[attr-defined]
+        },
+    }

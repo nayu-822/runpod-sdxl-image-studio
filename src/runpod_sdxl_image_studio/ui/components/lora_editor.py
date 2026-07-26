@@ -192,6 +192,18 @@ def component_outputs(editor: LoraEditorComponents) -> list[Any]:
     return outputs
 
 
+def preserve_component_updates(editor: LoraEditorComponents) -> tuple[object, ...]:
+    """Create preserve updates from the editor's actual event output structure."""
+
+    return tuple(gr.skip() for _ in component_outputs(editor))
+
+
+def component_output_count_for_rows(max_loras: int) -> int:
+    """Return the output count using the row dataclass structure, not a magic number."""
+
+    return max(1, max_loras) * len(LoraRowComponents.__dataclass_fields__)
+
+
 def render_state_updates(
     state: object,
     choices: object,

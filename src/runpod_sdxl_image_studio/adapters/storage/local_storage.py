@@ -35,6 +35,19 @@ class LocalStorageAdapter:
     def data_dir(self) -> Path:
         return self._data_dir
 
+    @staticmethod
+    def relative_path_from_data_dir(path: Path, data_dir: Path) -> str:
+        try:
+            relative = path.resolve().relative_to(data_dir.resolve())
+        except ValueError as exc:
+            raise StorageError("Stored path is outside the data directory") from exc
+        if any(part in {"", ".", ".."} for part in relative.parts):
+            raise StorageError("Stored path is unsafe")
+        return relative.as_posix()
+
+    def relative_path(self, path: Path) -> str:
+        return self.relative_path_from_data_dir(path, self._data_dir)
+
     def store_image(
         self,
         image_bytes: bytes,
