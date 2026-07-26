@@ -220,7 +220,7 @@ def make_generate_handler(
             return gr.Button("Generate", interactive=True), "", None, "入力値を確認してください。"
 
         def on_progress(update: GenerationProgress) -> None:
-            progress(update.percentage or 0.0, desc=update.message)
+            report_gradio_progress(progress, update)
 
         result = await service.generate(generation_settings, on_progress)
         if result.status is GenerationStatus.COMPLETED and result.stored_image is not None:
@@ -244,6 +244,25 @@ def make_generate_handler(
         )
 
     return handler
+
+
+def disable_generate_button() -> gr.Button:
+    """Disable the action before the queued generation handler starts."""
+
+    return gr.Button(value="逕滓・荳ｭ...", interactive=False)
+
+
+def report_gradio_progress(progress: gr.Progress, update: GenerationProgress) -> None:
+    """Convert domain 0-100 progress into Gradio's 0-1 or tuple format."""
+
+    if update.value is not None and update.maximum is not None and update.maximum > 0:
+        value = min(update.maximum, max(0, update.value))
+        progress((value, update.maximum), desc=update.message)
+    elif update.percentage is not None:
+        percentage = min(100.0, max(0.0, update.percentage))
+        progress(percentage / 100.0, desc=update.message)
+    else:
+        progress(0.0, desc=update.message)
 
 
 def size_preset_values(preset: str) -> tuple[int, int]:

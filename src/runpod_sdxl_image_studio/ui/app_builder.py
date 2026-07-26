@@ -14,6 +14,7 @@ from runpod_sdxl_image_studio.services.generation_service import GenerationServi
 from runpod_sdxl_image_studio.ui.tabs.system_tab import (
     build_generation_tab,
     build_system_tab,
+    disable_generate_button,
     make_check_connection_handler,
     make_generate_handler,
     make_refresh_handler,
@@ -97,7 +98,12 @@ def build_app(
             inputs=[generation.size_preset],
             outputs=[generation.width, generation.height],
         )
-        generation.generate_button.click(
+        generate_event = generation.generate_button.click(
+            fn=disable_generate_button,
+            outputs=[generation.generate_button],
+            queue=False,
+        )
+        generate_event.then(
             fn=make_generate_handler(generation_service),
             inputs=[
                 generation.checkpoint,

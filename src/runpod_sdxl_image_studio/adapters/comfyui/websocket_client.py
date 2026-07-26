@@ -77,6 +77,8 @@ class ComfyUIWebSocketClient:
             raise ComfyUIWebSocketDisconnectedError("ComfyUI WebSocket disconnected") from exc
         except (OSError, WebSocketException) as exc:
             raise ComfyUIWebSocketError("ComfyUI WebSocket connection failed") from exc
+        except Exception as exc:  # noqa: BLE001 - adapter boundary normalizes library failures
+            raise ComfyUIWebSocketError("ComfyUI WebSocket message handling failed") from exc
 
 
 def parse_websocket_message(

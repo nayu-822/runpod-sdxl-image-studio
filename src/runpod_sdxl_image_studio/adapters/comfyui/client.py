@@ -6,14 +6,17 @@ import json
 import logging
 import ntpath
 import posixpath
+import warnings
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from io import BytesIO
 from types import TracebackType
 from typing import Any, Self
 from urllib.parse import quote
 from uuid import UUID
 
 import httpx
+from PIL import Image, UnidentifiedImageError
 
 from runpod_sdxl_image_studio.adapters.comfyui.exceptions import (
     ComfyUIConnectionError,
@@ -150,6 +153,7 @@ class ComfyUIClient:
                 raise ComfyUIResponseError("ComfyUI output image is too large")
         if not response.content or len(response.content) > self._max_output_image_bytes:
             raise ComfyUIResponseError("ComfyUI returned an empty or oversized image")
+        _validate_image_bytes(response.content)
         return response.content
 
     async def close(self) -> None:
@@ -245,3 +249,15 @@ def _validate_subfolder(value: str) -> str:
     if any(part in {"", ".", ".."} for part in normalized.split("/")):
         raise ComfyUIResponseError("ComfyUI subfolder is invalid")
     return normalized
+
+
+def _validate_image_bytes(image_bytes: bytes) -> None:
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(BytesIO(image_bytes)) as image:
+                if image.format not in {"PNG", "WEBP"}:
+                    raise ComfyUIResponseError("ComfyUI returned an unsupported image format")
+                image.verify()
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
+        raise ComfyUIResponseError("ComfyUI returned invalid image data") from exc

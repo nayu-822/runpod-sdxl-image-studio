@@ -46,10 +46,12 @@ class LocalStorageAdapter:
         if not image_bytes:
             raise StorageError("Image data is empty")
         width, height = _validate_image(image_bytes)
-        local_date = created_at.astimezone(self._timezone).date().isoformat()
-        target_dir = self._data_dir / "generations" / local_date
+        local_datetime = created_at.astimezone(self._timezone)
+        local_date = local_datetime.date().isoformat()
+        target_dir = self._data_dir / "generations" / local_date / "generated"
         target_dir.mkdir(parents=True, exist_ok=True)
-        final_path = target_dir / f"{generation_id}.png"
+        timestamp = local_datetime.strftime("%Y%m%d_%H%M%S")
+        final_path = target_dir / f"{timestamp}_{generation_id.hex[:8]}.png"
         if final_path.exists():
             raise StorageError("Generation image already exists")
 
@@ -57,7 +59,7 @@ class LocalStorageAdapter:
         try:
             with NamedTemporaryFile(
                 mode="wb",
-                prefix=f".{generation_id}.",
+                prefix=f".{timestamp}_{generation_id.hex[:8]}.",
                 suffix=".tmp",
                 dir=target_dir,
                 delete=False,

@@ -112,7 +112,7 @@ class GenerationService:
 
         try:
             await asyncio.wait_for(
-                self._run_job(job, resolved_settings, progress_callback),
+                self._run_job(job, resolved_settings, created_at, progress_callback),
                 timeout=self._settings.generation_timeout_seconds,
             )
             result = self._result_for_job(job, seed, created_at)
@@ -136,6 +136,7 @@ class GenerationService:
         self,
         job: GenerationJob,
         settings: GenerationSettings,
+        created_at: datetime,
         progress_callback: ProgressCallback | None,
     ) -> None:
         capabilities_result = await self._capabilities_provider()
@@ -198,7 +199,7 @@ class GenerationService:
         job.stored_image = self._storage.store_image(
             image_bytes,
             job.generation_id,
-            datetime.now(UTC),
+            created_at,
         )
         job.status = GenerationStatus.COMPLETED
 

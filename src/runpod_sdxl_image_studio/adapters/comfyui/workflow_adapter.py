@@ -22,6 +22,19 @@ DEFAULT_REQUIRED_NODE_CLASSES = (
     "VAEDecode",
     "SaveImage",
 )
+REQUIRED_BINDING_FIELDS = (
+    "checkpoint_name",
+    "positive_prompt",
+    "negative_prompt",
+    "seed",
+    "steps",
+    "cfg_scale",
+    "sampler_name",
+    "scheduler_name",
+    "width",
+    "height",
+    "filename_prefix",
+)
 
 
 class WorkflowAdapter:
@@ -72,6 +85,8 @@ def build_txt2img_workflow(
     bindings = template.get("bindings")
     if not isinstance(bindings, Mapping):
         raise WorkflowTemplateError("workflow bindings are missing")
+    if any(field_name not in bindings for field_name in REQUIRED_BINDING_FIELDS):
+        raise WorkflowTemplateError("workflow bindings are incomplete")
     values: dict[str, object] = {
         "checkpoint_name": settings.checkpoint_name,
         "positive_prompt": settings.positive_prompt,
