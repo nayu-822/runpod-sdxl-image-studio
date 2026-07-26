@@ -7,21 +7,47 @@ import gradio as gr
 from runpod_sdxl_image_studio.adapters.comfyui.client import ComfyUIClient
 from runpod_sdxl_image_studio.adapters.comfyui.websocket_client import ComfyUIWebSocketClient
 from runpod_sdxl_image_studio.adapters.comfyui.workflow_adapter import WorkflowAdapter
+from runpod_sdxl_image_studio.adapters.database.engine import (
+    create_image_studio_engine,
+    create_session_factory,
+)
+from runpod_sdxl_image_studio.adapters.database.repositories.lora_metadata_repository import (
+    LoraMetadataRepository,
+)
 from runpod_sdxl_image_studio.adapters.storage.local_storage import LocalStorageAdapter
+from runpod_sdxl_image_studio.adapters.storage.lora_thumbnail_storage import LoraThumbnailStorage
 from runpod_sdxl_image_studio.config import Settings, get_settings
+from runpod_sdxl_image_studio.domain.lora_search import append_trigger_words
 from runpod_sdxl_image_studio.services.comfyui_service import ComfyUIService
 from runpod_sdxl_image_studio.services.generation_service import GenerationService
+from runpod_sdxl_image_studio.services.lora_catalog_service import (
+    LoraCatalogError,
+    LoraCatalogService,
+)
 from runpod_sdxl_image_studio.ui.components.lora_editor import (
     add_lora_row,
     component_outputs,
+    lora_settings_from_state,
     move_lora_row,
+    normalize_lora_state,
     remove_lora_row,
     render_state_updates,
     update_lora_row,
 )
+from runpod_sdxl_image_studio.ui.tabs.lora_management_tab import (
+    build_lora_management_tab,
+    make_favorite_handler,
+    make_save_handler,
+    make_search_handler,
+    make_select_handler,
+    make_sync_handler,
+    make_thumbnail_delete_handler,
+    make_thumbnail_save_handler,
+)
 from runpod_sdxl_image_studio.ui.tabs.system_tab import (
     build_generation_tab,
     build_system_tab,
+    capability_refresh_outputs,
     disable_generate_button,
     make_check_connection_handler,
     make_generate_handler,
@@ -50,6 +76,15 @@ def build_app(
     app_settings = settings or get_settings()
     client = ComfyUIClient(app_settings)
     comfyui_service = service or ComfyUIService(client)
+    database_engine = create_image_studio_engine(app_settings)
+    catalog_service = LoraCatalogService(
+        LoraMetadataRepository(create_session_factory(database_engine)),
+        LoraThumbnailStorage(
+            app_settings.data_dir / "lora_thumbnails",
+            app_settings.max_lora_thumbnail_bytes,
+            app_settings.lora_thumbnail_max_edge,
+        ),
+    )
     loaded_workflow = load_txt2img_template(
         app_settings.workflow_dir.parent if app_settings.workflow_dir.exists() else None
     )
@@ -60,6 +95,7 @@ def build_app(
         LocalStorageAdapter(app_settings),
         comfyui_service.refresh_capabilities,
         app_settings,
+        lora_catalog_service=catalog_service,
     )
     with gr.Blocks(title=APP_TITLE, css=APP_CSS) as demo:
         gr.Markdown(f"# {APP_TITLE}")
@@ -70,6 +106,8 @@ def build_app(
                 app_settings.comfyui_base_url,
                 initial_status_markdown(),
             )
+        with gr.Tab("LoRA管理"):
+            lora_management = build_lora_management_tab(catalog_service)
 
         capability_inputs = [
             generation.checkpoint,
@@ -79,31 +117,21 @@ def build_app(
             generation.upscaler,
             generation.lora_editor.state,
             generation.lora_editor.choices,
+            generation.lora_category_filter,
         ]
-        capability_outputs = [
-            generation.checkpoint,
-            generation.vae,
-            generation.sampler,
-            generation.scheduler,
-            generation.upscaler,
-            generation.lora_list,
-            generation.generate_button,
-            generation.lora_editor.choices,
-            generation.lora_editor.state,
-            *component_outputs(generation.lora_editor),
-            generation.lora_editor.add_button,
-        ]
+        capability_outputs = capability_refresh_outputs(generation)
         system.connection_button.click(
             fn=make_check_connection_handler(
                 comfyui_service,
                 app_settings.timezone,
                 generation,
+                catalog_service,
             ),
             inputs=capability_inputs,
             outputs=[system.status_markdown, system.capability_message, *capability_outputs],
         )
         system.refresh_button.click(
-            fn=make_refresh_handler(comfyui_service, generation),
+            fn=make_refresh_handler(comfyui_service, generation, catalog_service),
             inputs=capability_inputs,
             outputs=[system.capability_message, *capability_outputs],
         )
@@ -112,6 +140,32 @@ def build_app(
             inputs=[generation.size_preset],
             outputs=[generation.width, generation.height],
         )
+
+        def handle_lora_name_change(
+            state: object,
+            name: str | None,
+            model_strength: object,
+            clip_strength: object,
+            row_index: int,
+        ) -> tuple[object, ...]:
+            rows = normalize_lora_state(state, app_settings.max_loras)
+            previous = rows[row_index].get("lora_name") if row_index < len(rows) else None
+            model = model_strength
+            clip = clip_strength
+            if name != previous:
+                metadata = catalog_service.get_by_file_name(name) if name else None
+                model = (
+                    metadata.recommended_model_strength
+                    if metadata and metadata.recommended_model_strength is not None
+                    else 1.0
+                )
+                clip = (
+                    metadata.recommended_clip_strength
+                    if metadata and metadata.recommended_clip_strength is not None
+                    else 1.0
+                )
+            updated = update_lora_row(state, row_index, name, model, clip, app_settings.max_loras)
+            return updated, model, clip
 
         generation.lora_editor.add_button.click(
             fn=lambda state, choices: render_state_updates(
@@ -128,8 +182,8 @@ def build_app(
         )
         for index, row in enumerate(generation.lora_editor.rows):
             row.name.change(
-                fn=lambda state, name, model, clip, row_index=index: update_lora_row(
-                    state, row_index, name, model, clip, app_settings.max_loras
+                fn=lambda state, name, model, clip, row_index=index: handle_lora_name_change(
+                    state, name, model, clip, row_index
                 ),
                 inputs=[
                     generation.lora_editor.state,
@@ -137,7 +191,7 @@ def build_app(
                     row.model_strength,
                     row.clip_strength,
                 ],
-                outputs=[generation.lora_editor.state],
+                outputs=[generation.lora_editor.state, row.model_strength, row.clip_strength],
             )
             row.model_strength.change(
                 fn=lambda state, name, model, clip, row_index=index: update_lora_row(
@@ -202,6 +256,101 @@ def build_app(
                     generation.lora_editor.add_button,
                 ],
             )
+        generation.lora_editor.trigger_button.click(
+            fn=lambda prompt, state: _append_selected_triggers(
+                prompt, state, catalog_service, app_settings.max_loras
+            ),
+            inputs=[generation.positive_prompt, generation.lora_editor.state],
+            outputs=[generation.positive_prompt, generation.lora_editor.trigger_message],
+        )
+
+        generation.lora_category_filter.change(
+            fn=lambda category, state: _filter_lora_category(
+                category, state, catalog_service, app_settings.max_loras
+            ),
+            inputs=[generation.lora_category_filter, generation.lora_editor.state],
+            outputs=[
+                generation.lora_editor.choices,
+                generation.lora_editor.state,
+                *component_outputs(generation.lora_editor),
+                generation.lora_editor.add_button,
+            ],
+        )
+
+        search_inputs = [
+            lora_management.search,
+            lora_management.category_filter,
+            lora_management.favorites_only,
+            lora_management.include_missing,
+            lora_management.sort,
+        ]
+        search_outputs = [lora_management.result_list, lora_management.selected]
+        search_handler = make_search_handler(catalog_service)
+        for source in (
+            lora_management.search,
+            lora_management.category_filter,
+            lora_management.favorites_only,
+            lora_management.include_missing,
+            lora_management.sort,
+        ):
+            source.change(fn=search_handler, inputs=search_inputs, outputs=search_outputs)
+        lora_management.search.submit(
+            fn=search_handler, inputs=search_inputs, outputs=search_outputs
+        )
+        lora_management.sync_button.click(
+            fn=make_sync_handler(comfyui_service, catalog_service),
+            outputs=[
+                lora_management.message,
+                lora_management.result_list,
+                lora_management.selected,
+                lora_management.category_filter,
+            ],
+        )
+        lora_management.selected.change(
+            fn=make_select_handler(catalog_service),
+            inputs=[lora_management.selected],
+            outputs=[
+                lora_management.display_name,
+                lora_management.category,
+                lora_management.favorite,
+                lora_management.trigger_words,
+                lora_management.recommended_model,
+                lora_management.recommended_clip,
+                lora_management.compatible_models,
+                lora_management.notes,
+                lora_management.thumbnail_preview,
+            ],
+        )
+        lora_management.save_button.click(
+            fn=make_save_handler(catalog_service),
+            inputs=[
+                lora_management.selected,
+                lora_management.display_name,
+                lora_management.category,
+                lora_management.favorite,
+                lora_management.trigger_words,
+                lora_management.recommended_model,
+                lora_management.recommended_clip,
+                lora_management.compatible_models,
+                lora_management.notes,
+            ],
+            outputs=[lora_management.message, lora_management.result_list],
+        )
+        lora_management.favorite.change(
+            fn=make_favorite_handler(catalog_service),
+            inputs=[lora_management.selected, lora_management.favorite],
+            outputs=[lora_management.favorite, lora_management.message],
+        )
+        lora_management.thumbnail_upload.change(
+            fn=make_thumbnail_save_handler(catalog_service),
+            inputs=[lora_management.selected, lora_management.thumbnail_upload],
+            outputs=[lora_management.message, lora_management.thumbnail_preview],
+        )
+        lora_management.delete_thumbnail_button.click(
+            fn=make_thumbnail_delete_handler(catalog_service),
+            inputs=[lora_management.selected],
+            outputs=[lora_management.message, lora_management.thumbnail_preview],
+        )
         generate_event = generation.generate_button.click(
             fn=disable_generate_button,
             outputs=[generation.generate_button],
@@ -234,3 +383,43 @@ def build_app(
             concurrency_limit=1,
         )
     return demo
+
+
+def _filter_lora_category(
+    category: str | None,
+    state: object,
+    catalog: LoraCatalogService,
+    max_loras: int,
+) -> tuple[object, ...]:
+    """Apply a catalog category without changing the stored LoRA strengths."""
+
+    choices = catalog.selector_options(category or None)
+    return (list(choices),) + render_state_updates(
+        state,
+        choices,
+        max_loras,
+        clear_unavailable=True,
+    )
+
+
+def _append_selected_triggers(
+    prompt: str,
+    state: object,
+    catalog: LoraCatalogService,
+    max_loras: int,
+) -> tuple[str, str]:
+    try:
+        settings = lora_settings_from_state(state, max_loras)
+        words: list[str] = []
+        for metadata in catalog.metadata_for_files(lora.name for lora in settings):
+            if metadata is not None:
+                words.extend(metadata.trigger_words)
+        updated = append_trigger_words(prompt or "", tuple(words))
+        return (
+            updated,
+            "トリガーワードをPrompt末尾へ追加しました。"
+            if words
+            else "追加するトリガーワードはありません。",
+        )
+    except (ValueError, LoraCatalogError):
+        return prompt, "トリガーワードを追加できませんでした。"

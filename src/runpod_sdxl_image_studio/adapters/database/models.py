@@ -1,0 +1,90 @@
+"""SQLAlchemy persistence models, kept separate from domain models."""
+
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime
+from uuid import UUID
+
+from sqlalchemy import Boolean, DateTime, Index, Integer, String, Text
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+from runpod_sdxl_image_studio.domain.lora_metadata import LoraMetadata
+
+
+class Base(DeclarativeBase):
+    """Alembic metadata root."""
+
+
+class LoraMetadataModel(Base):
+    __tablename__ = "lora_metadata"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    file_name: Mapped[str] = mapped_column(String(500), unique=True, nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    category: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    is_favorite: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    trigger_words_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    recommended_model_strength: Mapped[float | None] = mapped_column(nullable=True)
+    recommended_clip_strength: Mapped[float | None] = mapped_column(nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    compatible_models_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    thumbnail_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    is_missing: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    usage_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    def to_domain(self) -> LoraMetadata:
+        return LoraMetadata(
+            id=UUID(self.id),
+            file_name=self.file_name,
+            display_name=self.display_name,
+            category=self.category,
+            is_favorite=self.is_favorite,
+            trigger_words=tuple(json.loads(self.trigger_words_json)),
+            recommended_model_strength=self.recommended_model_strength,
+            recommended_clip_strength=self.recommended_clip_strength,
+            notes=self.notes,
+            compatible_models=tuple(json.loads(self.compatible_models_json)),
+            thumbnail_path=self.thumbnail_path,
+            is_missing=self.is_missing,
+            usage_count=self.usage_count,
+            last_used_at=_utc(self.last_used_at),
+            created_at=_utc(self.created_at) or datetime.now(UTC),
+            updated_at=_utc(self.updated_at) or datetime.now(UTC),
+        )
+
+    @classmethod
+    def from_domain(cls, metadata: LoraMetadata) -> LoraMetadataModel:
+        return cls(
+            id=str(metadata.id),
+            file_name=metadata.file_name,
+            display_name=metadata.display_name,
+            category=metadata.category,
+            is_favorite=metadata.is_favorite,
+            trigger_words_json=json.dumps(metadata.trigger_words, ensure_ascii=False),
+            recommended_model_strength=metadata.recommended_model_strength,
+            recommended_clip_strength=metadata.recommended_clip_strength,
+            notes=metadata.notes,
+            compatible_models_json=json.dumps(metadata.compatible_models, ensure_ascii=False),
+            thumbnail_path=metadata.thumbnail_path,
+            is_missing=metadata.is_missing,
+            usage_count=metadata.usage_count,
+            last_used_at=metadata.last_used_at,
+            created_at=metadata.created_at,
+            updated_at=metadata.updated_at,
+        )
+
+
+Index("ix_lora_metadata_category", LoraMetadataModel.category)
+Index("ix_lora_metadata_favorite", LoraMetadataModel.is_favorite)
+Index("ix_lora_metadata_missing", LoraMetadataModel.is_missing)
+Index("ix_lora_metadata_last_used", LoraMetadataModel.last_used_at)
+
+
+def _utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)

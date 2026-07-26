@@ -8,6 +8,11 @@ from runpod_sdxl_image_studio.domain.generation import (
 )
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
 from runpod_sdxl_image_studio.domain.lora import LoraSetting
+from runpod_sdxl_image_studio.domain.lora_metadata import (
+    LoraMetadata,
+    LoraMetadataUpdate,
+)
+from runpod_sdxl_image_studio.domain.lora_search import LoraSearchQuery, LoraSort
 
 __all__ = [
     "GenerationProgress",
@@ -15,5 +20,9 @@ __all__ = [
     "GenerationSettings",
     "GenerationStatus",
     "LoraSetting",
+    "LoraMetadata",
+    "LoraMetadataUpdate",
+    "LoraSearchQuery",
+    "LoraSort",
     "StoredImage",
 ]

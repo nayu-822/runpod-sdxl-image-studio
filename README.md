@@ -1,5 +1,31 @@
 # RunPod SDXL Image Studio
 
+## Phase 2B: LoRA metadata catalog
+
+Phase 2B adds a local SQLite catalog for LoRA metadata. The default database is
+`<IMAGE_STUDIO_DATA_DIR>/database/image_studio.sqlite3`; set
+`IMAGE_STUDIO_DATABASE_URL` to use an explicit database URL. The application runs
+Alembic migrations explicitly during startup, and importing modules has no database
+or filesystem side effects.
+
+The LoRA management tab supports capability synchronization, search, category and
+favorite/missing filters, metadata editing, usage sorting, and safe PNG/JPEG/WebP
+thumbnail conversion to UUID-named WebP files. Trigger words are appended to the
+positive prompt only when the user presses the explicit trigger-word button.
+Recommended strengths are applied only when a LoRA selection changes. Usage
+statistics are best-effort and never change a successful generation to a failure.
+
+Phase 2B does not connect to external metadata services, Civitai, Google Drive,
+rclone, or RunPod APIs. Gradio 5 remains the supported UI version.
+
+Migration commands:
+
+```bash
+alembic upgrade head
+alembic downgrade -1
+alembic upgrade head
+```
+
 Phase 2A (multiple LoRA and VAE selection foundation): [PHASE_2A_IMPLEMENTATION.md](PHASE_2A_IMPLEMENTATION.md)
 
 Phase 1B の実装範囲と手動確認手順は [PHASE_1B_IMPLEMENTATION.md](PHASE_1B_IMPLEMENTATION.md) にまとめています。

@@ -531,13 +531,22 @@ async def test_view_endpoint_rejects_posix_and_windows_traversal(image: ComfyUIO
     await client.close()
 
 
-def test_disable_generate_button_is_immediate_and_noninteractive() -> None:
+def _legacy_test_disable_generate_button_is_immediate_and_noninteractive() -> None:
     update = disable_generate_button()
 
     assert update.interactive is False
     assert update.value == "生成中..."
     assert update.value
     assert "逕" not in update.value
+
+
+def test_disable_generate_button_has_the_expected_label() -> None:
+    update = disable_generate_button()
+
+    assert update.value == "生成中..."
+    assert update.value
+    assert "逕滓" not in update.value
+    assert update.interactive is False
 
 
 def test_gradio_progress_conversion_is_bounded_and_safe() -> None:

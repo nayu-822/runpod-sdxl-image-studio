@@ -8,6 +8,18 @@ import posixpath
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
+def normalize_relative_lora_name(value: str) -> str:
+    """Normalize and validate a ComfyUI-relative LoRA filename."""
+
+    normalized = value.strip().replace("\\", "/")
+    if not normalized or posixpath.isabs(normalized) or ntpath.isabs(normalized):
+        raise ValueError("LoRA name must be a relative path")
+    parts = normalized.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("LoRA name contains an unsafe path segment")
+    return normalized
+
+
 class LoraSetting(BaseModel):
     """One LoRA selection and its model/CLIP strengths."""
 
@@ -21,10 +33,4 @@ class LoraSetting(BaseModel):
     @field_validator("name")
     @classmethod
     def validate_name(cls, value: str) -> str:
-        normalized = value.strip().replace("\\", "/")
-        if not normalized or posixpath.isabs(normalized) or ntpath.isabs(normalized):
-            raise ValueError("LoRA name must be a relative path")
-        parts = normalized.split("/")
-        if any(part in {"", ".", ".."} for part in parts):
-            raise ValueError("LoRA name contains an unsafe path segment")
-        return normalized
+        return normalize_relative_lora_name(value)

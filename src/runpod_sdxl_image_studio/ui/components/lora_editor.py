@@ -13,6 +13,7 @@ from runpod_sdxl_image_studio.domain.lora import LoraSetting
 
 LoraRowState: TypeAlias = dict[str, object]
 LoraEditorState: TypeAlias = list[LoraRowState]
+LoraChoice: TypeAlias = str | tuple[str, str]
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,8 @@ class LoraEditorComponents:
 
     rows: tuple[LoraRowComponents, ...]
     add_button: gr.Button
+    trigger_button: gr.Button
+    trigger_message: gr.Markdown
     state: gr.State
     choices: gr.State
 
@@ -163,7 +166,11 @@ def build_lora_editor(max_loras: int) -> LoraEditorComponents:
             )
         )
     add_button = gr.Button("Add LoRA", interactive=max_loras > 1)
-    return LoraEditorComponents(tuple(rows), add_button, state, choices)
+    trigger_button = gr.Button("選択中LoRAのトリガーワードを追加")
+    trigger_message = gr.Markdown("")
+    return LoraEditorComponents(
+        tuple(rows), add_button, trigger_button, trigger_message, state, choices
+    )
 
 
 def component_outputs(editor: LoraEditorComponents) -> list[Any]:
@@ -189,11 +196,22 @@ def render_state_updates(
     state: object,
     choices: object,
     max_loras: int,
+    *,
+    clear_unavailable: bool = False,
 ) -> tuple[object, ...]:
     """Render normalized state into preallocated component updates."""
 
     rows = normalize_lora_state(state, max_loras)
-    available = tuple(str(value) for value in choices) if isinstance(choices, Sequence) else ()
+    available = _normalize_choices(choices)
+    if clear_unavailable:
+        available_values = _choice_values(available)
+        rows = [
+            {
+                **row,
+                "lora_name": (row["lora_name"] if row["lora_name"] in available_values else None),
+            }
+            for row in rows
+        ]
     updates: list[object] = [rows]
     for index in range(max(1, max_loras)):
         row = rows[index] if index < len(rows) else _new_row()
@@ -217,9 +235,9 @@ def render_state_updates(
     return tuple(updates)
 
 
-def preserve_lora_selection(current: object, choices: Sequence[str]) -> str | None:
+def preserve_lora_selection(current: object, choices: Sequence[LoraChoice]) -> str | None:
     value = current if isinstance(current, str) else None
-    return value if value in choices else None
+    return value if value in _choice_values(choices) else None
 
 
 def _new_row() -> LoraRowState:
@@ -255,3 +273,22 @@ def _raw_rows(state: object) -> list[dict[str, object]]:
     if not isinstance(state, Sequence) or isinstance(state, (str, bytes, bytearray)):
         return []
     return [item for item in state if isinstance(item, dict)]
+
+
+def _normalize_choices(value: object) -> tuple[LoraChoice, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return ()
+    result: list[LoraChoice] = []
+    for item in value:
+        if isinstance(item, str) or (
+            isinstance(item, tuple)
+            and len(item) == 2
+            and isinstance(item[0], str)
+            and isinstance(item[1], str)
+        ):
+            result.append(item)
+    return tuple(result)
+
+
+def _choice_values(choices: Sequence[LoraChoice]) -> tuple[str, ...]:
+    return tuple(item if isinstance(item, str) else item[1] for item in choices)

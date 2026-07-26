@@ -50,8 +50,8 @@ class Settings(BaseSettings):
     data_dir: Path = Field(
         Path("/workspace/image-studio-data"), validation_alias="IMAGE_STUDIO_DATA_DIR"
     )
-    database_url: str = Field(
-        "sqlite:////workspace/image-studio-data/app.db",
+    database_url: str | None = Field(
+        None,
         validation_alias="IMAGE_STUDIO_DATABASE_URL",
     )
     workflow_dir: Path = Field(
@@ -81,6 +81,14 @@ class Settings(BaseSettings):
     max_loras: int = Field(8, validation_alias="IMAGE_STUDIO_MAX_LORAS")
     max_upscale_factor: float = Field(4.0, validation_alias="IMAGE_STUDIO_MAX_UPSCALE_FACTOR")
     thumbnail_size: int = Field(512, validation_alias="IMAGE_STUDIO_THUMBNAIL_SIZE")
+    max_lora_thumbnail_bytes: int = Field(
+        10_485_760, validation_alias="IMAGE_STUDIO_MAX_LORA_THUMBNAIL_BYTES"
+    )
+    lora_thumbnail_max_edge: int = Field(
+        512, validation_alias="IMAGE_STUDIO_LORA_THUMBNAIL_MAX_EDGE"
+    )
+    max_trigger_words: int = Field(50, validation_alias="IMAGE_STUDIO_MAX_TRIGGER_WORDS")
+    max_compatible_models: int = Field(20, validation_alias="IMAGE_STUDIO_MAX_COMPATIBLE_MODELS")
 
     rclone_remote: str = Field("", validation_alias="RCLONE_REMOTE")
     rclone_base_path: str = Field("RunPodSDXLImageStudio", validation_alias="RCLONE_BASE_PATH")
@@ -116,6 +124,10 @@ class Settings(BaseSettings):
         "thumbnail_size",
         "history_max_attempts",
         "max_output_image_bytes",
+        "max_lora_thumbnail_bytes",
+        "lora_thumbnail_max_edge",
+        "max_trigger_words",
+        "max_compatible_models",
     )
     @classmethod
     def validate_positive_integer(cls, value: int) -> int:

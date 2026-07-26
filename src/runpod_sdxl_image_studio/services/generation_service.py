@@ -40,6 +40,10 @@ class CapabilitiesProvider(Protocol):
     def __call__(self) -> Awaitable[CapabilityRefreshResult]: ...
 
 
+class LoraUsageRecorder(Protocol):
+    def record_usage(self, file_names: tuple[str, ...], completed_at: datetime) -> None: ...
+
+
 class GenerationService:
     """Coordinate validation, queueing, monitoring, recovery, and local storage."""
 
@@ -51,6 +55,7 @@ class GenerationService:
         storage: LocalStorageAdapter,
         capabilities_provider: CapabilitiesProvider,
         settings: Settings | None = None,
+        lora_catalog_service: LoraUsageRecorder | None = None,
         *,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         id_factory: Callable[[], UUID] = uuid4,
@@ -61,6 +66,7 @@ class GenerationService:
         self._storage = storage
         self._capabilities_provider = capabilities_provider
         self._settings = settings or get_settings()
+        self._lora_catalog_service = lora_catalog_service
         self._sleep = sleep
         self._id_factory = id_factory
         self._jobs: dict[UUID, GenerationJob] = {}
@@ -116,6 +122,18 @@ class GenerationService:
                 timeout=self._settings.generation_timeout_seconds,
             )
             result = self._result_for_job(job, seed, created_at)
+            if (
+                result.status is GenerationStatus.COMPLETED
+                and self._lora_catalog_service is not None
+                and resolved_settings.loras
+            ):
+                try:
+                    self._lora_catalog_service.record_usage(
+                        tuple(lora.name for lora in resolved_settings.loras),
+                        created_at,
+                    )
+                except Exception:  # noqa: BLE001 - usage statistics are best effort
+                    logger.warning("LoRA usage statistics update failed", exc_info=True)
         except Exception as exc:  # noqa: BLE001 - boundary converts failures to safe UI text
             logger.error("Generation job failed: %s", type(exc).__name__)
             job.status = GenerationStatus.FAILED

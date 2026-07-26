@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import gradio as gr
 from pydantic import ValidationError
@@ -13,6 +14,10 @@ from runpod_sdxl_image_studio.domain.generation import GenerationProgress, Gener
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
 from runpod_sdxl_image_studio.services.comfyui_service import ComfyUIService
 from runpod_sdxl_image_studio.services.generation_service import GenerationService
+from runpod_sdxl_image_studio.services.lora_catalog_service import (
+    LoraCatalogError,
+    LoraCatalogService,
+)
 from runpod_sdxl_image_studio.ui.components.lora_editor import (
     LoraEditorComponents,
     build_lora_editor,
@@ -51,6 +56,7 @@ class GenerationTabComponents:
     upscaler: gr.Dropdown
     lora_list: gr.Markdown
     lora_editor: LoraEditorComponents
+    lora_category_filter: gr.Dropdown
     positive_prompt: gr.Textbox
     negative_prompt: gr.Textbox
     size_preset: gr.Dropdown
@@ -64,6 +70,25 @@ class GenerationTabComponents:
     progress: gr.Markdown
     result_image: gr.Image
     result_details: gr.Markdown
+
+
+def capability_refresh_outputs(generation: GenerationTabComponents) -> tuple[Any, ...]:
+    """Single source of truth for capability refresh event outputs."""
+
+    return (
+        generation.checkpoint,
+        generation.vae,
+        generation.sampler,
+        generation.scheduler,
+        generation.upscaler,
+        generation.lora_list,
+        generation.generate_button,
+        generation.lora_editor.choices,
+        generation.lora_editor.state,
+        *component_outputs(generation.lora_editor),
+        generation.lora_editor.add_button,
+        generation.lora_category_filter,
+    )
 
 
 def build_system_tab(comfyui_url: str, initial_markdown: str) -> SystemTabComponents:
@@ -114,6 +139,7 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
             upscaler = gr.Dropdown([], label="upscaler", interactive=False)
     lora_list = gr.Markdown("**LoRA list:** unavailable")
     lora_editor = build_lora_editor(max_loras)
+    lora_category_filter = gr.Dropdown([], label="LoRAカテゴリ", interactive=False)
     generate_button = gr.Button("Generate", variant="primary", interactive=False, size="lg")
     progress = gr.Markdown("")
     result_image = gr.Image(label="Generated image", type="filepath")
@@ -126,6 +152,7 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
         upscaler=upscaler,
         lora_list=lora_list,
         lora_editor=lora_editor,
+        lora_category_filter=lora_category_filter,
         positive_prompt=positive_prompt,
         negative_prompt=negative_prompt,
         size_preset=size_preset,
@@ -146,6 +173,7 @@ def make_check_connection_handler(
     service: ComfyUIService,
     timezone_name: str,
     generation: GenerationTabComponents,
+    catalog_service: LoraCatalogService | None = None,
 ) -> Callable[..., Awaitable[tuple[object, ...]]]:
     """Create an async handler that obtains status through the service."""
 
@@ -157,14 +185,19 @@ def make_check_connection_handler(
         upscaler: str | None,
         lora_state: object = None,
         lora_choices: object = None,
+        lora_category: str | None = None,
     ) -> tuple[object, ...]:
         status = await service.get_status()
+        catalog_choices = _catalog_choices(catalog_service, status.capabilities)
+        catalog_categories = _catalog_categories(catalog_service)
         updates = _capability_updates(
             status.capabilities,
             (checkpoint, vae, sampler, scheduler, upscaler),
             generation,
             lora_state,
-            lora_choices,
+            catalog_choices,
+            lora_category,
+            catalog_categories,
         )
         return (
             status_markdown(status, timezone_name),
@@ -178,6 +211,7 @@ def make_check_connection_handler(
 def make_refresh_handler(
     service: ComfyUIService,
     generation: GenerationTabComponents,
+    catalog_service: LoraCatalogService | None = None,
 ) -> Callable[..., Awaitable[tuple[object, ...]]]:
     """Create an async handler for capability-only refreshes."""
 
@@ -189,6 +223,7 @@ def make_refresh_handler(
         upscaler: str | None,
         lora_state: object = None,
         lora_choices: object = None,
+        lora_category: str | None = None,
     ) -> tuple[object, ...]:
         refresh_result = await service.refresh_capabilities()
         if not refresh_result.is_success or refresh_result.capabilities is None:
@@ -198,7 +233,9 @@ def make_refresh_handler(
             (checkpoint, vae, sampler, scheduler, upscaler),
             generation,
             lora_state,
-            lora_choices,
+            _catalog_choices(catalog_service, refresh_result.capabilities),
+            lora_category,
+            _catalog_categories(catalog_service),
         )
         return (refresh_result.message, *updates)
 
@@ -289,11 +326,29 @@ def make_generate_handler(
     return handler
 
 
-def disable_generate_button() -> gr.Button:
+def _legacy_disable_generate_button() -> gr.Button:
     """Disable the action before the queued generation handler starts."""
 
     return gr.Button(
         value="生成中...",
+        interactive=False,
+    )
+
+
+def _legacy_disable_generate_button_with_mojibake() -> gr.Button:
+    """Disable the action before the queued generation handler starts."""
+
+    return gr.Button(
+        value="生成中...",
+        interactive=False,
+    )
+
+
+def disable_generate_button() -> gr.Button:
+    """Disable the action before the queued generation handler starts."""
+
+    return gr.Button(
+        value="\u751f\u6210\u4e2d...",
         interactive=False,
     )
 
@@ -328,7 +383,9 @@ def _capability_updates(
     current_values: tuple[object, ...],
     generation: GenerationTabComponents,
     lora_state: object = None,
-    lora_choices: object = None,
+    lora_choice_options: object = None,
+    lora_category: str | None = None,
+    category_options: Sequence[str] = (),
 ) -> tuple[object, ...]:
     if capabilities is None:
         return _empty_updates(generation)
@@ -371,14 +428,27 @@ def _capability_updates(
     )
     rendered = render_state_updates(
         lora_state,
-        capabilities.loras,
+        lora_choice_options if lora_choice_options is not None else capabilities.loras,
         len(generation.lora_editor.rows),
+        clear_unavailable=True,
+    )
+    selected_options = (
+        list(lora_choice_options)
+        if isinstance(lora_choice_options, Sequence)
+        and not isinstance(lora_choice_options, (str, bytes, bytearray))
+        else list(capabilities.loras)
     )
     return tuple(updates) + (
         lora_markdown(capabilities),
         gr.Button(interactive=can_generate),
-        list(capabilities.loras),
+        selected_options,
         *rendered,
+        gr.Dropdown(
+            choices=list(category_options),
+            value=preserve_selection(lora_category, tuple(category_options)),
+            label=generation.lora_category_filter.label,
+            interactive=bool(category_options),
+        ),
     )
 
 
@@ -394,11 +464,35 @@ def _empty_updates(generation: GenerationTabComponents) -> tuple[object, ...]:
         gr.Button(interactive=False),
         [],
         *rendered,
+        gr.Dropdown([], label=generation.lora_category_filter.label, interactive=False),
     )
 
 
 def _preserve_updates(generation: GenerationTabComponents) -> tuple[object, ...]:
     """Leave all editable controls untouched after a refresh failure."""
 
-    preserved_count = 7 + 1 + 1 + len(component_outputs(generation.lora_editor)) + 1
-    return tuple(gr.skip() for _ in range(preserved_count))
+    return tuple(gr.skip() for _ in capability_refresh_outputs(generation))
+
+
+def _catalog_choices(
+    catalog_service: LoraCatalogService | None,
+    capabilities: ComfyUICapabilities | None,
+) -> object:
+    if capabilities is None:
+        return None
+    if catalog_service is None:
+        return capabilities.loras
+    try:
+        catalog_service.sync_with_capabilities(capabilities.loras)
+        return catalog_service.selector_options()
+    except LoraCatalogError:
+        return capabilities.loras
+
+
+def _catalog_categories(catalog_service: LoraCatalogService | None) -> tuple[str, ...]:
+    if catalog_service is None:
+        return ()
+    try:
+        return catalog_service.categories()
+    except Exception:  # noqa: BLE001 - capability refresh must remain usable
+        return ()

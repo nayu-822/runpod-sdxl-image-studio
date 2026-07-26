@@ -15,6 +15,7 @@ from runpod_sdxl_image_studio.domain.system_status import (
 )
 from runpod_sdxl_image_studio.ui.tabs.system_tab import (
     build_generation_tab,
+    capability_refresh_outputs,
     make_check_connection_handler,
     make_refresh_handler,
 )
@@ -81,3 +82,15 @@ async def test_refresh_handler_keeps_app_alive_on_service_failure() -> None:
     assert all(
         isinstance(update, dict) and update.get("__type__") == "update" for update in result[1:]
     )
+    assert len(result[1:]) == len(capability_refresh_outputs(generation))
+
+
+@pytest.mark.asyncio
+async def test_preserve_output_shape_follows_configured_editor_rows() -> None:
+    service = FakeService()
+    with gr.Blocks():
+        generation = build_generation_tab(max_loras=3)
+        handler = make_refresh_handler(service, generation)
+        result = await handler(None, None, None, None, None)
+
+    assert len(result[1:]) == len(capability_refresh_outputs(generation))
