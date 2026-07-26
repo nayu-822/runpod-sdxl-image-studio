@@ -32,7 +32,23 @@
 - 秘密情報や生成画像が Git 対象外になっている
 - 文書間の優先順位が明確である
 
-## Phase 1: 最小画像生成基盤
+## Phase 1A: ComfyUI接続・能力取得基盤
+
+### 目的
+
+Gradio から Application Service を経由して ComfyUI の稼働状態と利用可能な生成パラメータを取得できる状態にする。
+
+### 完了状況
+
+- `/system_stats` / `/object_info` の HTTP 取得
+- checkpoint、VAE、sampler、scheduler、LoRA、upscaler の解析
+- 接続状態と能力情報の Gradio 表示
+- 手動の接続確認・一覧再読込
+- fixture を使った単体・統合テスト
+
+画像生成、`/prompt`、WebSocket、workflow、SQLite、画像保存は Phase 1B 以降で実装する。
+
+## Phase 1B: 最小画像生成基盤
 
 ### 目的
 

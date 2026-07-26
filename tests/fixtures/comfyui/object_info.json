@@ -1,0 +1,50 @@
+{
+  "CheckpointLoaderSimple": {
+    "input": {
+      "required": {
+        "ckpt_name": [
+          [
+            "test-model-b.safetensors",
+            "test-model-a.safetensors",
+            "test-model-a.safetensors",
+            ""
+          ]
+        ]
+      }
+    },
+    "class_type": "CheckpointLoaderSimple"
+  },
+  "VAELoader": {
+    "input": {
+      "required": {
+        "vae_name": [["test-vae.safetensors"]]
+      }
+    },
+    "class_type": "VAELoader"
+  },
+  "KSampler": {
+    "input": {
+      "required": {
+        "sampler_name": [["euler", "ddim", "euler"]],
+        "scheduler": [["normal", "karras"]]
+      }
+    },
+    "class_type": "KSampler"
+  },
+  "LoraLoader": {
+    "input": {
+      "required": {
+        "lora_name": [["test-character.safetensors", "test-character.safetensors"]]
+      }
+    },
+    "class_type": "LoraLoader"
+  },
+  "UpscaleModelLoader": {
+    "input": {
+      "required": {
+        "model_name": [["test-upscaler.pth"]]
+      }
+    },
+    "class_type": "UpscaleModelLoader"
+  }
+}

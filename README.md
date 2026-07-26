@@ -214,6 +214,23 @@ Phase 0 では、実装を安全に始めるためのプロジェクト基盤を
 
 Phase 0 の起動時には ComfyUI、データベース、GPU、rclone へ接続しません。画像生成、履歴、SQLite、Google Drive 同期などは後続フェーズで追加します。
 
+## Phase 1A の状態
+
+Phase 1A では、ComfyUI の状態と利用可能な能力を確認する基盤を追加しました。
+
+- `httpx.AsyncClient` による ComfyUI HTTP クライアント
+- `/system_stats` と `/object_info` の取得
+- checkpoint / VAE / sampler / scheduler / LoRA / upscaler の一覧解析
+- 欠損ノード、欠損フィールド、接続失敗、timeout の安全な処理
+- Application Service 経由の状態集約
+- 生成タブとシステムタブの状態表示
+- 接続確認とモデル一覧の手動再読込
+- 実 ComfyUI に接続しない fixture ベースの単体・統合テスト
+
+ComfyUI は `COMFYUI_BASE_URL` で指定した URL から読み取ります。RunPod では通常、同一 Pod 内の `http://127.0.0.1:8188` へ接続する想定です。アプリ起動だけでは ComfyUI へ接続せず、「接続確認」または「モデル一覧を再読込」を押したときだけ通信します。
+
+Phase 1A では画像生成、`/prompt`、WebSocket、workflow、画像保存、SQLite、Google Drive 同期はまだ実装していません。
+
 ## 開発環境のセットアップ
 
 Python 3.11 以上を用意し、リポジトリのルートで次を実行します。
@@ -248,7 +265,24 @@ python -m runpod_sdxl_image_studio.app
 runpod-sdxl-image-studio
 ```
 
-ブラウザで `http://127.0.0.1:7860` を開くと、Phase 0 の状態画面が表示されます。`share=True` は使用しません。RunPod での本番起動や ComfyUI 接続は後続フェーズで追加します。
+ブラウザで `http://127.0.0.1:7860` を開くと、Phase 1A の状態画面が表示されます。`share=True` は使用しません。RunPod での本番起動設定は後続フェーズで追加します。
+
+## Phase 1A の手動確認
+
+```bash
+cp .env.example .env
+python -m runpod_sdxl_image_studio.app
+```
+
+ブラウザで次を確認します。
+
+1. 「生成」と「システム」タブが表示される
+2. 初期状態が「未確認」、各一覧が「未取得」である
+3. 「接続確認」で system stats と能力情報が更新される
+4. 「モデル一覧を再読込」で Dropdown と LoRA 一覧が更新される
+5. ComfyUI 停止時もアプリは落ちず、安全な日本語メッセージが表示される
+
+テストおよび CI は実 ComfyUI、GPU、Google Drive を必要としません。
 
 ## セキュリティ
 

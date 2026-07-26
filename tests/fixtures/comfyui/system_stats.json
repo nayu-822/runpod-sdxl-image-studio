@@ -1,0 +1,19 @@
+{
+  "system": {
+    "os": "linux",
+    "python_version": "3.12.8",
+    "embedded_python": false,
+    "comfyui_version": "0.3.30"
+  },
+  "devices": [
+    {
+      "name": "NVIDIA Test GPU",
+      "type": "cuda",
+      "index": 0,
+      "vram_total": 17179869184,
+      "vram_free": 12884901888,
+      "torch_vram_total": 17179869184,
+      "torch_vram_free": 12000000000
+    }
+  ]
+}
