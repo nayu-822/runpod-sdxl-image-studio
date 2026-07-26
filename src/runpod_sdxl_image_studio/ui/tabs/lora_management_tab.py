@@ -178,9 +178,13 @@ def make_select_handler(
         if not selected:
             return (gr.skip(),) * 9
         try:
-            metadata = catalog.get_metadata(UUID(selected))
+            metadata_id = UUID(selected)
         except ValueError:
-            metadata = None
+            return (gr.skip(),) * 9
+        try:
+            metadata = catalog.get_metadata(metadata_id)
+        except LoraCatalogError:
+            return (gr.skip(),) * 9
         if metadata is None:
             return (gr.skip(),) * 9
         preview = catalog.thumbnail_path(metadata.id)
@@ -221,9 +225,11 @@ def make_save_handler(
         generation_category: str | None = None,
         generation_state: object = None,
     ) -> tuple[object, ...]:
-        output_count = 7 + 7 * max_loras
         if not selected:
-            return ("LoRAを選択してください。",) + (gr.skip(),) * output_count
+            return (
+                "LoRAを選択してください。",
+                *metadata_save_preserve_updates(max_loras),
+            )
         try:
             metadata = catalog.update_metadata(
                 UUID(selected),
@@ -252,7 +258,10 @@ def make_save_handler(
                 max_loras,
             )
         except (LoraCatalogError, ValidationError, ValueError):
-            return ("入力値を確認してください。",) + (gr.skip(),) * output_count
+            return (
+                "入力値を確認してください。",
+                *metadata_save_preserve_updates(max_loras),
+            )
 
     return handler
 
@@ -372,6 +381,20 @@ def build_catalog_list_updates(
             value=category if category in category_values else None,
             interactive=bool(category_values),
         ),
+    )
+
+
+def metadata_save_preserve_updates(max_loras: int) -> tuple[object, ...]:
+    """Preserve every save-event output except its user-facing message."""
+
+    return (
+        gr.skip(),  # result_list
+        gr.skip(),  # selected
+        gr.skip(),  # category_filter
+        gr.skip(),  # generation choices
+        gr.skip(),  # generation state
+        *(gr.skip() for _ in range(7 * max_loras)),
+        gr.skip(),  # add button
     )
 
 

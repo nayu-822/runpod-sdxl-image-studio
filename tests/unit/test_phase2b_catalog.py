@@ -40,6 +40,7 @@ from runpod_sdxl_image_studio.ui.tabs.lora_management_tab import (
     build_catalog_list_updates,
     make_favorite_handler,
     make_save_handler,
+    make_select_handler,
 )
 
 
@@ -270,6 +271,7 @@ def test_metadata_changes_refresh_catalog_and_generation_views(tmp_path: Path) -
         None,
         [],
     )
+    assert len(save_result) == 7 + 7 * 2
     assert "Updated Style" in save_result[1]
     assert save_result[2].choices[0][0] == "Updated Style — style.safetensors"
     assert ("character", "character") in save_result[3].choices
@@ -278,3 +280,109 @@ def test_metadata_changes_refresh_catalog_and_generation_views(tmp_path: Path) -
     invalid = favorite("not-a-uuid", True)
     assert invalid[0].value is False
     assert "UUID" in invalid[1]
+
+
+def _assert_skip_updates(updates: tuple[object, ...]) -> None:
+    assert all(update == gr.skip() for update in updates)
+
+
+@pytest.mark.parametrize("max_loras", [1, 2, 8, 12])
+def test_save_handler_returns_matching_output_count_when_no_selection(
+    max_loras: int,
+) -> None:
+    result = make_save_handler(object(), max_loras)(None, "", "", False, "", None, None, "", "")
+
+    assert len(result) == 7 + 7 * max_loras
+    assert result[0] == "LoRAを選択してください。"
+    _assert_skip_updates(result[1:])
+
+
+@pytest.mark.parametrize("max_loras", [1, 2, 8, 12])
+def test_save_handler_returns_matching_output_count_on_validation_error(
+    max_loras: int,
+) -> None:
+    class ValidationCatalog:
+        def update_metadata(self, metadata_id: UUID, update: LoraMetadataUpdate) -> None:
+            del metadata_id, update
+            raise AssertionError("validation must happen before the catalog call")
+
+    result = make_save_handler(ValidationCatalog(), max_loras)(
+        str(UUID(int=1)),
+        "",
+        "",
+        False,
+        "",
+        3.0,
+        None,
+        "",
+        "",
+    )
+
+    assert len(result) == 7 + 7 * max_loras
+    assert result[0] == "入力値を確認してください。"
+    _assert_skip_updates(result[1:])
+    assert "3.0" not in str(result)
+
+
+@pytest.mark.parametrize("max_loras", [1, 2, 8, 12])
+def test_save_handler_returns_matching_output_count_on_catalog_error(
+    max_loras: int,
+) -> None:
+    class FailingCatalog:
+        def update_metadata(self, metadata_id: UUID, update: LoraMetadataUpdate) -> None:
+            del metadata_id, update
+            raise LoraCatalogError("database details")
+
+    result = make_save_handler(FailingCatalog(), max_loras)(
+        str(UUID(int=1)),
+        "",
+        "",
+        False,
+        "",
+        None,
+        None,
+        "",
+        "",
+    )
+
+    assert len(result) == 7 + 7 * max_loras
+    assert result[0] == "入力値を確認してください。"
+    _assert_skip_updates(result[1:])
+    assert "database details" not in str(result)
+
+
+def test_select_handler_preserves_form_on_invalid_uuid() -> None:
+    class UnexpectedCatalog:
+        def get_metadata(self, metadata_id: UUID) -> None:
+            del metadata_id
+            raise AssertionError("invalid UUID must not reach the catalog")
+
+    result = make_select_handler(UnexpectedCatalog())("not-a-uuid")
+
+    assert len(result) == 9
+    _assert_skip_updates(result)
+
+
+def test_select_handler_preserves_form_on_catalog_error() -> None:
+    class FailingCatalog:
+        def get_metadata(self, metadata_id: UUID) -> None:
+            del metadata_id
+            raise LoraCatalogError("database details")
+
+    result = make_select_handler(FailingCatalog())(str(UUID(int=1)))
+
+    assert len(result) == 9
+    _assert_skip_updates(result)
+    assert "database details" not in str(result)
+
+
+def test_select_handler_preserves_form_when_metadata_was_deleted() -> None:
+    class EmptyCatalog:
+        def get_metadata(self, metadata_id: UUID) -> None:
+            del metadata_id
+            return None
+
+    result = make_select_handler(EmptyCatalog())(str(UUID(int=1)))
+
+    assert len(result) == 9
+    _assert_skip_updates(result)
