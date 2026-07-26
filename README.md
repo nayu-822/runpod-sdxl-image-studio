@@ -201,22 +201,54 @@ Google Drive/
 3. `CODING_RULES.md`
 4. `AGENTS.md`
 
-## 初期フェーズの対象
+## Phase 0 の状態
 
-Phase 1 では以下を実装します。
+Phase 0 では、実装を安全に始めるためのプロジェクト基盤を提供します。
 
-- Python パッケージ基盤
-- Gradio のスマートフォン対応 UI
-- ComfyUI 接続確認
-- checkpoint / LoRA 一覧取得
-- 基本的な txt2img 生成
-- 生成履歴とメタデータ保存
-- ローカル保存
-- 生成前チェックの基礎
-- ジョブ / キューの基礎構造
-- テスト・静的解析・CI
+- `src` レイアウトの Python パッケージ
+- `pydantic-settings` による型付き設定
+- スマートフォン幅を考慮した最小 Gradio Blocks UI
+- pytest / coverage / ruff / mypy の設定
+- Python 3.11 / 3.12 用 GitHub Actions
+- 後続フェーズ用の domain / service / adapter / persistence / UI 境界
 
-Google Drive 同期、プリセット、履歴検索、LoRA 補助情報管理、アップスケール、外部 metadata インポート、システム状態画面の詳細は後続フェーズで追加します。
+Phase 0 の起動時には ComfyUI、データベース、GPU、rclone へ接続しません。画像生成、履歴、SQLite、Google Drive 同期などは後続フェーズで追加します。
+
+## 開発環境のセットアップ
+
+Python 3.11 以上を用意し、リポジトリのルートで次を実行します。
+
+```bash
+python -m venv .venv
+# macOS / Linux
+source .venv/bin/activate
+# Windows PowerShell
+# .venv\\Scripts\\Activate.ps1
+python -m pip install --upgrade pip
+pip install -e ".[dev]"
+copy .env.example .env  # Windows PowerShell
+# cp .env.example .env  # macOS / Linux
+```
+
+設定値は `.env.example` をコピーした `.env` で変更します。設定読み込みだけではディレクトリ作成や外部接続は行われません。
+
+## Phase 0 の確認
+
+```bash
+ruff format --check .
+ruff check .
+mypy src
+pytest --cov=runpod_sdxl_image_studio --cov-report=term-missing
+python -m runpod_sdxl_image_studio.app
+```
+
+または editable install 後に console script を使えます。
+
+```bash
+runpod-sdxl-image-studio
+```
+
+ブラウザで `http://127.0.0.1:7860` を開くと、Phase 0 の状態画面が表示されます。`share=True` は使用しません。RunPod での本番起動や ComfyUI 接続は後続フェーズで追加します。
 
 ## セキュリティ
 
