@@ -249,7 +249,10 @@ def make_generate_handler(
 def disable_generate_button() -> gr.Button:
     """Disable the action before the queued generation handler starts."""
 
-    return gr.Button(value="逕滓・荳ｭ...", interactive=False)
+    return gr.Button(
+        value="生成中...",
+        interactive=False,
+    )
 
 
 def report_gradio_progress(progress: gr.Progress, update: GenerationProgress) -> None:

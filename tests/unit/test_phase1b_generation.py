@@ -35,7 +35,11 @@ from runpod_sdxl_image_studio.adapters.comfyui.workflow_adapter import WorkflowA
 from runpod_sdxl_image_studio.adapters.storage.exceptions import StorageError
 from runpod_sdxl_image_studio.adapters.storage.local_storage import LocalStorageAdapter
 from runpod_sdxl_image_studio.config import Settings
-from runpod_sdxl_image_studio.domain.generation import GenerationProgress, GenerationStatus
+from runpod_sdxl_image_studio.domain.generation import (
+    GenerationProgress,
+    GenerationResult,
+    GenerationStatus,
+)
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
 from runpod_sdxl_image_studio.domain.system_status import CapabilityRefreshResult
 from runpod_sdxl_image_studio.services.generation_service import GenerationService
@@ -319,6 +323,110 @@ async def test_generation_service_recovers_after_websocket_disconnect_without_re
     assert sleeps == [2, 2]
 
 
+@pytest.mark.asyncio
+async def test_generation_service_fails_after_history_max_attempts_without_unlimited_polling(
+    tmp_path: Path,
+) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.history_calls = 0
+
+        async def queue_prompt(self, workflow: object, client_id: str) -> QueuedPrompt:
+            return QueuedPrompt("prompt-123", 1, {})
+
+        async def get_prompt_history(self, prompt_id: str) -> PromptHistory:
+            self.history_calls += 1
+            return PromptHistory(prompt_id, False, False, (), None)
+
+    class FakeWebSocket:
+        async def watch_prompt(self, prompt_id: str, client_id: str):
+            if False:
+                yield None
+            raise ComfyUIWebSocketDisconnectedError("private disconnect detail")
+
+    capabilities = ComfyUICapabilities(
+        checkpoints=("test-model-a.safetensors",),
+        vaes=(),
+        samplers=("euler",),
+        schedulers=("normal",),
+        loras=(),
+        upscale_models=(),
+        available_node_classes=frozenset(),
+        warnings=(),
+    )
+    sleeps: list[float] = []
+
+    async def fake_sleep(value: float) -> None:
+        sleeps.append(value)
+
+    settings = Settings(
+        _env_file=None,
+        data_dir=tmp_path,
+        generation_timeout_seconds=5,
+        history_poll_interval_seconds=2,
+        history_max_attempts=3,
+    )
+    client = FakeClient()
+    service = GenerationService(
+        client,  # type: ignore[arg-type]
+        WorkflowAdapter(load_txt2img_template().as_mapping()),
+        FakeWebSocket(),  # type: ignore[arg-type]
+        LocalStorageAdapter(settings),
+        lambda: _async_capability_result(capabilities),
+        settings,
+        sleep=fake_sleep,
+        id_factory=lambda: UUID(int=12),
+    )
+
+    result = await service.generate(_settings())
+
+    assert result.status is GenerationStatus.FAILED
+    assert client.history_calls == 3
+    assert sleeps == [2, 2]
+    assert result.error_message == "ComfyUIで画像生成を完了できませんでした"
+    assert "private disconnect detail" not in (result.error_message or "")
+
+
+@pytest.mark.asyncio
+async def test_failed_generation_handler_reenables_button() -> None:
+    class FailedService:
+        async def generate(
+            self, settings: GenerationSettings, progress_callback: object
+        ) -> GenerationResult:
+            return GenerationResult(
+                generation_id=UUID(int=13),
+                prompt_id="prompt-123",
+                status=GenerationStatus.FAILED,
+                seed=123,
+                stored_image=None,
+                error_message="安全な生成エラー",
+                created_at=datetime.now(UTC),
+            )
+
+    from runpod_sdxl_image_studio.ui.tabs.system_tab import make_generate_handler
+
+    handler = make_generate_handler(FailedService())  # type: ignore[arg-type]
+    button, status, image, details = await handler(
+        "test-model-a.safetensors",
+        "positive",
+        "negative",
+        "Custom",
+        1024,
+        1024,
+        "Fixed",
+        123,
+        28,
+        5.5,
+        "euler",
+        "normal",
+    )
+
+    assert button.interactive is True
+    assert status == "Failed"
+    assert image is None
+    assert details == "安全な生成エラー"
+
+
 def test_websocket_abnormal_events_are_ignored_or_normalized() -> None:
     wrong_prompt = parse_websocket_message(
         {"type": "progress", "data": {"prompt_id": "prompt-b", "value": 1, "max": 2}},
@@ -427,6 +535,9 @@ def test_disable_generate_button_is_immediate_and_noninteractive() -> None:
     update = disable_generate_button()
 
     assert update.interactive is False
+    assert update.value == "生成中..."
+    assert update.value
+    assert "逕" not in update.value
 
 
 def test_gradio_progress_conversion_is_bounded_and_safe() -> None:
