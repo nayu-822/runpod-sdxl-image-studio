@@ -11,7 +11,6 @@ import httpx
 
 from runpod_sdxl_image_studio.adapters.comfyui.exceptions import (
     ComfyUIConnectionError,
-    ComfyUIError,
     ComfyUIResponseError,
     ComfyUITimeoutError,
 )
@@ -74,20 +73,11 @@ class ComfyUIClient:
         return parse_object_info(payload)
 
     async def check_connection(self) -> ComfyUIConnectionResult:
-        """Perform an explicit health check without exposing low-level errors."""
+        """Perform an explicit health check and propagate adapter errors."""
 
         checked_at = datetime.now(UTC)
         logger.info("ComfyUI 接続確認開始")
-        try:
-            system_stats = await self.get_system_stats()
-        except ComfyUIError as exc:
-            logger.warning("ComfyUI 接続確認失敗: %s", type(exc).__name__)
-            return ComfyUIConnectionResult(
-                is_connected=False,
-                message="ComfyUIへの接続に失敗しました",
-                checked_at=checked_at,
-                system_stats=None,
-            )
+        system_stats = await self.get_system_stats()
 
         logger.info("ComfyUI 接続確認成功")
         return ComfyUIConnectionResult(

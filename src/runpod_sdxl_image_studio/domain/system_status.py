@@ -12,6 +12,16 @@ from runpod_sdxl_image_studio.adapters.comfyui.models import (
 
 
 @dataclass(frozen=True)
+class CapabilityRefreshResult:
+    """Service result for a capability refresh operation."""
+
+    is_success: bool
+    message: str
+    capabilities: ComfyUICapabilities | None
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class ComfyUIStatus:
     """Aggregated status data suitable for a UI view model."""
 

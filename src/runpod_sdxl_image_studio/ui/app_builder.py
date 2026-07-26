@@ -33,14 +33,14 @@ def build_app(
 
     app_settings = settings or get_settings()
     comfyui_service = service or ComfyUIService(ComfyUIClient(app_settings))
-    with gr.Blocks(title=APP_TITLE) as demo:
+    with gr.Blocks(title=APP_TITLE, css=APP_CSS) as demo:
         gr.Markdown(f"# {APP_TITLE}")
         with gr.Tab("生成"):
             generation = build_generation_tab()
         with gr.Tab("システム"):
             system = build_system_tab(
                 app_settings.comfyui_base_url,
-                initial_status_markdown(app_settings.comfyui_base_url),
+                initial_status_markdown(),
             )
 
         capability_inputs = [
@@ -61,7 +61,6 @@ def build_app(
         system.connection_button.click(
             fn=make_check_connection_handler(
                 comfyui_service,
-                app_settings.comfyui_base_url,
                 app_settings.timezone,
                 generation,
             ),

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from runpod_sdxl_image_studio.config import get_settings
-from runpod_sdxl_image_studio.ui.app_builder import APP_CSS, build_app
+from runpod_sdxl_image_studio.ui.app_builder import build_app
 
 
 def main() -> None:
@@ -13,7 +13,6 @@ def main() -> None:
     build_app(settings).launch(
         server_name=settings.host,
         server_port=settings.port,
-        css=APP_CSS,
         share=False,
     )
 

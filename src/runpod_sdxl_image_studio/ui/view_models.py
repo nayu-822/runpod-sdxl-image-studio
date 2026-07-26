@@ -9,25 +9,23 @@ from runpod_sdxl_image_studio.adapters.comfyui.models import ComfyUICapabilities
 from runpod_sdxl_image_studio.domain.system_status import ComfyUIStatus
 
 
-def initial_status_markdown(comfyui_url: str) -> str:
+def initial_status_markdown() -> str:
     """Render the external-connection-free initial status."""
 
     return "\n".join(
         (
             "### ComfyUI 状態: 未確認",
-            f"**接続先URL:** `{comfyui_url}`",
-            "接続確認ボタンを押すと ComfyUI の状態を取得します。",
-            "**最終確認日時:** 未確認",
+            "**最終確認日時:** -",
             "**checkpoint / VAE / LoRA / upscaler:** 未取得",
         )
     )
 
 
-def status_markdown(status: ComfyUIStatus, comfyui_url: str, timezone_name: str) -> str:
+def status_markdown(status: ComfyUIStatus, timezone_name: str) -> str:
     """Render safe, bounded system information for display."""
 
     state_label = "接続" if status.is_connected else status.message
-    lines = [f"### ComfyUI 状態: {state_label}", f"**接続先URL:** `{comfyui_url}`"]
+    lines = [f"### ComfyUI 状態: {state_label}"]
     lines.append(f"**最終確認日時:** {_format_datetime(status.checked_at, timezone_name)}")
 
     system_stats = status.system_stats

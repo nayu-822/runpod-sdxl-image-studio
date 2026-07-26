@@ -13,6 +13,7 @@ from runpod_sdxl_image_studio.adapters.comfyui.models import (
     ComfyUISystemStats,
 )
 from runpod_sdxl_image_studio.adapters.comfyui.parsers import parse_object_info
+from runpod_sdxl_image_studio.domain.system_status import CapabilityRefreshResult
 from runpod_sdxl_image_studio.services.comfyui_service import ComfyUIService
 
 FIXTURE_DIR = Path(__file__).parents[1] / "fixtures" / "comfyui"
@@ -61,6 +62,24 @@ async def test_service_preserves_parser_warnings() -> None:
 
     assert status.capabilities is not None
     assert status.warnings
+
+
+@pytest.mark.asyncio
+async def test_refresh_capabilities_returns_failure_dto() -> None:
+    client = FakeClient()
+
+    async def fail() -> ComfyUIObjectInfo:
+        raise ComfyUITimeoutError("internal timeout details")
+
+    client.get_object_info = fail  # type: ignore[method-assign]
+
+    result = await ComfyUIService(client).refresh_capabilities()
+
+    assert result == CapabilityRefreshResult(
+        is_success=False,
+        message="ComfyUIへの接続がタイムアウトしました",
+        capabilities=None,
+    )
 
 
 @pytest.mark.asyncio

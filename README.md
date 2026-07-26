@@ -227,6 +227,8 @@ Phase 1A では、ComfyUI の状態と利用可能な能力を確認する基盤
 - 接続確認とモデル一覧の手動再読込
 - 実 ComfyUI に接続しない fixture ベースの単体・統合テスト
 
+CSSをUI構築側の `gr.Blocks` に保持するため、Phase 1AではGradio 6未満を使用します。
+
 ComfyUI は `COMFYUI_BASE_URL` で指定した URL から読み取ります。RunPod では通常、同一 Pod 内の `http://127.0.0.1:8188` へ接続する想定です。アプリ起動だけでは ComfyUI へ接続せず、「接続確認」または「モデル一覧を再読込」を押したときだけ通信します。
 
 Phase 1A では画像生成、`/prompt`、WebSocket、workflow、画像保存、SQLite、Google Drive 同期はまだ実装していません。

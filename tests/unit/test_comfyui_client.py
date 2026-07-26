@@ -117,14 +117,11 @@ async def test_invalid_json_is_translated() -> None:
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_check_connection_returns_safe_failure_result() -> None:
+async def test_check_connection_propagates_connection_error() -> None:
     respx.get("http://comfy.test:8188/system_stats").mock(
         side_effect=httpx.ConnectError("connection refused")
     )
     client = ComfyUIClient(base_url="http://comfy.test:8188")
 
-    result = await client.check_connection()
-
-    assert result.is_connected is False
-    assert result.system_stats is None
-    assert result.message == "ComfyUIへの接続に失敗しました"
+    with pytest.raises(ComfyUIConnectionError):
+        await client.check_connection()

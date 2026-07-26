@@ -9,10 +9,14 @@ from runpod_sdxl_image_studio.adapters.comfyui.models import (
     ComfyUICapabilities,
     ComfyUISystemStats,
 )
-from runpod_sdxl_image_studio.domain.system_status import ComfyUIStatus
+from runpod_sdxl_image_studio.domain.system_status import (
+    CapabilityRefreshResult,
+    ComfyUIStatus,
+)
 from runpod_sdxl_image_studio.ui.tabs.system_tab import (
     build_generation_tab,
     make_check_connection_handler,
+    make_refresh_handler,
 )
 
 
@@ -42,15 +46,16 @@ class FakeService:
             error_summary=None,
         )
 
+    async def refresh_capabilities(self) -> CapabilityRefreshResult:
+        return CapabilityRefreshResult(False, "更新に失敗しました", None)
+
 
 @pytest.mark.asyncio
 async def test_system_handler_uses_service_and_returns_dropdown_updates() -> None:
     service = FakeService()
     with gr.Blocks():
         generation = build_generation_tab()
-        handler = make_check_connection_handler(
-            service, "http://comfy.test:8188", "Asia/Tokyo", generation
-        )
+        handler = make_check_connection_handler(service, "Asia/Tokyo", generation)
 
         result = await handler(None, None, None, None, None)
 
@@ -61,3 +66,16 @@ async def test_system_handler_uses_service_and_returns_dropdown_updates() -> Non
     assert result[6].choices
     assert result[6].choices[0][0] == "upscaler.pth"
     assert "style.safetensors" in result[7]
+
+
+@pytest.mark.asyncio
+async def test_refresh_handler_keeps_app_alive_on_service_failure() -> None:
+    service = FakeService()
+    with gr.Blocks():
+        generation = build_generation_tab()
+        handler = make_refresh_handler(service, generation)
+
+        result = await handler(None, None, None, None, None)
+
+    assert result[0] == "更新に失敗しました"
+    assert result[1].choices == []

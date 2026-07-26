@@ -7,7 +7,6 @@ from dataclasses import dataclass
 
 import gradio as gr
 
-from runpod_sdxl_image_studio.adapters.comfyui.exceptions import ComfyUIError
 from runpod_sdxl_image_studio.adapters.comfyui.models import ComfyUICapabilities
 from runpod_sdxl_image_studio.services.comfyui_service import ComfyUIService
 from runpod_sdxl_image_studio.ui.view_models import (
@@ -83,7 +82,6 @@ def build_generation_tab() -> GenerationTabComponents:
 
 def make_check_connection_handler(
     service: ComfyUIService,
-    comfyui_url: str,
     timezone_name: str,
     generation: GenerationTabComponents,
 ) -> Callable[..., Awaitable[tuple[object, ...]]]:
@@ -103,7 +101,7 @@ def make_check_connection_handler(
             generation,
         )
         return (
-            status_markdown(status, comfyui_url, timezone_name),
+            status_markdown(status, timezone_name),
             "能力情報を更新しました" if status.capabilities is not None else status.message,
             *updates,
         )
@@ -124,17 +122,17 @@ def make_refresh_handler(
         scheduler: str | None,
         upscaler: str | None,
     ) -> tuple[object, ...]:
-        try:
-            capabilities = await service.refresh_capabilities()
-        except ComfyUIError:
-            return ("能力情報を取得できませんでした",) + _empty_updates(generation)
+        refresh_result = await service.refresh_capabilities()
+        if not refresh_result.is_success or refresh_result.capabilities is None:
+            return (refresh_result.message,) + _empty_updates(generation)
 
+        capabilities = refresh_result.capabilities
         updates = _capability_updates(
             capabilities,
             (checkpoint, vae, sampler, scheduler, upscaler),
             generation,
         )
-        return ("モデル一覧を更新しました", *updates)
+        return (refresh_result.message, *updates)
 
     return handler
 
