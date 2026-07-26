@@ -14,6 +14,12 @@ from runpod_sdxl_image_studio.adapters.comfyui.exceptions import (
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
 
 SAFE_FILENAME_PREFIX = "runpod_sdxl_image_studio"
+CHECKPOINT_NODE_ID = "4"
+KSampler_NODE_ID = "3"
+POSITIVE_CLIP_NODE_ID = "6"
+NEGATIVE_CLIP_NODE_ID = "7"
+VAE_DECODE_NODE_ID = "8"
+EXTERNAL_VAE_NODE_ID = "vae_external"
 DEFAULT_REQUIRED_NODE_CLASSES = (
     "CheckpointLoaderSimple",
     "CLIPTextEncode",
@@ -106,11 +112,56 @@ def build_txt2img_workflow(
         path = _binding_path(binding, field_name)
         _set_binding(workflow, path, values[field_name])
 
+    _apply_external_vae(workflow, settings.vae_name)
+    _apply_lora_chain(workflow, settings)
+
     try:
         json.dumps(workflow)
     except (TypeError, ValueError) as exc:
         raise WorkflowValidationError("workflow is not JSON serializable") from exc
     return workflow
+
+
+def _apply_external_vae(workflow: dict[str, object], vae_name: str | None) -> None:
+    if vae_name is None:
+        return
+    if EXTERNAL_VAE_NODE_ID in workflow:
+        raise WorkflowTemplateError("reserved external VAE node id is already in use")
+    workflow[EXTERNAL_VAE_NODE_ID] = {
+        "class_type": "VAELoader",
+        "inputs": {"vae_name": vae_name},
+    }
+    _set_binding(
+        workflow,
+        (VAE_DECODE_NODE_ID, "inputs", "vae"),
+        [EXTERNAL_VAE_NODE_ID, 0],
+    )
+
+
+def _apply_lora_chain(workflow: dict[str, object], settings: GenerationSettings) -> None:
+    if not settings.loras:
+        return
+    model_link: list[object] = [CHECKPOINT_NODE_ID, 0]
+    clip_link: list[object] = [CHECKPOINT_NODE_ID, 1]
+    for index, lora in enumerate(sorted(settings.loras, key=lambda item: item.order)):
+        node_id = f"lora_{index:03d}"
+        if node_id in workflow:
+            raise WorkflowTemplateError("reserved LoRA node id is already in use")
+        workflow[node_id] = {
+            "class_type": "LoraLoader",
+            "inputs": {
+                "lora_name": lora.name,
+                "strength_model": lora.model_strength,
+                "strength_clip": lora.clip_strength,
+                "model": model_link,
+                "clip": clip_link,
+            },
+        }
+        model_link = [node_id, 0]
+        clip_link = [node_id, 1]
+    _set_binding(workflow, (KSampler_NODE_ID, "inputs", "model"), model_link)
+    _set_binding(workflow, (POSITIVE_CLIP_NODE_ID, "inputs", "clip"), clip_link)
+    _set_binding(workflow, (NEGATIVE_CLIP_NODE_ID, "inputs", "clip"), clip_link)
 
 
 def _required_classes(value: object) -> tuple[str, ...]:

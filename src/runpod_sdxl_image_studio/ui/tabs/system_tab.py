@@ -13,6 +13,12 @@ from runpod_sdxl_image_studio.domain.generation import GenerationProgress, Gener
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
 from runpod_sdxl_image_studio.services.comfyui_service import ComfyUIService
 from runpod_sdxl_image_studio.services.generation_service import GenerationService
+from runpod_sdxl_image_studio.ui.components.lora_editor import (
+    LoraEditorComponents,
+    build_lora_editor,
+    lora_settings_from_state,
+    render_state_updates,
+)
 from runpod_sdxl_image_studio.ui.view_models import (
     capability_choices,
     lora_markdown,
@@ -43,6 +49,7 @@ class GenerationTabComponents:
     scheduler: gr.Dropdown
     upscaler: gr.Dropdown
     lora_list: gr.Markdown
+    lora_editor: LoraEditorComponents
     positive_prompt: gr.Textbox
     negative_prompt: gr.Textbox
     size_preset: gr.Dropdown
@@ -71,7 +78,7 @@ def build_system_tab(comfyui_url: str, initial_markdown: str) -> SystemTabCompon
     return SystemTabComponents(status, connection_button, refresh_button, capability_message)
 
 
-def build_generation_tab() -> GenerationTabComponents:
+def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
     """Build a mobile-friendly fixed-workflow SDXL generation form."""
 
     gr.Markdown("## 画像生成")
@@ -97,9 +104,15 @@ def build_generation_tab() -> GenerationTabComponents:
             sampler = gr.Dropdown([], label="sampler", interactive=False)
             scheduler = gr.Dropdown([], label="scheduler", interactive=False)
         with gr.Row():
-            vae = gr.Dropdown([], label="VAE", interactive=False)
+            vae = gr.Dropdown(
+                [("Checkpoint内蔵VAE", None)],  # type: ignore[list-item]
+                value=None,
+                label="VAE",
+                interactive=True,
+            )
             upscaler = gr.Dropdown([], label="upscaler", interactive=False)
     lora_list = gr.Markdown("**LoRA list:** unavailable")
+    lora_editor = build_lora_editor(max_loras)
     generate_button = gr.Button("Generate", variant="primary", interactive=False, size="lg")
     progress = gr.Markdown("")
     result_image = gr.Image(label="Generated image", type="filepath")
@@ -111,6 +124,7 @@ def build_generation_tab() -> GenerationTabComponents:
         scheduler=scheduler,
         upscaler=upscaler,
         lora_list=lora_list,
+        lora_editor=lora_editor,
         positive_prompt=positive_prompt,
         negative_prompt=negative_prompt,
         size_preset=size_preset,
@@ -140,12 +154,16 @@ def make_check_connection_handler(
         sampler: str | None,
         scheduler: str | None,
         upscaler: str | None,
+        lora_state: object = None,
+        lora_choices: object = None,
     ) -> tuple[object, ...]:
         status = await service.get_status()
         updates = _capability_updates(
             status.capabilities,
             (checkpoint, vae, sampler, scheduler, upscaler),
             generation,
+            lora_state,
+            lora_choices,
         )
         return (
             status_markdown(status, timezone_name),
@@ -168,6 +186,8 @@ def make_refresh_handler(
         sampler: str | None,
         scheduler: str | None,
         upscaler: str | None,
+        lora_state: object = None,
+        lora_choices: object = None,
     ) -> tuple[object, ...]:
         refresh_result = await service.refresh_capabilities()
         if not refresh_result.is_success or refresh_result.capabilities is None:
@@ -176,6 +196,8 @@ def make_refresh_handler(
             refresh_result.capabilities,
             (checkpoint, vae, sampler, scheduler, upscaler),
             generation,
+            lora_state,
+            lora_choices,
         )
         return (refresh_result.message, *updates)
 
@@ -200,6 +222,8 @@ def make_generate_handler(
         cfg_scale: float | int,
         sampler: str | None,
         scheduler: str | None,
+        vae: str | None = None,
+        lora_state: object = None,
         progress: gr.Progress = _DEFAULT_PROGRESS,
     ) -> tuple[object, ...]:
         del size_preset
@@ -210,6 +234,8 @@ def make_generate_handler(
                 checkpoint_name=checkpoint or "",
                 sampler_name=sampler or "",
                 scheduler_name=scheduler or "",
+                vae_name=vae,
+                loras=lora_settings_from_state(lora_state),
                 width=int(width),
                 height=int(height),
                 seed=-1 if seed_mode == "Random" else int(seed),
@@ -228,7 +254,13 @@ def make_generate_handler(
                 f"Generation ID: `{result.generation_id}`\n"
                 f"Prompt ID: `{result.prompt_id}`\n"
                 f"Seed: `{result.seed}`\n"
-                f"File: `{result.stored_image.path.name}`"
+                f"VAE: `{generation_settings.vae_name or 'Checkpoint内蔵VAE'}`\n"
+                + "".join(
+                    f"LoRA {index + 1}: `{lora.name}` "
+                    f"(model={lora.model_strength:g}, clip={lora.clip_strength:g})\n"
+                    for index, lora in enumerate(generation_settings.loras)
+                )
+                + f"File: `{result.stored_image.path.name}`"
             )
             return (
                 gr.Button("Generate", interactive=True),
@@ -282,8 +314,10 @@ def size_preset_values(preset: str) -> tuple[int, int]:
 
 def _capability_updates(
     capabilities: ComfyUICapabilities | None,
-    current_values: tuple[str | None, ...],
+    current_values: tuple[object, ...],
     generation: GenerationTabComponents,
+    lora_state: object = None,
+    lora_choices: object = None,
 ) -> tuple[object, ...]:
     if capabilities is None:
         return _empty_updates(generation)
@@ -295,22 +329,50 @@ def _capability_updates(
         (generation.scheduler, choices["scheduler"], current_values[3]),
         (generation.upscaler, choices["upscaler"], current_values[4]),
     )
-    updates = tuple(
-        gr.Dropdown(
-            choices=list(available_choices),
-            value=preserve_selection(current_value, available_choices),
-            label=component.label,
-            interactive=bool(available_choices),
-        )
-        for component, available_choices, current_value in dropdowns
-    )
+    updates: list[object] = []
+    for component, available_choices, current_value in dropdowns:
+        if component is generation.vae:
+            vae_choices: list[tuple[str, str | None]] = [("Checkpoint内蔵VAE", None)] + [
+                (value, value) for value in available_choices
+            ]
+            updates.append(
+                gr.Dropdown(
+                    choices=vae_choices,  # type: ignore[arg-type]
+                    value=current_value if current_value in available_choices else None,
+                    label=component.label,
+                    interactive=True,
+                )
+            )
+        else:
+            updates.append(
+                gr.Dropdown(
+                    choices=list(available_choices),
+                    value=preserve_selection(
+                        current_value if isinstance(current_value, str) else None,
+                        available_choices,
+                    ),
+                    label=component.label,
+                    interactive=bool(available_choices),
+                )
+            )
     can_generate = bool(
         capabilities.checkpoints and capabilities.samplers and capabilities.schedulers
     )
-    return updates + (lora_markdown(capabilities), gr.Button(interactive=can_generate))
+    rendered = render_state_updates(
+        lora_state,
+        capabilities.loras,
+        len(generation.lora_editor.rows),
+    )
+    return tuple(updates) + (
+        lora_markdown(capabilities),
+        gr.Button(interactive=can_generate),
+        list(capabilities.loras),
+        *rendered,
+    )
 
 
 def _empty_updates(generation: GenerationTabComponents) -> tuple[object, ...]:
+    rendered = render_state_updates(None, [], len(generation.lora_editor.rows))
     return (
         gr.Dropdown([], label=generation.checkpoint.label, interactive=False),
         gr.Dropdown([], label=generation.vae.label, interactive=False),
@@ -319,4 +381,6 @@ def _empty_updates(generation: GenerationTabComponents) -> tuple[object, ...]:
         gr.Dropdown([], label=generation.upscaler.label, interactive=False),
         "**LoRA list:** unavailable",
         gr.Button(interactive=False),
+        [],
+        *rendered,
     )

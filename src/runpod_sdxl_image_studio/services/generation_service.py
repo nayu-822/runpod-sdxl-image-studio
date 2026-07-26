@@ -253,12 +253,25 @@ def _validate_generation(
     checkpoints = getattr(capabilities, "checkpoints", ())
     samplers = getattr(capabilities, "samplers", ())
     schedulers = getattr(capabilities, "schedulers", ())
+    vaes = getattr(capabilities, "vaes", ())
+    loras = getattr(capabilities, "loras", ())
+    node_classes: frozenset[str] = getattr(capabilities, "available_node_classes", frozenset())
     if settings.checkpoint_name not in checkpoints:
         raise WorkflowError("Selected checkpoint is unavailable")
     if settings.sampler_name not in samplers:
         raise WorkflowError("Selected sampler is unavailable")
     if settings.scheduler_name not in schedulers:
         raise WorkflowError("Selected scheduler is unavailable")
+    if settings.vae_name is not None and settings.vae_name not in vaes:
+        raise WorkflowError("Selected VAE is unavailable")
+    if len(settings.loras) > limits.max_loras:
+        raise WorkflowError("The configured maximum number of LoRAs was exceeded")
+    if settings.loras and "LoraLoader" not in node_classes:
+        raise WorkflowError("LoRA loading is unavailable in ComfyUI")
+    if settings.vae_name is not None and "VAELoader" not in node_classes:
+        raise WorkflowError("External VAE loading is unavailable in ComfyUI")
+    if any(lora.name not in loras for lora in settings.loras):
+        raise WorkflowError("One or more selected LoRAs are unavailable")
     if settings.width > limits.max_width or settings.height > limits.max_height:
         raise WorkflowError("Requested image dimensions exceed the configured limit")
     if settings.width * settings.height > limits.max_pixels:
@@ -267,11 +280,11 @@ def _validate_generation(
 
 def _safe_generation_error(error: Exception) -> str:
     if isinstance(error, WorkflowError):
-        return "生成設定またはworkflowを検証できませんでした"
+        return "生成設定を確認できませんでした。"
     if isinstance(error, StorageError):
-        return "生成画像をローカルへ保存できませんでした"
+        return "生成画像を保存できませんでした。"
     if isinstance(error, ComfyUIError):
         return "ComfyUIで画像生成を完了できませんでした"
     if isinstance(error, TimeoutError):
-        return "画像生成が制限時間を超えました"
-    return "画像生成に失敗しました"
+        return "画像生成が制限時間を超えました。"
+    return "画像生成に失敗しました。"

@@ -1,5 +1,7 @@
 # RunPod SDXL Image Studio
 
+Phase 2A (multiple LoRA and VAE selection foundation): [PHASE_2A_IMPLEMENTATION.md](PHASE_2A_IMPLEMENTATION.md)
+
 Phase 1B の実装範囲と手動確認手順は [PHASE_1B_IMPLEMENTATION.md](PHASE_1B_IMPLEMENTATION.md) にまとめています。
 
 RunPod GPU Pod 上で ComfyUI を画像生成バックエンドとして使用し、Gradio からスマートフォンでも快適に操作できる個人向け SDXL 画像生成アプリです。

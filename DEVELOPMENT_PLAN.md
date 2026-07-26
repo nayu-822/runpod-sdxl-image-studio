@@ -366,3 +366,9 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 - 複数ユーザー対応
 
 これらは初期設計へ直接組み込まず、Adapter と workflow template の拡張点だけ確保する。
+
+## Phase 2A status
+
+Phase 2A is complete: multiple ordered LoRA selection, model/CLIP strengths, checkpoint-internal or external VAE selection, fixed workflow mapping, capability prevalidation, and bounded UI editing are implemented. See [PHASE_2A_IMPLEMENTATION.md](PHASE_2A_IMPLEMENTATION.md).
+
+Phase 2B remains for LoRA metadata and catalog features such as trigger words, categories, favorites, recommendations, previews, search, and presets.

@@ -1,1 +1,1 @@
-"""Reusable UI components."""
+"""Reusable Gradio component builders."""

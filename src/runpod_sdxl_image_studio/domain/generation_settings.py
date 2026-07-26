@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+import ntpath
+import posixpath
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from runpod_sdxl_image_studio.domain.lora import LoraSetting
 
 
 class GenerationSettings(BaseModel):
@@ -20,6 +25,8 @@ class GenerationSettings(BaseModel):
     sampler_name: str = Field(min_length=1)
     scheduler_name: str = Field(min_length=1)
     checkpoint_name: str = Field(min_length=1)
+    vae_name: str | None = None
+    loras: tuple[LoraSetting, ...] = ()
     workflow_template_id: str = Field(default="sdxl_txt2img", min_length=1)
     workflow_template_version: str = Field(default="1.0", min_length=1)
 
@@ -36,3 +43,25 @@ class GenerationSettings(BaseModel):
         if value % 64 != 0:
             raise ValueError("width and height must be multiples of 64")
         return value
+
+    @field_validator("vae_name")
+    @classmethod
+    def validate_vae_name(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        normalized = value.strip().replace("\\", "/")
+        if posixpath.isabs(normalized) or ntpath.isabs(normalized):
+            raise ValueError("VAE name must be a relative path")
+        if any(part in {"", ".", ".."} for part in normalized.split("/")):
+            raise ValueError("VAE name contains an unsafe path segment")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_lora_collection(self) -> GenerationSettings:
+        names = [lora.name for lora in self.loras]
+        if len(names) != len(set(names)):
+            raise ValueError("The same LoRA cannot be selected more than once")
+        orders = [lora.order for lora in self.loras]
+        if len(orders) != len(set(orders)):
+            raise ValueError("LoRA order values must be unique")
+        return self

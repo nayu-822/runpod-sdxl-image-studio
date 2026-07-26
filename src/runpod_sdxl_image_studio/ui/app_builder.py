@@ -11,6 +11,14 @@ from runpod_sdxl_image_studio.adapters.storage.local_storage import LocalStorage
 from runpod_sdxl_image_studio.config import Settings, get_settings
 from runpod_sdxl_image_studio.services.comfyui_service import ComfyUIService
 from runpod_sdxl_image_studio.services.generation_service import GenerationService
+from runpod_sdxl_image_studio.ui.components.lora_editor import (
+    add_lora_row,
+    component_outputs,
+    move_lora_row,
+    remove_lora_row,
+    render_state_updates,
+    update_lora_row,
+)
 from runpod_sdxl_image_studio.ui.tabs.system_tab import (
     build_generation_tab,
     build_system_tab,
@@ -56,7 +64,7 @@ def build_app(
     with gr.Blocks(title=APP_TITLE, css=APP_CSS) as demo:
         gr.Markdown(f"# {APP_TITLE}")
         with gr.Tab("生成"):
-            generation = build_generation_tab()
+            generation = build_generation_tab(app_settings.max_loras)
         with gr.Tab("システム"):
             system = build_system_tab(
                 app_settings.comfyui_base_url,
@@ -69,6 +77,8 @@ def build_app(
             generation.sampler,
             generation.scheduler,
             generation.upscaler,
+            generation.lora_editor.state,
+            generation.lora_editor.choices,
         ]
         capability_outputs = [
             generation.checkpoint,
@@ -78,6 +88,10 @@ def build_app(
             generation.upscaler,
             generation.lora_list,
             generation.generate_button,
+            generation.lora_editor.choices,
+            generation.lora_editor.state,
+            *component_outputs(generation.lora_editor),
+            generation.lora_editor.add_button,
         ]
         system.connection_button.click(
             fn=make_check_connection_handler(
@@ -98,6 +112,96 @@ def build_app(
             inputs=[generation.size_preset],
             outputs=[generation.width, generation.height],
         )
+
+        generation.lora_editor.add_button.click(
+            fn=lambda state, choices: render_state_updates(
+                add_lora_row(state, app_settings.max_loras),
+                choices,
+                app_settings.max_loras,
+            ),
+            inputs=[generation.lora_editor.state, generation.lora_editor.choices],
+            outputs=[
+                generation.lora_editor.state,
+                *component_outputs(generation.lora_editor),
+                generation.lora_editor.add_button,
+            ],
+        )
+        for index, row in enumerate(generation.lora_editor.rows):
+            row.name.change(
+                fn=lambda state, name, model, clip, row_index=index: update_lora_row(
+                    state, row_index, name, model, clip, app_settings.max_loras
+                ),
+                inputs=[
+                    generation.lora_editor.state,
+                    row.name,
+                    row.model_strength,
+                    row.clip_strength,
+                ],
+                outputs=[generation.lora_editor.state],
+            )
+            row.model_strength.change(
+                fn=lambda state, name, model, clip, row_index=index: update_lora_row(
+                    state, row_index, name, model, clip, app_settings.max_loras
+                ),
+                inputs=[
+                    generation.lora_editor.state,
+                    row.name,
+                    row.model_strength,
+                    row.clip_strength,
+                ],
+                outputs=[generation.lora_editor.state],
+            )
+            row.clip_strength.change(
+                fn=lambda state, name, model, clip, row_index=index: update_lora_row(
+                    state, row_index, name, model, clip, app_settings.max_loras
+                ),
+                inputs=[
+                    generation.lora_editor.state,
+                    row.name,
+                    row.model_strength,
+                    row.clip_strength,
+                ],
+                outputs=[generation.lora_editor.state],
+            )
+            row.remove_button.click(
+                fn=lambda state, choices, row_index=index: render_state_updates(
+                    remove_lora_row(state, row_index, app_settings.max_loras),
+                    choices,
+                    app_settings.max_loras,
+                ),
+                inputs=[generation.lora_editor.state, generation.lora_editor.choices],
+                outputs=[
+                    generation.lora_editor.state,
+                    *component_outputs(generation.lora_editor),
+                    generation.lora_editor.add_button,
+                ],
+            )
+            row.up_button.click(
+                fn=lambda state, choices, row_index=index: render_state_updates(
+                    move_lora_row(state, row_index, -1, app_settings.max_loras),
+                    choices,
+                    app_settings.max_loras,
+                ),
+                inputs=[generation.lora_editor.state, generation.lora_editor.choices],
+                outputs=[
+                    generation.lora_editor.state,
+                    *component_outputs(generation.lora_editor),
+                    generation.lora_editor.add_button,
+                ],
+            )
+            row.down_button.click(
+                fn=lambda state, choices, row_index=index: render_state_updates(
+                    move_lora_row(state, row_index, 1, app_settings.max_loras),
+                    choices,
+                    app_settings.max_loras,
+                ),
+                inputs=[generation.lora_editor.state, generation.lora_editor.choices],
+                outputs=[
+                    generation.lora_editor.state,
+                    *component_outputs(generation.lora_editor),
+                    generation.lora_editor.add_button,
+                ],
+            )
         generate_event = generation.generate_button.click(
             fn=disable_generate_button,
             outputs=[generation.generate_button],
@@ -118,6 +222,8 @@ def build_app(
                 generation.cfg_scale,
                 generation.sampler,
                 generation.scheduler,
+                generation.vae,
+                generation.lora_editor.state,
             ],
             outputs=[
                 generation.generate_button,
