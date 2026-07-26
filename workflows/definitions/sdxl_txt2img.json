@@ -1,0 +1,27 @@
+{
+  "template_id": "sdxl_txt2img",
+  "schema_version": 1,
+  "workflow_version": "1.0",
+  "workflow_file": "workflows/templates/sdxl_txt2img.json",
+  "required_node_classes": [
+    "CheckpointLoaderSimple",
+    "CLIPTextEncode",
+    "EmptyLatentImage",
+    "KSampler",
+    "VAEDecode",
+    "SaveImage"
+  ],
+  "bindings": {
+    "checkpoint_name": ["4", "inputs", "ckpt_name"],
+    "positive_prompt": ["6", "inputs", "text"],
+    "negative_prompt": ["7", "inputs", "text"],
+    "seed": ["3", "inputs", "seed"],
+    "steps": ["3", "inputs", "steps"],
+    "cfg_scale": ["3", "inputs", "cfg"],
+    "sampler_name": ["3", "inputs", "sampler_name"],
+    "scheduler_name": ["3", "inputs", "scheduler"],
+    "width": ["5", "inputs", "width"],
+    "height": ["5", "inputs", "height"],
+    "filename_prefix": ["9", "inputs", "filename_prefix"]
+  }
+}

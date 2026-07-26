@@ -11,7 +11,10 @@ from runpod_sdxl_image_studio.adapters.comfyui.models import (
     ComfyUICapabilities,
     ComfyUIDeviceInfo,
     ComfyUIObjectInfo,
+    ComfyUIOutputImage,
     ComfyUISystemStats,
+    PromptHistory,
+    QueuedPrompt,
 )
 
 
@@ -114,6 +117,56 @@ def parse_capabilities(object_info: ComfyUIObjectInfo) -> ComfyUICapabilities:
         available_node_classes=available_node_classes,
         warnings=tuple(warnings),
     )
+
+
+def parse_queued_prompt(payload: Mapping[str, object]) -> QueuedPrompt:
+    """Parse the small, typed subset of a ``/prompt`` response."""
+
+    prompt_id = payload.get("prompt_id")
+    if not isinstance(prompt_id, str) or not prompt_id.strip():
+        raise ComfyUIParseError("ComfyUI prompt response did not contain a prompt id")
+    number = payload.get("number")
+    safe_number = number if isinstance(number, int) and not isinstance(number, bool) else None
+    node_errors = payload.get("node_errors", {})
+    if not isinstance(node_errors, Mapping):
+        node_errors = {}
+    return QueuedPrompt(prompt_id=prompt_id, number=safe_number, node_errors=dict(node_errors))
+
+
+def parse_prompt_history(payload: Mapping[str, object], prompt_id: str) -> PromptHistory:
+    """Parse ComfyUI history without exposing its raw response structure."""
+
+    prompt_entry = payload.get(prompt_id)
+    if not isinstance(prompt_entry, Mapping):
+        return PromptHistory(prompt_id, False, False, (), None)
+
+    status_payload = _mapping_value(prompt_entry, "status") or {}
+    status_string = _optional_string(status_payload.get("status_str"))
+    is_failed = status_string in {"error", "failed"}
+    is_completed = bool(status_payload.get("completed")) or status_string in {
+        "success",
+        "completed",
+    }
+    outputs_payload = _mapping_value(prompt_entry, "outputs") or {}
+    outputs: list[ComfyUIOutputImage] = []
+    for node_output in outputs_payload.values():
+        if not isinstance(node_output, Mapping):
+            continue
+        images = node_output.get("images")
+        if not isinstance(images, Sequence) or isinstance(images, (str, bytes, bytearray)):
+            continue
+        for image_payload in images:
+            if not isinstance(image_payload, Mapping):
+                continue
+            filename = _optional_string(image_payload.get("filename"))
+            subfolder = _optional_string(image_payload.get("subfolder"))
+            output_type = _optional_string(image_payload.get("type"))
+            if filename is None or subfolder is None or output_type is None:
+                continue
+            outputs.append(ComfyUIOutputImage(filename, subfolder, output_type))
+
+    error_message = "ComfyUIで画像生成に失敗しました" if is_failed else None
+    return PromptHistory(prompt_id, is_completed, is_failed, tuple(outputs), error_message)
 
 
 def _extract_choices(

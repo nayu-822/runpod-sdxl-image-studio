@@ -65,3 +65,32 @@ class ComfyUICapabilities:
     upscale_models: tuple[str, ...]
     available_node_classes: frozenset[str]
     warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class QueuedPrompt:
+    """The safe subset of a ``/prompt`` response."""
+
+    prompt_id: str
+    number: int | None
+    node_errors: Mapping[str, object]
+
+
+@dataclass(frozen=True)
+class ComfyUIOutputImage:
+    """An image reference returned by ComfyUI history."""
+
+    filename: str
+    subfolder: str
+    output_type: str
+
+
+@dataclass(frozen=True)
+class PromptHistory:
+    """Normalized completion and output state for one prompt."""
+
+    prompt_id: str
+    is_completed: bool
+    is_failed: bool
+    outputs: tuple[ComfyUIOutputImage, ...]
+    error_message: str | None

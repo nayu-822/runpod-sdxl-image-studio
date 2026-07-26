@@ -1,0 +1,12 @@
+{
+  "prompt-123": {
+    "status": {"completed": true, "status_str": "success"},
+    "outputs": {
+      "9": {
+        "images": [
+          {"filename": "runpod_sdxl_image_studio_00001.png", "subfolder": "", "type": "output"}
+        ]
+      }
+    }
+  }
+}

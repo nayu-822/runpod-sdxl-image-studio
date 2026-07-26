@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import ntpath
+import posixpath
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from types import TracebackType
-from typing import Self
+from typing import Any, Self
+from urllib.parse import quote
+from uuid import UUID
 
 import httpx
 
@@ -17,10 +23,15 @@ from runpod_sdxl_image_studio.adapters.comfyui.exceptions import (
 from runpod_sdxl_image_studio.adapters.comfyui.models import (
     ComfyUIConnectionResult,
     ComfyUIObjectInfo,
+    ComfyUIOutputImage,
     ComfyUISystemStats,
+    PromptHistory,
+    QueuedPrompt,
 )
 from runpod_sdxl_image_studio.adapters.comfyui.parsers import (
     parse_object_info,
+    parse_prompt_history,
+    parse_queued_prompt,
     parse_system_stats,
 )
 from runpod_sdxl_image_studio.config import Settings, get_settings
@@ -43,6 +54,7 @@ class ComfyUIClient:
         configured_base_url = base_url or app_settings.comfyui_base_url
         self._base_url = configured_base_url.rstrip("/")
         self._timeout = timeout if timeout is not None else app_settings.comfyui_timeout_seconds
+        self._max_output_image_bytes = app_settings.max_output_image_bytes
         self._http_client = http_client
         self._owns_http_client = http_client is None
         self._closed = False
@@ -87,6 +99,59 @@ class ComfyUIClient:
             system_stats=system_stats,
         )
 
+    async def queue_prompt(
+        self,
+        workflow: Mapping[str, object],
+        client_id: str,
+    ) -> QueuedPrompt:
+        """Queue one fixed workflow and return its prompt identifier."""
+
+        try:
+            UUID(client_id)
+        except (ValueError, AttributeError) as exc:
+            raise ComfyUIResponseError("ComfyUI client id must be a UUID") from exc
+        try:
+            request_payload = {"prompt": dict(workflow), "client_id": client_id}
+            json.dumps(request_payload)
+        except (TypeError, ValueError) as exc:
+            raise ComfyUIResponseError("ComfyUI workflow is not JSON serializable") from exc
+        response_payload = await self._post_json("/prompt", request_payload)
+        return parse_queued_prompt(response_payload)
+
+    async def get_prompt_history(self, prompt_id: str) -> PromptHistory:
+        """Fetch and parse one prompt's history entry."""
+
+        safe_prompt_id = _validate_identifier(prompt_id, "prompt id")
+        payload = await self._get_json(f"/history/{quote(safe_prompt_id, safe='')}")
+        return parse_prompt_history(payload, safe_prompt_id)
+
+    async def get_output_image(self, image: ComfyUIOutputImage) -> bytes:
+        """Fetch one validated image reference from ComfyUI's ``/view`` endpoint."""
+
+        filename = _validate_filename(image.filename)
+        subfolder = _validate_subfolder(image.subfolder)
+        if image.output_type not in {"output", "temp", "input"}:
+            raise ComfyUIResponseError("ComfyUI output type is not allowed")
+        response = await self._request(
+            "GET",
+            "/view",
+            params={"filename": filename, "subfolder": subfolder, "type": image.output_type},
+        )
+        content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+        if content_type not in {"image/png", "image/webp"}:
+            raise ComfyUIResponseError("ComfyUI returned a non-image content type")
+        content_length = response.headers.get("content-length")
+        if content_length is not None:
+            try:
+                declared_length = int(content_length)
+            except ValueError as exc:
+                raise ComfyUIResponseError("ComfyUI returned an invalid image size") from exc
+            if declared_length < 0 or declared_length > self._max_output_image_bytes:
+                raise ComfyUIResponseError("ComfyUI output image is too large")
+        if not response.content or len(response.content) > self._max_output_image_bytes:
+            raise ComfyUIResponseError("ComfyUI returned an empty or oversized image")
+        return response.content
+
     async def close(self) -> None:
         """Close an internally created HTTP client; injected clients remain owned by callers."""
 
@@ -108,25 +173,7 @@ class ComfyUIClient:
         await self.close()
 
     async def _get_json(self, path: str) -> dict[str, object]:
-        if self._closed:
-            raise ComfyUIConnectionError("ComfyUI client is closed")
-        client = self._http_client
-        if client is None:
-            client = httpx.AsyncClient()
-            self._http_client = client
-
-        url = self._join_url(path)
-        try:
-            response = await client.get(url, timeout=self._timeout)
-        except httpx.TimeoutException as exc:
-            raise ComfyUITimeoutError("ComfyUI request timed out") from exc
-        except httpx.ConnectError as exc:
-            raise ComfyUIConnectionError("ComfyUI endpoint could not be reached") from exc
-        except httpx.RequestError as exc:
-            raise ComfyUIConnectionError("ComfyUI request failed") from exc
-
-        if not 200 <= response.status_code < 300:
-            raise ComfyUIResponseError(f"ComfyUI returned HTTP status {response.status_code}")
+        response = await self._request("GET", path)
         try:
             payload = response.json()
         except ValueError as exc:
@@ -135,6 +182,66 @@ class ComfyUIClient:
             raise ComfyUIResponseError("ComfyUI returned a non-object JSON payload")
         return payload
 
+    async def _post_json(self, path: str, payload: Mapping[str, object]) -> dict[str, object]:
+        response = await self._request("POST", path, json=dict(payload))
+        try:
+            response_payload = response.json()
+        except ValueError as exc:
+            raise ComfyUIResponseError("ComfyUI returned invalid JSON") from exc
+        if not isinstance(response_payload, dict):
+            raise ComfyUIResponseError("ComfyUI returned a non-object JSON payload")
+        return response_payload
+
+    async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        if self._closed:
+            raise ComfyUIConnectionError("ComfyUI client is closed")
+        client = self._http_client
+        if client is None:
+            client = httpx.AsyncClient()
+            self._http_client = client
+        try:
+            response = await client.request(
+                method,
+                self._join_url(path),
+                timeout=self._timeout,
+                **kwargs,
+            )
+        except httpx.TimeoutException as exc:
+            raise ComfyUITimeoutError("ComfyUI request timed out") from exc
+        except httpx.ConnectError as exc:
+            raise ComfyUIConnectionError("ComfyUI endpoint could not be reached") from exc
+        except httpx.RequestError as exc:
+            raise ComfyUIConnectionError("ComfyUI request failed") from exc
+        if not 200 <= response.status_code < 300:
+            raise ComfyUIResponseError(f"ComfyUI returned HTTP status {response.status_code}")
+        return response
+
     def _join_url(self, path: str) -> str:
         normalized_path = "/" + path.lstrip("/")
         return f"{self._base_url}{normalized_path}"
+
+
+def _validate_identifier(value: str, label: str) -> str:
+    if not isinstance(value, str) or not value.strip() or "/" in value or "\\" in value:
+        raise ComfyUIResponseError(f"ComfyUI {label} is invalid")
+    if value in {".", ".."} or ".." in value:
+        raise ComfyUIResponseError(f"ComfyUI {label} is invalid")
+    return value
+
+
+def _validate_filename(value: str) -> str:
+    safe_value = _validate_identifier(value, "filename")
+    if posixpath.basename(safe_value) != safe_value or ntpath.basename(safe_value) != safe_value:
+        raise ComfyUIResponseError("ComfyUI filename must be a file name")
+    return safe_value
+
+
+def _validate_subfolder(value: str) -> str:
+    if not isinstance(value, str) or value in {".", ".."}:
+        raise ComfyUIResponseError("ComfyUI subfolder is invalid")
+    normalized = value.replace("\\", "/")
+    if posixpath.isabs(normalized) or ntpath.isabs(value):
+        raise ComfyUIResponseError("ComfyUI subfolder is invalid")
+    if any(part in {"", ".", ".."} for part in normalized.split("/")):
+        raise ComfyUIResponseError("ComfyUI subfolder is invalid")
+    return normalized

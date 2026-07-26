@@ -1,5 +1,7 @@
 # RunPod SDXL Image Studio
 
+Phase 1B の実装範囲と手動確認手順は [PHASE_1B_IMPLEMENTATION.md](PHASE_1B_IMPLEMENTATION.md) にまとめています。
+
 RunPod GPU Pod 上で ComfyUI を画像生成バックエンドとして使用し、Gradio からスマートフォンでも快適に操作できる個人向け SDXL 画像生成アプリです。
 
 ## 目的

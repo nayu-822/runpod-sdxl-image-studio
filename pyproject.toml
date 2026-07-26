@@ -13,7 +13,7 @@ authors = [{name = "RunPod SDXL Image Studio contributors"}]
 dependencies = [
     "alembic>=1.13,<2.0",
     # Gradio 6 moves Blocks CSS to launch(); Phase 1A keeps CSS in build_app().
-    "gradio>=4.0,<6.0",
+    "gradio>=5.0.0,<6.0.0",
     "httpx>=0.27,<1.0",
     "pillow>=10.0,<13.0",
     "pydantic>=2.7,<3.0",

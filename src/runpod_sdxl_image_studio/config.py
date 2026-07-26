@@ -36,6 +36,16 @@ class Settings(BaseSettings):
         Path("/workspace/ComfyUI/output"), validation_alias="COMFYUI_OUTPUT_DIR"
     )
     comfyui_timeout_seconds: float = Field(30.0, validation_alias="COMFYUI_TIMEOUT_SECONDS")
+    generation_timeout_seconds: float = Field(
+        600.0, validation_alias="IMAGE_STUDIO_GENERATION_TIMEOUT_SECONDS"
+    )
+    history_poll_interval_seconds: float = Field(
+        2.0, validation_alias="IMAGE_STUDIO_HISTORY_POLL_INTERVAL_SECONDS"
+    )
+    history_max_attempts: int = Field(10, validation_alias="IMAGE_STUDIO_HISTORY_MAX_ATTEMPTS")
+    max_output_image_bytes: int = Field(
+        52_428_800, validation_alias="IMAGE_STUDIO_MAX_OUTPUT_IMAGE_BYTES"
+    )
 
     data_dir: Path = Field(
         Path("/workspace/image-studio-data"), validation_alias="IMAGE_STUDIO_DATA_DIR"
@@ -90,8 +100,22 @@ class Settings(BaseSettings):
             raise ValueError("comfyui_timeout_seconds must be greater than zero")
         return value
 
+    @field_validator("generation_timeout_seconds", "history_poll_interval_seconds")
+    @classmethod
+    def validate_generation_timing(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("generation timing values must be greater than zero")
+        return value
+
     @field_validator(
-        "max_width", "max_height", "max_pixels", "max_batch_count", "max_loras", "thumbnail_size"
+        "max_width",
+        "max_height",
+        "max_pixels",
+        "max_batch_count",
+        "max_loras",
+        "thumbnail_size",
+        "history_max_attempts",
+        "max_output_image_bytes",
     )
     @classmethod
     def validate_positive_integer(cls, value: int) -> int:
