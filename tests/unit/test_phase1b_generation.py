@@ -405,7 +405,7 @@ async def test_failed_generation_handler_reenables_button() -> None:
 
     from runpod_sdxl_image_studio.ui.tabs.system_tab import make_generate_handler
 
-    handler = make_generate_handler(FailedService())  # type: ignore[arg-type]
+    handler = make_generate_handler(FailedService(), 8)  # type: ignore[arg-type]
     button, status, image, details = await handler(
         "test-model-a.safetensors",
         "positive",

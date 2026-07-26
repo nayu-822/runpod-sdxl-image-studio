@@ -16,6 +16,7 @@ from runpod_sdxl_image_studio.services.generation_service import GenerationServi
 from runpod_sdxl_image_studio.ui.components.lora_editor import (
     LoraEditorComponents,
     build_lora_editor,
+    component_outputs,
     lora_settings_from_state,
     render_state_updates,
 )
@@ -191,7 +192,7 @@ def make_refresh_handler(
     ) -> tuple[object, ...]:
         refresh_result = await service.refresh_capabilities()
         if not refresh_result.is_success or refresh_result.capabilities is None:
-            return (refresh_result.message,) + _empty_updates(generation)
+            return (refresh_result.message,) + _preserve_updates(generation)
         updates = _capability_updates(
             refresh_result.capabilities,
             (checkpoint, vae, sampler, scheduler, upscaler),
@@ -206,6 +207,7 @@ def make_refresh_handler(
 
 def make_generate_handler(
     service: GenerationService,
+    max_loras: int,
 ) -> Callable[..., Awaitable[tuple[object, ...]]]:
     """Create the UI boundary that constructs typed GenerationSettings."""
 
@@ -228,6 +230,15 @@ def make_generate_handler(
     ) -> tuple[object, ...]:
         del size_preset
         try:
+            loras = lora_settings_from_state(lora_state, max_loras=max_loras)
+        except (TypeError, ValueError, ValidationError):
+            return (
+                gr.Button("Generate", interactive=True),
+                "",
+                None,
+                "LoRAの強度または件数を確認してください。",
+            )
+        try:
             generation_settings = GenerationSettings(
                 positive_prompt=positive_prompt or "",
                 negative_prompt=negative_prompt or "",
@@ -235,7 +246,7 @@ def make_generate_handler(
                 sampler_name=sampler or "",
                 scheduler_name=scheduler or "",
                 vae_name=vae,
-                loras=lora_settings_from_state(lora_state),
+                loras=loras,
                 width=int(width),
                 height=int(height),
                 seed=-1 if seed_mode == "Random" else int(seed),
@@ -384,3 +395,10 @@ def _empty_updates(generation: GenerationTabComponents) -> tuple[object, ...]:
         [],
         *rendered,
     )
+
+
+def _preserve_updates(generation: GenerationTabComponents) -> tuple[object, ...]:
+    """Leave all editable controls untouched after a refresh failure."""
+
+    preserved_count = 7 + 1 + 1 + len(component_outputs(generation.lora_editor)) + 1
+    return tuple(gr.skip() for _ in range(preserved_count))

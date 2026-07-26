@@ -78,4 +78,6 @@ async def test_refresh_handler_keeps_app_alive_on_service_failure() -> None:
         result = await handler(None, None, None, None, None)
 
     assert result[0] == "更新に失敗しました"
-    assert result[1].choices == []
+    assert all(
+        isinstance(update, dict) and update.get("__type__") == "update" for update in result[1:]
+    )

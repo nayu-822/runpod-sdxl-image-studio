@@ -263,6 +263,7 @@ def _validate_generation(
     if settings.scheduler_name not in schedulers:
         raise WorkflowError("Selected scheduler is unavailable")
     if settings.vae_name is not None and settings.vae_name not in vaes:
+        logger.warning("Unavailable VAE selected: %s", settings.vae_name)
         raise WorkflowError("Selected VAE is unavailable")
     if len(settings.loras) > limits.max_loras:
         raise WorkflowError("The configured maximum number of LoRAs was exceeded")
@@ -270,7 +271,9 @@ def _validate_generation(
         raise WorkflowError("LoRA loading is unavailable in ComfyUI")
     if settings.vae_name is not None and "VAELoader" not in node_classes:
         raise WorkflowError("External VAE loading is unavailable in ComfyUI")
-    if any(lora.name not in loras for lora in settings.loras):
+    missing_loras = [lora.name for lora in settings.loras if lora.name not in loras]
+    if missing_loras:
+        logger.warning("Unavailable LoRAs selected: %s", ", ".join(missing_loras))
         raise WorkflowError("One or more selected LoRAs are unavailable")
     if settings.width > limits.max_width or settings.height > limits.max_height:
         raise WorkflowError("Requested image dimensions exceed the configured limit")

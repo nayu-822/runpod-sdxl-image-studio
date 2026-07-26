@@ -59,22 +59,25 @@ def normalize_lora_state(state: object, max_loras: int) -> LoraEditorState:
             {
                 "row_id": str(item.get("row_id") or uuid4().hex),
                 "lora_name": _optional_string(item.get("lora_name")),
-                "model_strength": _strength(item.get("model_strength"), 1.0),
-                "clip_strength": _strength(item.get("clip_strength"), 1.0),
+                "model_strength": item.get("model_strength", 1.0),
+                "clip_strength": item.get("clip_strength", 1.0),
             }
         )
     return rows or empty_lora_state()[:max_loras]
 
 
-def lora_settings_from_state(state: object, max_loras: int = 8) -> tuple[LoraSetting, ...]:
+def lora_settings_from_state(state: object, max_loras: int) -> tuple[LoraSetting, ...]:
     """Convert serializable UI rows into the typed domain tuple."""
 
+    raw_rows = _raw_rows(state)
+    if len(raw_rows) > max_loras:
+        raise ValueError("LoRA count exceeds the configured maximum")
     rows = normalize_lora_state(state, max_loras)
     return tuple(
         LoraSetting(
             name=str(row["lora_name"]),
-            model_strength=_row_strength(row, "model_strength"),
-            clip_strength=_row_strength(row, "clip_strength"),
+            model_strength=_parse_strength(row.get("model_strength"), 1.0),
+            clip_strength=_parse_strength(row.get("clip_strength"), 1.0),
             order=order,
         )
         for order, row in enumerate(rows)
@@ -115,8 +118,8 @@ def update_lora_row(
         rows[index] = {
             **rows[index],
             "lora_name": _optional_string(lora_name),
-            "model_strength": _strength(model_strength, 1.0),
-            "clip_strength": _strength(clip_strength, 1.0),
+            "model_strength": model_strength,
+            "clip_strength": clip_strength,
         }
     return rows
 
@@ -203,8 +206,8 @@ def render_state_updates(
                     value=preserve_lora_selection(row["lora_name"], available),
                     interactive=bool(available),
                 ),
-                gr.Number(value=_row_strength(row, "model_strength"), visible=visible),
-                gr.Number(value=_row_strength(row, "clip_strength"), visible=visible),
+                gr.Number(value=_display_strength(row.get("model_strength")), visible=visible),
+                gr.Number(value=_display_strength(row.get("clip_strength")), visible=visible),
                 gr.Button(interactive=visible and index > 0),
                 gr.Button(interactive=visible and index + 1 < len(rows)),
                 gr.Button(interactive=visible),
@@ -235,12 +238,20 @@ def _optional_string(value: object) -> str | None:
     return normalized or None
 
 
-def _strength(value: object, default: float) -> float:
-    try:
-        return max(-2.0, min(2.0, float(str(value))))
-    except (TypeError, ValueError):
+def _parse_strength(value: object, default: float) -> float:
+    if value is None or value == "":
         return default
+    return float(str(value))
 
 
-def _row_strength(row: LoraRowState, key: str) -> float:
-    return _strength(row.get(key), 1.0)
+def _display_strength(value: object) -> float:
+    try:
+        return _parse_strength(value, 1.0)
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _raw_rows(state: object) -> list[dict[str, object]]:
+    if not isinstance(state, Sequence) or isinstance(state, (str, bytes, bytearray)):
+        return []
+    return [item for item in state if isinstance(item, dict)]

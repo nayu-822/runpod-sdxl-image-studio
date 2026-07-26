@@ -208,7 +208,7 @@ def build_app(
             queue=False,
         )
         generate_event.then(
-            fn=make_generate_handler(generation_service),
+            fn=make_generate_handler(generation_service, app_settings.max_loras),
             inputs=[
                 generation.checkpoint,
                 generation.positive_prompt,
