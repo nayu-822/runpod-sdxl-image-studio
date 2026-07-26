@@ -5,13 +5,17 @@ from io import BytesIO
 from pathlib import Path
 from uuid import UUID
 
+import gradio as gr
 import pytest
+from alembic import command
+from alembic.config import Config
 from PIL import Image
 from sqlalchemy import inspect
 
 from runpod_sdxl_image_studio.adapters.database.engine import (
     create_image_studio_engine,
     create_session_factory,
+    resolved_database_url,
 )
 from runpod_sdxl_image_studio.adapters.database.repositories.lora_metadata_repository import (
     LoraMetadataRepository,
@@ -28,7 +32,15 @@ from runpod_sdxl_image_studio.domain.lora_search import (
     LoraSort,
     append_trigger_words,
 )
-from runpod_sdxl_image_studio.services.lora_catalog_service import LoraCatalogService
+from runpod_sdxl_image_studio.services.lora_catalog_service import (
+    LoraCatalogError,
+    LoraCatalogService,
+)
+from runpod_sdxl_image_studio.ui.tabs.lora_management_tab import (
+    build_catalog_list_updates,
+    make_favorite_handler,
+    make_save_handler,
+)
 
 
 def _catalog(tmp_path: Path) -> tuple[Settings, LoraMetadataRepository, LoraThumbnailStorage]:
@@ -114,7 +126,28 @@ def test_repository_migration_sync_update_search_missing_and_usage(tmp_path: Pat
 def test_migration_creates_expected_table(tmp_path: Path) -> None:
     settings, _, _ = _catalog(tmp_path)
     engine = create_image_studio_engine(settings)
-    assert inspect(engine).has_table("lora_metadata")
+    inspector = inspect(engine)
+    assert inspector.has_table("lora_metadata")
+    indexes = {index["name"] for index in inspector.get_indexes("lora_metadata")}
+    assert {
+        "ix_lora_metadata_category",
+        "ix_lora_metadata_favorite",
+        "ix_lora_metadata_missing",
+        "ix_lora_metadata_last_used",
+    } <= indexes
+    engine.dispose()
+
+    config = Config(str(Path(__file__).parents[2] / "alembic.ini"))
+    config.set_main_option("script_location", str(Path(__file__).parents[2] / "alembic"))
+    config.set_main_option("sqlalchemy.url", resolved_database_url(settings))
+    command.downgrade(config, "base")
+    downgraded_engine = create_image_studio_engine(settings)
+    assert not inspect(downgraded_engine).has_table("lora_metadata")
+    downgraded_engine.dispose()
+    command.upgrade(config, "head")
+    upgraded_engine = create_image_studio_engine(settings)
+    assert inspect(upgraded_engine).has_table("lora_metadata")
+    upgraded_engine.dispose()
 
 
 def test_thumbnail_storage_validates_and_atomically_writes_webp(tmp_path: Path) -> None:
@@ -145,6 +178,47 @@ def test_thumbnail_storage_validates_and_atomically_writes_webp(tmp_path: Path) 
         storage.read("lora_thumbnails/not-a-uuid.webp")
 
 
+def test_thumbnail_service_compensates_for_database_failures(tmp_path: Path) -> None:
+    _, repository, thumbnails = _catalog(tmp_path)
+    repository.upsert_discovered_loras(("style.safetensors", "new.safetensors"))
+    service = LoraCatalogService(repository, thumbnails)
+    style = service.get_by_file_name("style.safetensors")
+    new = service.get_by_file_name("new.safetensors")
+    assert style is not None and new is not None
+
+    payload = BytesIO()
+    Image.new("RGB", (8, 8), "red").save(payload, format="PNG")
+    service.save_thumbnail(style.id, payload.getvalue())
+    old_path = service.thumbnail_path(style.id)
+    assert old_path is not None and old_path.exists()
+    with Image.open(old_path) as old_image:
+        old_pixel = old_image.getpixel((0, 0))
+
+    def fail_thumbnail_update(metadata_id: UUID, thumbnail_path: str | None):
+        del metadata_id, thumbnail_path
+        raise RuntimeError("database failure")
+
+    original_set_thumbnail_path = repository.set_thumbnail_path
+    repository.set_thumbnail_path = fail_thumbnail_update  # type: ignore[method-assign]
+    with pytest.raises(LoraCatalogError):
+        service.save_thumbnail(new.id, payload.getvalue())
+    assert service.thumbnail_path(new.id) is None
+
+    with pytest.raises(LoraCatalogError):
+        service.save_thumbnail(style.id, payload.getvalue())
+    restored_path = service.thumbnail_path(style.id)
+    assert restored_path is not None and restored_path.exists()
+    with Image.open(restored_path) as restored:
+        assert restored.getpixel((0, 0)) == old_pixel
+
+    with pytest.raises(LoraCatalogError):
+        service.delete_thumbnail(style.id)
+    assert service.thumbnail_path(style.id) is not None
+    repository.set_thumbnail_path = original_set_thumbnail_path  # type: ignore[method-assign]
+    service.delete_thumbnail(new.id)
+    assert service.thumbnail_path(new.id) is None
+
+
 def test_catalog_service_sync_failure_does_not_mark_existing_metadata_missing(
     tmp_path: Path,
 ) -> None:
@@ -156,3 +230,51 @@ def test_catalog_service_sync_failure_does_not_mark_existing_metadata_missing(
 
     metadata = service.get_by_file_name("style.safetensors")
     assert metadata is not None and metadata.is_missing is False
+
+
+def test_metadata_changes_refresh_catalog_and_generation_views(tmp_path: Path) -> None:
+    _, repository, thumbnails = _catalog(tmp_path)
+    repository.upsert_discovered_loras(("style.safetensors",))
+    service = LoraCatalogService(repository, thumbnails)
+    metadata = service.get_by_file_name("style.safetensors")
+    assert metadata is not None
+
+    with gr.Blocks():
+        updates = build_catalog_list_updates(
+            (metadata.model_copy(update={"display_name": "Style"}),),
+            str(metadata.id),
+            ("character", "style"),
+            "style",
+        )
+    assert "Style" in updates[0]
+    assert updates[1].value == str(metadata.id)
+    assert updates[1].choices[0][0] == "Style — style.safetensors"
+    assert updates[2].value == "style"
+
+    save = make_save_handler(service, max_loras=2)
+    save_result = save(
+        str(metadata.id),
+        "Updated Style",
+        "character",
+        True,
+        "style",
+        0.8,
+        0.7,
+        "SDXL 1.0",
+        "memo",
+        "",
+        None,
+        False,
+        False,
+        "favorites_recent",
+        None,
+        [],
+    )
+    assert "Updated Style" in save_result[1]
+    assert save_result[2].choices[0][0] == "Updated Style — style.safetensors"
+    assert ("character", "character") in save_result[3].choices
+
+    favorite = make_favorite_handler(service, max_loras=2)
+    invalid = favorite("not-a-uuid", True)
+    assert invalid[0].value is False
+    assert "UUID" in invalid[1]

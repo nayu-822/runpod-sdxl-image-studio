@@ -17,6 +17,7 @@ from runpod_sdxl_image_studio.services.lora_catalog_service import (
     LoraCatalogError,
     LoraCatalogService,
 )
+from runpod_sdxl_image_studio.ui.components.lora_editor import render_state_updates
 
 
 @dataclass(frozen=True)
@@ -124,6 +125,7 @@ def make_search_handler(
         favorites_only: bool,
         include_missing: bool,
         sort: str,
+        selected_id: str | None = None,
     ) -> tuple[object, ...]:
         try:
             results = catalog.search(
@@ -135,20 +137,14 @@ def make_search_handler(
                     sort=sort,
                 )
             )
-            options = tuple(
-                (
-                    f"{item.display_name} — {item.file_name}"
-                    if item.display_name
-                    else item.file_name,
-                    str(item.id),
-                )
-                for item in results
-            )
-            return _render_results(results), gr.Dropdown(
-                choices=list(options), interactive=bool(options)
+            return build_catalog_list_updates(
+                results,
+                selected_id,
+                catalog.categories(),
+                category,
             )
         except (LoraCatalogError, ValidationError, ValueError):
-            return "LoRA一覧を取得できませんでした。", gr.Dropdown(choices=[], interactive=False)
+            return "LoRA一覧を取得できませんでした。", gr.skip(), gr.skip()
 
     return handler
 
@@ -164,21 +160,13 @@ def make_sync_handler(
         try:
             catalog.sync_with_capabilities(result.capabilities.loras)
             results = catalog.search(LoraSearchQuery())
-            return (
-                _render_results(results),
-                gr.skip(),
-                gr.Dropdown(
-                    choices=[(item.file_name, str(item.id)) for item in results],
-                    interactive=bool(results),
-                ),
-                gr.Dropdown(
-                    choices=list(catalog.categories()),
-                    interactive=bool(catalog.categories()),
-                ),
+            return (result.message,) + build_catalog_list_updates(
+                results,
+                None,
+                catalog.categories(),
             )
         except LoraCatalogError as exc:
             return str(exc), gr.skip(), gr.skip(), gr.skip()
-            return "LoRA一覧を同期できませんでした。", gr.skip(), gr.skip()
 
     return handler
 
@@ -213,6 +201,7 @@ def make_select_handler(
 
 def make_save_handler(
     catalog: LoraCatalogService,
+    max_loras: int = 8,
 ) -> Callable[..., tuple[object, ...]]:
     def handler(
         selected: str | None,
@@ -224,9 +213,17 @@ def make_save_handler(
         recommended_clip: float | None,
         compatible_models: str,
         notes: str,
+        search_text: str = "",
+        search_category: str | None = None,
+        favorites_only: bool = False,
+        include_missing: bool = False,
+        sort: str = LoraSort.FAVORITES_RECENT.value,
+        generation_category: str | None = None,
+        generation_state: object = None,
     ) -> tuple[object, ...]:
+        output_count = 7 + 7 * max_loras
         if not selected:
-            return "LoRAを選択してください。", gr.skip()
+            return ("LoRAを選択してください。",) + (gr.skip(),) * output_count
         try:
             metadata = catalog.update_metadata(
                 UUID(selected),
@@ -241,27 +238,76 @@ def make_save_handler(
                     notes=notes,
                 ),
             )
-            return f"保存しました: {metadata.file_name}", gr.skip()
+            return _metadata_change_updates(
+                catalog,
+                f"保存しました: {metadata.file_name}",
+                selected,
+                search_text,
+                search_category,
+                favorites_only,
+                include_missing,
+                sort,
+                generation_category,
+                generation_state,
+                max_loras,
+            )
         except (LoraCatalogError, ValidationError, ValueError):
-            return "入力値を確認してください。", gr.skip()
+            return ("入力値を確認してください。",) + (gr.skip(),) * output_count
 
     return handler
 
 
 def make_favorite_handler(
     catalog: LoraCatalogService,
-) -> Callable[[str | None, bool], tuple[object, ...]]:
-    def handler(selected: str | None, favorite: bool) -> tuple[object, ...]:
+    max_loras: int = 8,
+) -> Callable[..., tuple[object, ...]]:
+    def handler(
+        selected: str | None,
+        favorite: bool,
+        search_text: str = "",
+        search_category: str | None = None,
+        favorites_only: bool = False,
+        include_missing: bool = False,
+        sort: str = LoraSort.FAVORITES_RECENT.value,
+        generation_category: str | None = None,
+        generation_state: object = None,
+    ) -> tuple[object, ...]:
+        output_count = 8 + 7 * max_loras
         if not selected:
-            return gr.skip(), "LoRAを選択してください。"
+            return (gr.skip(), "LoRAを選択してください。") + (gr.skip(),) * (output_count - 2)
         try:
-            catalog.set_favorite(UUID(selected), favorite)
-            return gr.Checkbox(value=favorite), "お気に入りを保存しました。"
+            metadata_id = UUID(selected)
+        except ValueError:
+            return (
+                gr.Checkbox(value=not favorite),
+                "選択対象のUUIDが不正です。",
+            ) + (gr.skip(),) * (output_count - 2)
+        try:
+            catalog.set_favorite(metadata_id, favorite)
+            updates = _metadata_change_updates(
+                catalog,
+                "お気に入りを保存しました。",
+                selected,
+                search_text,
+                search_category,
+                favorites_only,
+                include_missing,
+                sort,
+                generation_category,
+                generation_state,
+                max_loras,
+            )
+            return (gr.Checkbox(value=favorite),) + updates
         except (LoraCatalogError, ValueError):
-            current = catalog.get_metadata(UUID(selected))
-            return gr.Checkbox(
-                value=current.is_favorite if current else not favorite
-            ), "保存に失敗しました。"
+            try:
+                current = catalog.get_metadata(metadata_id)
+            except Exception:  # noqa: BLE001 - do not expose database details in the UI
+                current = None
+            return (
+                gr.Checkbox(value=current.is_favorite if current else not favorite),
+                "保存に失敗しました。",
+                *(gr.skip() for _ in range(output_count - 2)),
+            )
 
     return handler
 
@@ -295,6 +341,90 @@ def make_thumbnail_delete_handler(
             return "サムネイルを削除できませんでした。", gr.skip()
 
     return handler
+
+
+def build_catalog_list_updates(
+    results: Sequence[LoraMetadata],
+    selected_id: str | None,
+    categories: Sequence[str] = (),
+    category: str | None = None,
+) -> tuple[object, ...]:
+    """Build the shared result, selection, and category updates."""
+
+    options = tuple(
+        (
+            f"{item.display_name} — {item.file_name}" if item.display_name else item.file_name,
+            str(item.id),
+        )
+        for item in results
+    )
+    selected_value = selected_id if selected_id in {value for _, value in options} else None
+    category_values = tuple(categories)
+    return (
+        _render_results(results),
+        gr.Dropdown(
+            choices=list(options),
+            value=selected_value,
+            interactive=bool(options),
+        ),
+        gr.Dropdown(
+            choices=list(category_values),
+            value=category if category in category_values else None,
+            interactive=bool(category_values),
+        ),
+    )
+
+
+def _metadata_change_updates(
+    catalog: LoraCatalogService,
+    message: str,
+    selected_id: str,
+    search_text: str,
+    search_category: str | None,
+    favorites_only: bool,
+    include_missing: bool,
+    sort: str,
+    generation_category: str | None,
+    generation_state: object,
+    max_loras: int,
+) -> tuple[object, ...]:
+    results = catalog.search(
+        LoraSearchQuery(
+            text=search_text or "",
+            category=search_category or None,
+            favorites_only=favorites_only,
+            include_missing=include_missing,
+            sort=sort,
+        )
+    )
+    list_updates = build_catalog_list_updates(
+        results,
+        selected_id,
+        catalog.categories(),
+        search_category,
+    )
+    generation_updates = _generation_lora_updates(
+        catalog,
+        generation_category,
+        generation_state,
+        max_loras,
+    )
+    return (message, *list_updates, *generation_updates)
+
+
+def _generation_lora_updates(
+    catalog: LoraCatalogService,
+    category: str | None,
+    state: object,
+    max_loras: int,
+) -> tuple[object, ...]:
+    choices = catalog.selector_options(category or None)
+    return (list(choices),) + render_state_updates(
+        state,
+        choices,
+        max_loras,
+        clear_unavailable=True,
+    )
 
 
 def _render_results(metadata: Sequence[LoraMetadata]) -> str:

@@ -464,6 +464,13 @@ async def test_generation_service_posts_three_loras_and_external_vae(tmp_path: P
         generation_timeout_seconds=5,
         max_loras=3,
     )
+    usage_calls: list[tuple[tuple[str, ...], datetime]] = []
+
+    class FailingUsageRecorder:
+        def record_usage(self, file_names: tuple[str, ...], completed_at: datetime) -> None:
+            usage_calls.append((file_names, completed_at))
+            raise RuntimeError("database is temporarily unavailable")
+
     client = FakeClient()
     service = GenerationService(
         client,  # type: ignore[arg-type]
@@ -472,6 +479,7 @@ async def test_generation_service_posts_three_loras_and_external_vae(tmp_path: P
         LocalStorageAdapter(settings),
         capabilities_provider,
         settings,
+        lora_catalog_service=FailingUsageRecorder(),
         id_factory=lambda: UUID(int=22),
     )
     generation_settings = _settings(
@@ -500,6 +508,14 @@ async def test_generation_service_posts_three_loras_and_external_vae(tmp_path: P
     assert workflow["vae_external"]["inputs"]["vae_name"] == "test-vae.safetensors"  # type: ignore[index]
     assert workflow["3"]["inputs"]["seed"] == 123  # type: ignore[index]
     assert result.stored_image is not None
+    assert result.status is GenerationStatus.COMPLETED
+    assert len(usage_calls) == 1
+    assert usage_calls[0][0] == (
+        "lora-0.safetensors",
+        "lora-1.safetensors",
+        "lora-2.safetensors",
+    )
+    assert usage_calls[0][1] > result.created_at
 
 
 @pytest.mark.asyncio

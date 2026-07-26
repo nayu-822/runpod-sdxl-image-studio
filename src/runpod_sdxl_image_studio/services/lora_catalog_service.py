@@ -54,31 +54,52 @@ class LoraCatalogService:
             raise LoraCatalogError("LoRA一覧を取得できませんでした。") from exc
 
     def categories(self) -> tuple[str, ...]:
-        return self._repository.list_categories()
+        try:
+            return self._repository.list_categories()
+        except Exception as exc:  # noqa: BLE001 - service boundary
+            raise LoraCatalogError("LoRAカテゴリを取得できませんでした。") from exc
 
     def get_metadata(self, metadata_id: UUID) -> LoraMetadata | None:
-        return self._repository.get_by_id(metadata_id)
+        try:
+            return self._repository.get_by_id(metadata_id)
+        except Exception as exc:  # noqa: BLE001 - service boundary
+            raise LoraCatalogError("LoRA metadataを取得できませんでした。") from exc
 
     def get_by_file_name(self, file_name: str) -> LoraMetadata | None:
-        return self._repository.get_by_file_name(file_name)
+        try:
+            return self._repository.get_by_file_name(file_name)
+        except Exception as exc:  # noqa: BLE001 - service boundary
+            raise LoraCatalogError("LoRA metadataを取得できませんでした。") from exc
 
     def update_metadata(self, metadata_id: UUID, update: LoraMetadataUpdate) -> LoraMetadata:
-        metadata = self._repository.update_metadata(metadata_id, update)
+        try:
+            metadata = self._repository.update_metadata(metadata_id, update)
+        except Exception as exc:  # noqa: BLE001 - service boundary
+            raise LoraCatalogError("LoRA metadataを更新できませんでした。") from exc
         if metadata is None:
             raise LoraCatalogError("対象のLoRA metadataが見つかりません。")
         return metadata
 
     def set_favorite(self, metadata_id: UUID, is_favorite: bool) -> LoraMetadata:
-        metadata = self._repository.set_favorite(metadata_id, is_favorite)
+        try:
+            metadata = self._repository.set_favorite(metadata_id, is_favorite)
+        except Exception as exc:  # noqa: BLE001 - service boundary
+            raise LoraCatalogError("お気に入りを更新できませんでした。") from exc
         if metadata is None:
             raise LoraCatalogError("対象のLoRA metadataが見つかりません。")
         return metadata
 
     def save_thumbnail(self, metadata_id: UUID, payload: bytes) -> LoraMetadata:
-        current = self._repository.get_by_id(metadata_id)
+        try:
+            current = self._repository.get_by_id(metadata_id)
+        except Exception as exc:  # noqa: BLE001 - service boundary
+            raise LoraCatalogError("LoRA metadataを取得できませんでした。") from exc
         if current is None:
             raise LoraCatalogError("対象のLoRA metadataが見つかりません。")
-        old_payload = self._thumbnails.read(current.thumbnail_path)
+        try:
+            old_payload = self._thumbnails.read(current.thumbnail_path)
+        except Exception as exc:  # noqa: BLE001 - service boundary
+            raise LoraCatalogError("既存サムネイルを読み込めませんでした。") from exc
         try:
             relative_path = self._thumbnails.save(metadata_id, payload)
             updated = self._repository.set_thumbnail_path(metadata_id, relative_path)
@@ -100,10 +121,16 @@ class LoraCatalogService:
             raise LoraCatalogError("LoRA metadataを更新できませんでした。") from exc
 
     def delete_thumbnail(self, metadata_id: UUID) -> LoraMetadata:
-        current = self._repository.get_by_id(metadata_id)
+        try:
+            current = self._repository.get_by_id(metadata_id)
+        except Exception as exc:  # noqa: BLE001 - service boundary
+            raise LoraCatalogError("LoRA metadataを取得できませんでした。") from exc
         if current is None:
             raise LoraCatalogError("対象のLoRA metadataが見つかりません。")
-        old_payload = self._thumbnails.read(current.thumbnail_path)
+        try:
+            old_payload = self._thumbnails.read(current.thumbnail_path)
+        except Exception as exc:  # noqa: BLE001 - service boundary
+            raise LoraCatalogError("既存サムネイルを読み込めませんでした。") from exc
         try:
             self._thumbnails.delete(current.thumbnail_path)
             updated = self._repository.set_thumbnail_path(metadata_id, None)

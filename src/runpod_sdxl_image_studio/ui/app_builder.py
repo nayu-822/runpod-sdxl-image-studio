@@ -283,8 +283,13 @@ def build_app(
             lora_management.favorites_only,
             lora_management.include_missing,
             lora_management.sort,
+            lora_management.selected,
         ]
-        search_outputs = [lora_management.result_list, lora_management.selected]
+        search_outputs = [
+            lora_management.result_list,
+            lora_management.selected,
+            lora_management.category_filter,
+        ]
         search_handler = make_search_handler(catalog_service)
         for source in (
             lora_management.search,
@@ -322,7 +327,7 @@ def build_app(
             ],
         )
         lora_management.save_button.click(
-            fn=make_save_handler(catalog_service),
+            fn=make_save_handler(catalog_service, app_settings.max_loras),
             inputs=[
                 lora_management.selected,
                 lora_management.display_name,
@@ -333,13 +338,49 @@ def build_app(
                 lora_management.recommended_clip,
                 lora_management.compatible_models,
                 lora_management.notes,
+                lora_management.search,
+                lora_management.category_filter,
+                lora_management.favorites_only,
+                lora_management.include_missing,
+                lora_management.sort,
+                generation.lora_category_filter,
+                generation.lora_editor.state,
             ],
-            outputs=[lora_management.message, lora_management.result_list],
+            outputs=[
+                lora_management.message,
+                lora_management.result_list,
+                lora_management.selected,
+                lora_management.category_filter,
+                generation.lora_editor.choices,
+                generation.lora_editor.state,
+                *component_outputs(generation.lora_editor),
+                generation.lora_editor.add_button,
+            ],
         )
         lora_management.favorite.change(
-            fn=make_favorite_handler(catalog_service),
-            inputs=[lora_management.selected, lora_management.favorite],
-            outputs=[lora_management.favorite, lora_management.message],
+            fn=make_favorite_handler(catalog_service, app_settings.max_loras),
+            inputs=[
+                lora_management.selected,
+                lora_management.favorite,
+                lora_management.search,
+                lora_management.category_filter,
+                lora_management.favorites_only,
+                lora_management.include_missing,
+                lora_management.sort,
+                generation.lora_category_filter,
+                generation.lora_editor.state,
+            ],
+            outputs=[
+                lora_management.favorite,
+                lora_management.message,
+                lora_management.result_list,
+                lora_management.selected,
+                lora_management.category_filter,
+                generation.lora_editor.choices,
+                generation.lora_editor.state,
+                *component_outputs(generation.lora_editor),
+                generation.lora_editor.add_button,
+            ],
         )
         lora_management.thumbnail_upload.change(
             fn=make_thumbnail_save_handler(catalog_service),

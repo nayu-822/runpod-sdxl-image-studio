@@ -127,10 +127,11 @@ class GenerationService:
                 and self._lora_catalog_service is not None
                 and resolved_settings.loras
             ):
+                completed_at = datetime.now(UTC)
                 try:
                     self._lora_catalog_service.record_usage(
                         tuple(lora.name for lora in resolved_settings.loras),
-                        created_at,
+                        completed_at,
                     )
                 except Exception:  # noqa: BLE001 - usage statistics are best effort
                     logger.warning("LoRA usage statistics update failed", exc_info=True)
