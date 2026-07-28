@@ -115,29 +115,57 @@ class GenerationHistoryService:
         self,
         generation_id: UUID,
         *,
-        checkpoints: tuple[str, ...] = (),
-        vaes: tuple[str, ...] = (),
-        loras: tuple[str, ...] = (),
+        checkpoints: tuple[str, ...] | None = None,
+        vaes: tuple[str, ...] | None = None,
+        loras: tuple[str, ...] | None = None,
         max_loras: int | None = None,
     ) -> RestoreSettingsResult:
         generation = self._get_generation(generation_id)
         settings = generation.settings_snapshot.to_generation_settings()
         warnings: list[str] = []
-        if checkpoints and settings.checkpoint_name not in checkpoints:
+        unverified = checkpoints is None or vaes is None or loras is None
+        if unverified:
+            warnings.append(
+                "現在のComfyUI一覧を取得していないため、モデルの存在確認は行っていません。"
+            )
+        if checkpoints is not None and settings.checkpoint_name not in checkpoints:
             warnings.append(f"checkpointが現在利用できません: {settings.checkpoint_name}")
-        if settings.vae_name is not None and vaes and settings.vae_name not in vaes:
+        if vaes is not None and settings.vae_name is not None and settings.vae_name not in vaes:
             warnings.append(f"VAEが現在利用できません: {settings.vae_name}")
-        missing_loras = [lora.name for lora in settings.loras if lora.name not in loras]
-        warnings.extend(f"LoRAが現在利用できません: {name}" for name in missing_loras)
+        if loras is not None:
+            missing_loras = [lora.name for lora in settings.loras if lora.name not in loras]
+            warnings.extend(f"LoRAが現在利用できません: {name}" for name in missing_loras)
         if max_loras is not None and len(settings.loras) > max_loras:
             warnings.append("保存時のLoRA数が現在の上限を超えています。")
         return RestoreSettingsResult(
-            settings=settings, warnings=tuple(warnings), parent_generation_id=generation.id
+            settings=settings,
+            warnings=tuple(warnings),
+            parent_generation_id=generation.id,
+            capability_unverified=unverified,
         )
 
-    def prepare_regeneration(self, generation_id: UUID) -> RegenerationPlan:
-        restored = self.restore_settings(generation_id)
-        if restored.warnings:
+    def prepare_regeneration(
+        self,
+        generation_id: UUID,
+        *,
+        checkpoints: tuple[str, ...] | None = None,
+        vaes: tuple[str, ...] | None = None,
+        loras: tuple[str, ...] | None = None,
+        max_loras: int | None = None,
+    ) -> RegenerationPlan:
+        restored = self.restore_settings(
+            generation_id,
+            checkpoints=checkpoints,
+            vaes=vaes,
+            loras=loras,
+            max_loras=max_loras,
+        )
+        blocking_warnings = tuple(
+            warning
+            for warning in restored.warnings
+            if not warning.startswith("現在のComfyUI一覧を取得していないため")
+        )
+        if blocking_warnings:
             raise GenerationHistoryError("利用できないモデルがあるため再生成できません。")
         return RegenerationPlan(
             settings=restored.settings,

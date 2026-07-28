@@ -132,7 +132,7 @@ def build_lora_editor(max_loras: int) -> LoraEditorComponents:
 
     rows: list[LoraRowComponents] = []
     state = gr.State(empty_lora_state()[: max(1, max_loras)])
-    choices = gr.State([])
+    choices = gr.State(None)
     gr.Markdown("### LoRA")
     for index in range(max(1, max_loras)):
         with gr.Row(visible=index == 0) as container:
@@ -228,12 +228,24 @@ def render_state_updates(
     for index in range(max(1, max_loras)):
         row = rows[index] if index < len(rows) else _new_row()
         visible = index < len(rows)
+        row_choices = list(available)
+        current_name = row["lora_name"]
+        if (
+            not clear_unavailable
+            and isinstance(current_name, str)
+            and current_name not in _choice_values(available)
+        ):
+            row_choices.append((f"{current_name}（現在利用不可）", current_name))
         updates.extend(
             [
                 gr.Row(visible=visible),
                 gr.Dropdown(
-                    choices=list(available),
-                    value=preserve_lora_selection(row["lora_name"], available),
+                    choices=row_choices,
+                    value=(
+                        current_name
+                        if not clear_unavailable and isinstance(current_name, str)
+                        else preserve_lora_selection(current_name, available)
+                    ),
                     interactive=bool(available),
                 ),
                 gr.Number(value=_display_strength(row.get("model_strength")), visible=visible),

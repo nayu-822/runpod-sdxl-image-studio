@@ -277,6 +277,23 @@ class GenerationArtifactRepositoryProtocol(Protocol):
     def get_primary_image(self, generation_id: UUID) -> GenerationArtifact | None: ...
 
 
+class GenerationCompletionRepositoryProtocol(Protocol):
+    def complete_generation(
+        self,
+        generation_id: UUID,
+        job_id: UUID,
+        image_artifact: GenerationArtifact,
+        completed_at: datetime | None = None,
+    ) -> None: ...
+
+    def complete_existing_artifact(
+        self,
+        generation_id: UUID,
+        job_id: UUID,
+        completed_at: datetime | None = None,
+    ) -> None: ...
+
+
 class GenerationArtifactRepository(GenerationArtifactRepositoryProtocol):
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self._session_factory = session_factory
@@ -343,6 +360,126 @@ class GenerationArtifactRepository(GenerationArtifactRepositoryProtocol):
                 return _artifact_domain(row) if row is not None else None
         except SQLAlchemyError as exc:
             raise GenerationRepositoryError("artifact could not be read") from exc
+
+
+class GenerationCompletionRepository(GenerationCompletionRepositoryProtocol):
+    """Persist the primary artifact and both completion states atomically."""
+
+    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+        self._session_factory = session_factory
+
+    def complete_generation(
+        self,
+        generation_id: UUID,
+        job_id: UUID,
+        image_artifact: GenerationArtifact,
+        completed_at: datetime | None = None,
+    ) -> None:
+        if image_artifact.generation_id != generation_id:
+            raise GenerationRepositoryError("image artifact generation does not match")
+        if _unsafe_relative_path(image_artifact.local_path):
+            raise GenerationRepositoryError("artifact path must be relative")
+        timestamp = _utc(completed_at or datetime.now(UTC)) or datetime.now(UTC)
+        try:
+            with session_scope(self._session_factory) as session:
+                generation = _require_generation(session, generation_id)
+                job = _require_job(session, job_id)
+                if job.generation_id != str(generation_id):
+                    raise GenerationRepositoryError("job generation does not match")
+                self._add_or_validate_primary_artifact(session, image_artifact)
+                _mark_generation_completed(generation, timestamp)
+                _mark_job_completed(job, timestamp)
+                session.flush()
+        except GenerationRepositoryError:
+            raise
+        except (SQLAlchemyError, ValueError, SnapshotError) as exc:
+            raise GenerationRepositoryError("generation completion could not be persisted") from exc
+
+    def complete_existing_artifact(
+        self,
+        generation_id: UUID,
+        job_id: UUID,
+        completed_at: datetime | None = None,
+    ) -> None:
+        timestamp = _utc(completed_at or datetime.now(UTC)) or datetime.now(UTC)
+        try:
+            with session_scope(self._session_factory) as session:
+                generation = _require_generation(session, generation_id)
+                job = _require_job(session, job_id)
+                if job.generation_id != str(generation_id):
+                    raise GenerationRepositoryError("job generation does not match")
+                existing = session.scalar(
+                    select(GenerationArtifactModel).where(
+                        GenerationArtifactModel.generation_id == str(generation_id),
+                        GenerationArtifactModel.artifact_type == ArtifactType.IMAGE.value,
+                    )
+                )
+                if existing is None:
+                    raise GenerationRepositoryError("primary image artifact was not found")
+                _mark_generation_completed(generation, timestamp)
+                _mark_job_completed(job, timestamp)
+                session.flush()
+        except GenerationRepositoryError:
+            raise
+        except (SQLAlchemyError, ValueError, SnapshotError) as exc:
+            raise GenerationRepositoryError(
+                "existing generation completion could not be persisted"
+            ) from exc
+
+    @staticmethod
+    def _add_or_validate_primary_artifact(session: Session, artifact: GenerationArtifact) -> None:
+        generation = session.get(GenerationModel, str(artifact.generation_id))
+        if generation is None:
+            raise GenerationRepositoryError("generation was not found")
+        existing = session.scalar(
+            select(GenerationArtifactModel).where(
+                GenerationArtifactModel.generation_id == str(artifact.generation_id),
+                GenerationArtifactModel.artifact_type == ArtifactType.IMAGE.value,
+            )
+        )
+        if existing is not None:
+            if existing.sha256 != artifact.sha256 or existing.local_path != artifact.local_path:
+                raise GenerationRepositoryError("primary image artifact does not match")
+            return
+        session.add(
+            GenerationArtifactModel(
+                id=str(artifact.id),
+                generation_id=str(artifact.generation_id),
+                artifact_type=ArtifactType.IMAGE.value,
+                local_path=artifact.local_path,
+                sha256=artifact.sha256,
+                size_bytes=artifact.size_bytes,
+                width=artifact.width,
+                height=artifact.height,
+                mime_type=artifact.mime_type,
+                created_at=_utc(artifact.created_at),
+            )
+        )
+
+
+def _require_job(session: Session, job_id: UUID) -> GenerationJobModel:
+    row = session.get(GenerationJobModel, str(job_id))
+    if row is None:
+        raise GenerationRepositoryError("job was not found")
+    return row
+
+
+def _mark_generation_completed(row: GenerationModel, completed_at: datetime) -> None:
+    current = GenerationStatus(row.status)
+    if not is_valid_status_transition(current, GenerationStatus.COMPLETED):
+        raise GenerationRepositoryError("invalid generation completion transition")
+    row.status = GenerationStatus.COMPLETED.value
+    row.completed_at = completed_at
+    row.updated_at = datetime.now(UTC)
+
+
+def _mark_job_completed(row: GenerationJobModel, completed_at: datetime) -> None:
+    current = GenerationStatus(row.status)
+    if not is_valid_status_transition(current, GenerationStatus.COMPLETED):
+        raise GenerationRepositoryError("invalid job completion transition")
+    row.status = GenerationStatus.COMPLETED.value
+    row.completed_at = completed_at
+    row.updated_at = datetime.now(UTC)
 
 
 class GenerationJobRepositoryProtocol(Protocol):

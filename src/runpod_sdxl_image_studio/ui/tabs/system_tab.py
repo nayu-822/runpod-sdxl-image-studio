@@ -56,6 +56,8 @@ class GenerationTabComponents:
 
     checkpoint: gr.Dropdown
     vae: gr.Dropdown
+    checkpoint_choices: gr.State
+    vae_choices: gr.State
     sampler: gr.Dropdown
     scheduler: gr.Dropdown
     upscaler: gr.Dropdown
@@ -76,6 +78,8 @@ class GenerationTabComponents:
     result_image: gr.Image
     result_details: gr.Markdown
     restored_from_generation: gr.State
+    regeneration_valid: gr.State
+    regeneration_requested: gr.State
 
 
 def capability_refresh_outputs(generation: GenerationTabComponents) -> tuple[Any, ...]:
@@ -87,6 +91,8 @@ def capability_refresh_outputs(generation: GenerationTabComponents) -> tuple[Any
         generation.sampler,
         generation.scheduler,
         generation.upscaler,
+        generation.checkpoint_choices,
+        generation.vae_choices,
         generation.lora_list,
         generation.generate_button,
         generation.lora_editor.choices,
@@ -115,6 +121,7 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
 
     gr.Markdown("## 画像生成")
     checkpoint = gr.Dropdown([], label="checkpoint", interactive=False)
+    checkpoint_choices = gr.State(None)
     positive_prompt = gr.Textbox(label="Positive prompt", lines=5, max_lines=12)
     negative_prompt = gr.Textbox(label="Negative prompt", lines=3, max_lines=8)
     with gr.Row():
@@ -144,6 +151,7 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
                 label="VAE",
                 interactive=True,
             )
+            vae_choices = gr.State(None)
             upscaler = gr.Dropdown([], label="upscaler", interactive=False)
     lora_list = gr.Markdown("**LoRA list:** unavailable")
     lora_editor = build_lora_editor(max_loras)
@@ -155,6 +163,8 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
     return GenerationTabComponents(
         checkpoint=checkpoint,
         vae=vae,
+        checkpoint_choices=checkpoint_choices,
+        vae_choices=vae_choices,
         sampler=sampler,
         scheduler=scheduler,
         upscaler=upscaler,
@@ -175,6 +185,8 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
         result_image=result_image,
         result_details=result_details,
         restored_from_generation=gr.State(None),
+        regeneration_valid=gr.State(False),
+        regeneration_requested=gr.State(False),
     )
 
 
@@ -273,6 +285,8 @@ def make_generate_handler(
         vae: str | None = None,
         lora_state: object = None,
         restored_from_generation_id: str | None = None,
+        regeneration_valid: bool = False,
+        regeneration_requested: bool = False,
         progress: gr.Progress = _DEFAULT_PROGRESS,
     ) -> tuple[object, ...]:
         del size_preset
@@ -284,6 +298,7 @@ def make_generate_handler(
                 "",
                 None,
                 "LoRAの強度または件数を確認してください。",
+                False,
             )
         try:
             generation_settings = GenerationSettings(
@@ -301,17 +316,40 @@ def make_generate_handler(
                 cfg_scale=float(cfg_scale),
             )
         except (TypeError, ValueError, ValidationError):
-            return gr.Button("Generate", interactive=True), "", None, "入力値を確認してください。"
+            return (
+                gr.Button("Generate", interactive=True),
+                "",
+                None,
+                "入力値を確認してください。",
+                False,
+            )
 
         def on_progress(update: GenerationProgress) -> None:
             report_gradio_progress(progress, update)
 
+        if regeneration_requested and not restored_from_generation_id:
+            return (
+                gr.Button("Generate", interactive=True),
+                "",
+                None,
+                "履歴設定の復元に失敗したため、再生成を開始しませんでした。",
+                False,
+            )
+        if regeneration_requested and not regeneration_valid:
+            return (
+                gr.Button("Generate", interactive=True),
+                "",
+                None,
+                "利用できない設定があるため、再生成を開始しませんでした。",
+                False,
+            )
         if seed_mode == "Previous seed" and not restored_from_generation_id:
             return (
                 gr.Button("Generate", interactive=True),
                 "",
                 None,
                 "復元元Generationがありません。",
+                False,
             )
         parent_id: UUID | None = None
         if restored_from_generation_id:
@@ -323,6 +361,7 @@ def make_generate_handler(
                     "",
                     None,
                     "復元元Generationが不正です。",
+                    False,
                 )
         if parent_id is None:
             result = await service.generate(generation_settings, on_progress)
@@ -351,12 +390,14 @@ def make_generate_handler(
                 "Completed",
                 str(result.stored_image.path),
                 details,
+                False,
             )
         return (
             gr.Button("Generate", interactive=True),
             "Failed",
             None,
             result.error_message or "画像生成に失敗しました",
+            False,
         )
 
     return handler
@@ -475,6 +516,8 @@ def _capability_updates(
         else list(capabilities.loras)
     )
     return tuple(updates) + (
+        list(choices["checkpoint"]),
+        list(choices["vae"]),
         lora_markdown(capabilities),
         gr.Button(interactive=can_generate),
         selected_options,
@@ -496,9 +539,11 @@ def _empty_updates(generation: GenerationTabComponents) -> tuple[object, ...]:
         gr.Dropdown([], label=generation.sampler.label, interactive=False),
         gr.Dropdown([], label=generation.scheduler.label, interactive=False),
         gr.Dropdown([], label=generation.upscaler.label, interactive=False),
+        None,
+        None,
         "**LoRA list:** unavailable",
         gr.Button(interactive=False),
-        [],
+        None,
         *rendered,
         gr.Dropdown([], label=generation.lora_category_filter.label, interactive=False),
     )

@@ -23,6 +23,9 @@ from runpod_sdxl_image_studio.services.generation_history_service import (
 from runpod_sdxl_image_studio.services.generation_recovery_service import (
     GenerationRecoveryService,
 )
+from runpod_sdxl_image_studio.ui.components.lora_editor import (
+    render_state_updates,
+)
 
 
 @dataclass(frozen=True)
@@ -47,6 +50,18 @@ class HistoryTabComponents:
     restore_button: gr.Button
     regenerate_button: gr.Button
     message: gr.Markdown
+
+
+def begin_regeneration() -> tuple[gr.Button, bool]:
+    """Disable regeneration immediately and mark the chained request."""
+
+    return gr.Button(value="再生成中...", interactive=False), True
+
+
+def enable_regeneration_button() -> gr.Button:
+    """Restore regeneration after all success and failure paths."""
+
+    return gr.Button(value="同条件で再生成", interactive=True)
 
 
 def build_history_tab() -> HistoryTabComponents:
@@ -239,12 +254,28 @@ def make_note_handler(service: GenerationHistoryService) -> Callable[[str | None
 
 def make_restore_handler(
     service: GenerationHistoryService,
-) -> Callable[[str | None], tuple[object, ...]]:
-    def handler(selected: str | None) -> tuple[object, ...]:
+    max_loras: int,
+) -> Callable[..., tuple[object, ...]]:
+    def handler(
+        selected: str | None,
+        checkpoint_choices: object = None,
+        vae_choices: object = None,
+        lora_choices: object = None,
+    ) -> tuple[object, ...]:
         if not selected:
-            return ("履歴を選択してください。",) + (gr.skip(),) * 14
+            return (
+                ("履歴を選択してください。",)
+                + (gr.skip(),) * (12 + component_output_count(max_loras))
+                + (None, False)
+            )
         try:
-            restored = service.restore_settings(UUID(selected))
+            restored = service.restore_settings(
+                UUID(selected),
+                checkpoints=_string_choices(checkpoint_choices),
+                vaes=_string_choices(vae_choices),
+                loras=_lora_values(lora_choices),
+                max_loras=max_loras,
+            )
             settings = restored.settings
             lora_state = [
                 {
@@ -262,7 +293,17 @@ def make_restore_handler(
                     "clip_strength": 1.0,
                 }
             ]
+            lora_updates = render_state_updates(
+                lora_state,
+                lora_choices,
+                max_loras,
+                clear_unavailable=False,
+            )
             warning = " / ".join(restored.warnings)
+            unverified_warning = (
+                "現在のComfyUI一覧を取得していないため、モデルの存在確認は行っていません。"
+            )
+            blocking = any(item != unverified_warning for item in restored.warnings)
             return (
                 "設定を復元しました。" + (f" 警告: {warning}" if warning else ""),
                 settings.positive_prompt,
@@ -277,13 +318,46 @@ def make_restore_handler(
                 settings.cfg_scale,
                 gr.Dropdown(value=settings.sampler_name),
                 gr.Dropdown(value=settings.scheduler_name),
-                lora_state,
+                *lora_updates,
                 str(restored.parent_generation_id),
+                not blocking,
             )
         except (GenerationHistoryError, ValueError):
-            return "設定を復元できませんでした。", *(gr.skip() for _ in range(14))
+            return (
+                ("設定を復元できませんでした。",)
+                + (gr.skip(),) * (12 + component_output_count(max_loras))
+                + (None, False)
+            )
 
     return handler
+
+
+def component_output_count(max_loras: int) -> int:
+    """Return state, row, and add-button outputs for the restore handler."""
+
+    return 2 + 7 * max(1, max_loras)
+
+
+def _string_choices(value: object) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(item for item in value if isinstance(item, str))
+
+
+def _lora_values(value: object) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        return ()
+    values: list[str] = []
+    for item in value:
+        if isinstance(item, str):
+            values.append(item)
+        elif isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[1], str):
+            values.append(item[1])
+    return tuple(values)
 
 
 def render_history_items(items: tuple[GenerationHistoryItem, ...]) -> str:

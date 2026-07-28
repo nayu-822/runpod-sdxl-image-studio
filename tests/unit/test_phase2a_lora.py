@@ -36,6 +36,7 @@ from runpod_sdxl_image_studio.ui.components.lora_editor import (
     lora_settings_from_state,
     move_lora_row,
     remove_lora_row,
+    render_state_updates,
     update_lora_row,
 )
 from runpod_sdxl_image_studio.workflows.loader import load_txt2img_template
@@ -202,6 +203,32 @@ def test_ui_state_strength_is_not_silently_clamped() -> None:
     assert settings[0].clip_strength == 1.0
 
 
+def test_restore_render_keeps_unavailable_lora_and_all_row_values() -> None:
+    state = [
+        {
+            "row_id": "one",
+            "lora_name": "removed.safetensors",
+            "model_strength": 0.4,
+            "clip_strength": 0.8,
+        },
+        {
+            "row_id": "two",
+            "lora_name": "available.safetensors",
+            "model_strength": 1.2,
+            "clip_strength": 0.6,
+        },
+    ]
+
+    updates = render_state_updates(state, ["available.safetensors"], 3)
+
+    assert updates[0] == state
+    assert updates[2].value == "removed.safetensors"
+    assert ("removed.safetensors（現在利用不可）", "removed.safetensors") in updates[2].choices
+    assert updates[3].value == 0.4
+    assert updates[4].value == 0.8
+    assert updates[9].value == "available.safetensors"
+
+
 @pytest.mark.asyncio
 async def test_generate_handler_passes_configured_lora_limit() -> None:
     class CaptureService:
@@ -254,7 +281,7 @@ async def test_generate_handler_passes_configured_lora_limit() -> None:
     assert service.settings is not None
     assert len(service.settings.loras) == 10
 
-    _, _, image, details = await handler(
+    _, _, image, details, _ = await handler(
         "test-model-a.safetensors",
         "positive",
         "negative",

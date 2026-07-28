@@ -13,6 +13,7 @@ from runpod_sdxl_image_studio.adapters.database.engine import (
 )
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_repository import (
     GenerationArtifactRepository,
+    GenerationCompletionRepository,
     GenerationJobRepository,
     GenerationRepository,
 )
@@ -52,7 +53,9 @@ from runpod_sdxl_image_studio.ui.components.lora_editor import (
     update_lora_row,
 )
 from runpod_sdxl_image_studio.ui.tabs.history_tab import (
+    begin_regeneration,
     build_history_tab,
+    enable_regeneration_button,
     make_history_detail_handler,
     make_history_refresh_handler,
     make_restore_handler,
@@ -111,6 +114,7 @@ def build_app(
     session_factory = create_session_factory(database_engine)
     generation_repository = GenerationRepository(session_factory)
     artifact_repository = GenerationArtifactRepository(session_factory)
+    completion_repository = GenerationCompletionRepository(session_factory)
     job_repository = GenerationJobRepository(session_factory)
     catalog_service = LoraCatalogService(
         LoraMetadataRepository(create_session_factory(database_engine)),
@@ -133,6 +137,7 @@ def build_app(
         lora_catalog_service=catalog_service,
         generation_repository=generation_repository,
         artifact_repository=artifact_repository,
+        completion_repository=completion_repository,
         job_repository=job_repository,
         thumbnail_storage=HistoryThumbnailStorage(app_settings),
         metadata_storage=GenerationMetadataStorage(app_settings.data_dir),
@@ -559,11 +564,19 @@ def build_app(
             generation.sampler,
             generation.scheduler,
             generation.lora_editor.state,
+            *component_outputs(generation.lora_editor),
+            generation.lora_editor.add_button,
             generation.restored_from_generation,
+            generation.regeneration_valid,
         ]
         history.restore_button.click(
-            fn=make_restore_handler(history_service),
-            inputs=[history.selected],
+            fn=make_restore_handler(history_service, app_settings.max_loras),
+            inputs=[
+                history.selected,
+                generation.checkpoint_choices,
+                generation.vae_choices,
+                generation.lora_editor.choices,
+            ],
             outputs=restore_outputs,
         )
         generation_inputs = [
@@ -582,13 +595,25 @@ def build_app(
             generation.vae,
             generation.lora_editor.state,
             generation.restored_from_generation,
+            generation.regeneration_valid,
+            generation.regeneration_requested,
         ]
         regenerate_event = history.regenerate_button.click(
-            fn=make_restore_handler(history_service),
-            inputs=[history.selected],
+            fn=begin_regeneration,
+            outputs=[history.regenerate_button, generation.regeneration_requested],
+            queue=False,
+        )
+        regenerate_event = regenerate_event.then(
+            fn=make_restore_handler(history_service, app_settings.max_loras),
+            inputs=[
+                history.selected,
+                generation.checkpoint_choices,
+                generation.vae_choices,
+                generation.lora_editor.choices,
+            ],
             outputs=restore_outputs,
         )
-        regenerate_event.then(
+        regeneration_generation_event = regenerate_event.then(
             fn=make_generate_handler(generation_service, app_settings.max_loras),
             inputs=generation_inputs,
             outputs=[
@@ -596,8 +621,13 @@ def build_app(
                 generation.progress,
                 generation.result_image,
                 generation.result_details,
+                generation.regeneration_requested,
             ],
             concurrency_limit=1,
+        )
+        regeneration_generation_event.then(
+            fn=enable_regeneration_button,
+            outputs=[history.regenerate_button],
         )
         generate_event = generation.generate_button.click(
             fn=disable_generate_button,
@@ -612,6 +642,7 @@ def build_app(
                 generation.progress,
                 generation.result_image,
                 generation.result_details,
+                generation.regeneration_requested,
             ],
             concurrency_limit=1,
         )

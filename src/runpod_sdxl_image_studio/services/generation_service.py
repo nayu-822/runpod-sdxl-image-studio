@@ -22,6 +22,7 @@ from runpod_sdxl_image_studio.adapters.comfyui.websocket_client import ComfyUIWe
 from runpod_sdxl_image_studio.adapters.comfyui.workflow_adapter import WorkflowAdapter
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_repository import (
     GenerationArtifactRepositoryProtocol,
+    GenerationCompletionRepositoryProtocol,
     GenerationJobRepositoryProtocol,
     GenerationRepositoryError,
     GenerationRepositoryProtocol,
@@ -41,6 +42,7 @@ from runpod_sdxl_image_studio.domain.generation import (
     GenerationProgress,
     GenerationResult,
     GenerationStatus,
+    StoredImage,
 )
 from runpod_sdxl_image_studio.domain.generation_artifact import ArtifactType, GenerationArtifact
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
@@ -54,6 +56,10 @@ ProgressCallback = Callable[[GenerationProgress], None]
 
 class HistoryTimeoutError(ComfyUIPromptError):
     """History polling reached its configured attempt limit."""
+
+
+class GenerationPersistenceError(GenerationRepositoryError):
+    """A required generation record could not be persisted safely."""
 
 
 class CapabilitiesProvider(Protocol):
@@ -81,6 +87,7 @@ class GenerationService:
         id_factory: Callable[[], UUID] = uuid4,
         generation_repository: GenerationRepositoryProtocol | None = None,
         artifact_repository: GenerationArtifactRepositoryProtocol | None = None,
+        completion_repository: GenerationCompletionRepositoryProtocol | None = None,
         job_repository: GenerationJobRepositoryProtocol | None = None,
         thumbnail_storage: HistoryThumbnailStorage | None = None,
         metadata_storage: GenerationMetadataStorage | None = None,
@@ -96,6 +103,7 @@ class GenerationService:
         self._id_factory = id_factory
         self._generation_repository = generation_repository
         self._artifact_repository = artifact_repository
+        self._completion_repository = completion_repository
         self._job_repository = job_repository
         self._thumbnail_storage = thumbnail_storage
         self._metadata_storage = metadata_storage
@@ -115,28 +123,29 @@ class GenerationService:
     async def recover_prompt(self, generation_id: UUID, prompt_id: str) -> bool:
         """Complete one existing prompt from history without submitting it again."""
 
-        if self._generation_repository is None or self._job_repository is None:
+        if (
+            self._generation_repository is None
+            or self._job_repository is None
+            or self._artifact_repository is None
+        ):
             return False
         try:
             generation = self._generation_repository.get_by_id(generation_id)
             job = self._job_repository.get_by_generation(generation_id)
             if generation is None or job is None:
                 return False
-            if generation.status in {
-                GenerationStatus.COMPLETED,
-                GenerationStatus.FAILED,
-                GenerationStatus.CANCELLED,
-            }:
+            if generation.status is GenerationStatus.COMPLETED:
+                return True
+            if generation.status in {GenerationStatus.FAILED, GenerationStatus.CANCELLED}:
+                return False
+            existing_image = self._artifact_repository.get_primary_image(generation_id)
+            if existing_image is not None:
+                self._complete_existing_generation(generation_id, job.id)
                 return True
             history = await self._client.get_prompt_history(prompt_id)
             if history.is_failed:
-                self._generation_repository.mark_failed(
-                    generation_id,
-                    GenerationErrorCode.COMFYUI_EXECUTION.value,
-                    "ComfyUIで生成が失敗しました。",
-                )
-                self._job_repository.mark_failed(
-                    job.id,
+                self._mark_failed_pair(
+                    job,
                     GenerationErrorCode.COMFYUI_EXECUTION.value,
                     "ComfyUIで生成が失敗しました。",
                 )
@@ -155,18 +164,16 @@ class GenerationService:
                 created_at=generation.created_at,
                 stored_image=stored_image,
             )
-            self._persist_artifacts(
+            self._complete_job(
                 recovery_job,
                 generation.settings_snapshot.to_generation_settings(),
                 generation.created_at,
                 generation.kind,
                 generation.parent_generation_id,
             )
-            self._generation_repository.mark_completed(generation_id)
-            self._job_repository.mark_completed(job.id)
             return True
         except (ComfyUIError, GenerationRepositoryError, StorageError, ValueError) as exc:
-            logger.warning(
+            logger.error(
                 "Generation recovery failed generation=%s prompt_id=%s error=%s",
                 generation_id,
                 prompt_id,
@@ -408,15 +415,7 @@ class GenerationService:
             job.generation_id,
             created_at,
         )
-        self._persist_artifacts(job, settings, created_at, kind, parent_generation_id)
-        job.status = GenerationStatus.COMPLETED
-        try:
-            if self._generation_repository is not None:
-                self._generation_repository.mark_completed(job.generation_id)
-            if self._job_repository is not None:
-                self._job_repository.mark_completed(job.id)
-        except GenerationRepositoryError:
-            logger.error("Failed to persist completion generation=%s", job.generation_id)
+        self._complete_job(job, settings, created_at, kind, parent_generation_id)
 
     def _persist_progress(self, job: GenerationJob, progress: GenerationProgress) -> None:
         try:
@@ -432,7 +431,7 @@ class GenerationService:
         except GenerationRepositoryError:
             logger.warning("Failed to persist progress generation=%s", job.generation_id)
 
-    def _persist_artifacts(
+    def _complete_job(
         self,
         job: GenerationJob,
         settings: GenerationSettings,
@@ -440,59 +439,162 @@ class GenerationService:
         kind: GenerationKind,
         parent_generation_id: UUID | None,
     ) -> None:
-        if self._artifact_repository is None or job.stored_image is None:
-            return
+        if job.stored_image is None:
+            raise GenerationPersistenceError("stored image is missing")
         image = job.stored_image
-        try:
-            self._artifact_repository.add(
-                GenerationArtifact(
-                    id=self._id_factory(),
-                    generation_id=job.generation_id,
-                    artifact_type=ArtifactType.IMAGE,
-                    local_path=self._storage.relative_path(image.path),
-                    sha256=image.sha256,
-                    size_bytes=image.size_bytes,
-                    width=image.width,
-                    height=image.height,
-                    mime_type=image.mime_type,
-                    created_at=created_at,
-                )
+        completed_at = datetime.now(UTC)
+        primary_artifact = self._primary_image_artifact(job, image, completed_at)
+        if self._generation_repository is not None:
+            if self._completion_repository is not None:
+                try:
+                    self._completion_repository.complete_generation(
+                        job.generation_id,
+                        job.id,
+                        primary_artifact,
+                        completed_at,
+                    )
+                except GenerationRepositoryError as exc:
+                    logger.error(
+                        "Generation completion persistence failed generation=%s job=%s "
+                        "prompt_id=%s image_path=%s error=%s",
+                        job.generation_id,
+                        job.id,
+                        job.prompt_id or "",
+                        primary_artifact.local_path,
+                        type(exc).__name__,
+                    )
+                    raise GenerationPersistenceError(
+                        "generation completion could not be persisted"
+                    ) from exc
+            else:
+                if self._job_repository is None:
+                    raise GenerationPersistenceError("job persistence is unavailable")
+                self._persist_primary_image_artifact(job, primary_artifact)
+                try:
+                    self._generation_repository.mark_completed(job.generation_id, completed_at)
+                    self._job_repository.mark_completed(job.id, completed_at)
+                except GenerationRepositoryError as exc:
+                    logger.error(
+                        "Generation completion persistence failed generation=%s job=%s "
+                        "prompt_id=%s image_path=%s",
+                        job.generation_id,
+                        job.id,
+                        job.prompt_id or "",
+                        primary_artifact.local_path,
+                    )
+                    raise GenerationPersistenceError(
+                        "generation completion could not be persisted"
+                    ) from exc
+        job.status = GenerationStatus.COMPLETED
+        job.completed_at = completed_at
+        self._persist_optional_artifacts(
+            job,
+            settings,
+            image,
+            completed_at,
+            kind,
+            parent_generation_id,
+        )
+
+    def _complete_existing_generation(self, generation_id: UUID, job_id: UUID) -> None:
+        completed_at = datetime.now(UTC)
+        if self._completion_repository is not None:
+            self._completion_repository.complete_existing_artifact(
+                generation_id,
+                job_id,
+                completed_at,
             )
+            return
+        if self._generation_repository is None or self._job_repository is None:
+            raise GenerationPersistenceError("generation persistence is unavailable")
+        try:
+            self._generation_repository.mark_completed(generation_id, completed_at)
+            self._job_repository.mark_completed(job_id, completed_at)
+        except GenerationRepositoryError as exc:
+            logger.error(
+                "Existing artifact completion persistence failed generation=%s job=%s",
+                generation_id,
+                job_id,
+            )
+            raise GenerationPersistenceError(
+                "existing generation completion could not be persisted"
+            ) from exc
+
+    def _persist_primary_image_artifact(
+        self, job: GenerationJob, artifact: GenerationArtifact
+    ) -> None:
+        if self._artifact_repository is None:
+            raise GenerationPersistenceError("primary image artifact repository is unavailable")
+        try:
+            self._artifact_repository.add(artifact)
         except (GenerationRepositoryError, StorageError, OSError) as exc:
+            logger.error(
+                "Required image artifact persistence failed generation=%s "
+                "prompt_id=%s image_path=%s error=%s",
+                artifact.generation_id,
+                job.prompt_id or "",
+                artifact.local_path,
+                type(exc).__name__,
+            )
+            raise GenerationPersistenceError(
+                "primary image artifact could not be persisted"
+            ) from exc
+
+    def _persist_optional_artifacts(
+        self,
+        job: GenerationJob,
+        settings: GenerationSettings,
+        image: StoredImage,
+        created_at: datetime,
+        kind: GenerationKind,
+        parent_generation_id: UUID | None,
+    ) -> None:
+        if self._artifact_repository is None:
+            return
+        try:
+            existing_types = {
+                artifact.artifact_type
+                for artifact in self._artifact_repository.list_by_generation(job.generation_id)
+            }
+        except GenerationRepositoryError as exc:
             logger.warning(
-                "Generation artifact persistence warning generation=%s error=%s",
+                "Optional artifact lookup warning generation=%s error=%s",
                 job.generation_id,
                 type(exc).__name__,
             )
-            return
+            existing_types = set()
+        image_path = image.path
         if self._metadata_storage is not None:
-            try:
-                payload = _sidecar_payload(job, settings, image, kind, parent_generation_id)
-                sidecar_path = self._metadata_storage.save_for_image(image.path, payload)
-                self._artifact_repository.add(
-                    GenerationArtifact(
-                        id=self._id_factory(),
-                        generation_id=job.generation_id,
-                        artifact_type=ArtifactType.METADATA,
-                        local_path=self._metadata_storage.relative_path(sidecar_path),
-                        sha256=self._metadata_storage.sha256(sidecar_path),
-                        size_bytes=sidecar_path.stat().st_size,
-                        width=None,
-                        height=None,
-                        mime_type="application/json",
-                        created_at=created_at,
+            if ArtifactType.METADATA in existing_types:
+                pass
+            else:
+                try:
+                    payload = _sidecar_payload(job, settings, image, kind, parent_generation_id)
+                    sidecar_path = self._metadata_storage.save_for_image(image_path, payload)
+                    self._artifact_repository.add(
+                        GenerationArtifact(
+                            id=self._id_factory(),
+                            generation_id=job.generation_id,
+                            artifact_type=ArtifactType.METADATA,
+                            local_path=self._metadata_storage.relative_path(sidecar_path),
+                            sha256=self._metadata_storage.sha256(sidecar_path),
+                            size_bytes=sidecar_path.stat().st_size,
+                            width=None,
+                            height=None,
+                            mime_type="application/json",
+                            created_at=created_at,
+                        )
                     )
-                )
-            except (GenerationRepositoryError, StorageError, OSError) as exc:
-                logger.warning(
-                    "Generation sidecar warning generation=%s error=%s",
-                    job.generation_id,
-                    type(exc).__name__,
-                )
-        if self._thumbnail_storage is not None:
+                except (GenerationRepositoryError, StorageError, OSError) as exc:
+                    logger.warning(
+                        "Generation sidecar warning generation=%s error=%s",
+                        job.generation_id,
+                        type(exc).__name__,
+                    )
+        if self._thumbnail_storage is not None and ArtifactType.THUMBNAIL not in existing_types:
             try:
                 thumbnail_path = self._thumbnail_storage.save(
-                    image.path, job.generation_id, created_at
+                    image_path, job.generation_id, created_at
                 )
                 self._artifact_repository.add(
                     GenerationArtifact(
@@ -514,6 +616,31 @@ class GenerationService:
                     job.generation_id,
                     type(exc).__name__,
                 )
+
+    def _primary_image_artifact(
+        self,
+        job: GenerationJob,
+        image: StoredImage,
+        created_at: datetime,
+    ) -> GenerationArtifact:
+        return GenerationArtifact(
+            id=self._id_factory(),
+            generation_id=job.generation_id,
+            artifact_type=ArtifactType.IMAGE,
+            local_path=self._storage.relative_path(image.path),
+            sha256=image.sha256,
+            size_bytes=image.size_bytes,
+            width=image.width,
+            height=image.height,
+            mime_type=image.mime_type,
+            created_at=created_at,
+        )
+
+    def _mark_failed_pair(self, job: GenerationJob, code: str, summary: str) -> None:
+        job.status = GenerationStatus.FAILED
+        job.error_code = code
+        job.error_summary = summary
+        self._persist_failed(job, GenerationRepositoryError(summary))
 
     async def _poll_history(self, prompt_id: str) -> PromptHistory:
         last_error: ComfyUIError | None = None
@@ -594,6 +721,8 @@ def _validate_generation(
 
 
 def _safe_generation_error(error: Exception) -> str:
+    if isinstance(error, GenerationRepositoryError):
+        return "生成結果の保存状態を確定できませんでした。"
     if isinstance(error, WorkflowError):
         return "生成設定を確認できませんでした。"
     if isinstance(error, StorageError):

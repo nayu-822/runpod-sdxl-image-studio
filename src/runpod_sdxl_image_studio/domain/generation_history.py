@@ -73,6 +73,7 @@ class RestoreSettingsResult:
     settings: GenerationSettings
     warnings: tuple[str, ...]
     parent_generation_id: UUID
+    capability_unverified: bool = False
 
 
 @dataclass(frozen=True)

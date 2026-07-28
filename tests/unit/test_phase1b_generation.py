@@ -406,7 +406,7 @@ async def test_failed_generation_handler_reenables_button() -> None:
     from runpod_sdxl_image_studio.ui.tabs.system_tab import make_generate_handler
 
     handler = make_generate_handler(FailedService(), 8)  # type: ignore[arg-type]
-    button, status, image, details = await handler(
+    button, status, image, details, _ = await handler(
         "test-model-a.safetensors",
         "positive",
         "negative",
@@ -425,6 +425,45 @@ async def test_failed_generation_handler_reenables_button() -> None:
     assert status == "Failed"
     assert image is None
     assert details == "安全な生成エラー"
+
+
+@pytest.mark.asyncio
+async def test_regeneration_validation_failure_stops_before_service_call() -> None:
+    class UnexpectedService:
+        async def generate(
+            self, settings: GenerationSettings, progress_callback: object
+        ) -> GenerationResult:
+            del settings, progress_callback
+            raise AssertionError("regeneration must not start")
+
+    from runpod_sdxl_image_studio.ui.tabs.system_tab import make_generate_handler
+
+    handler = make_generate_handler(UnexpectedService(), 8)  # type: ignore[arg-type]
+    button, status, image, details, requested = await handler(
+        "test-model-a.safetensors",
+        "positive",
+        "negative",
+        "Custom",
+        1024,
+        1024,
+        "Fixed",
+        123,
+        28,
+        5.5,
+        "euler",
+        "normal",
+        None,
+        None,
+        str(UUID(int=1)),
+        False,
+        True,
+    )
+
+    assert button.interactive is True
+    assert status == ""
+    assert image is None
+    assert "再生成" in details
+    assert requested is False
 
 
 def test_websocket_abnormal_events_are_ignored_or_normalized() -> None:
