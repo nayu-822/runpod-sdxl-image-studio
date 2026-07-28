@@ -1,39 +1,36 @@
 # RunPod SDXL Image Studio
 
-## Phase 3A: 生成履歴・snapshot・再生成
+## フェーズ3A: 生成履歴・スナップショット・再生成
 
-Phase 3A adds SQLite-backed `Generation`, `GenerationJob`, and
-`GenerationArtifact` records. Resolved generation settings, including the
-実使用seed and ordered LoRA strengths, are stored as schema-versioned JSON
-snapshots. Completed images receive relative-path image, thumbnail, and UTF-8
-sidecar metadata artifacts under `<IMAGE_STUDIO_DATA_DIR>/generations/YYYY-MM-DD/`.
+フェーズ3Aでは、SQLite による `Generation`、`GenerationJob`、
+`GenerationArtifact` レコードを追加します。実使用 seed と順序付き LoRA 強度を含む
+確定済みの生成設定を、スキーマバージョン付き JSON スナップショットとして保存します。
+完了した画像は、`<IMAGE_STUDIO_DATA_DIR>/generations/YYYY-MM-DD/` 配下に、相対パスの画像、
+サムネイル、UTF-8 の sidecar metadata 成果物として保存されます。
 
-The history tab supports date/status/favorite/kind-capable paging through the
-service API, detail display, setting restoration, same-condition derived
-generation, favorites, and 2,000-character notes. Unfinished records can be
-checked without resubmitting prompts. Phase 3B features such as advanced
-search, presets, prompt diff, and batch generation remain deferred. Gradio 5
-(`>=5,<6`) remains the supported version.
+履歴タブでは、サービス API を通じて日付・状態・お気に入り・種別によるページング、
+詳細表示、設定復元、同条件の派生生成、お気に入り、2,000 文字のメモに対応します。
+未完了レコードは prompt を再送信せずに確認できます。高度な検索、プリセット、
+プロンプト差分、バッチ生成などのフェーズ3B機能は引き続き保留です。対応する Gradio
+バージョンは `>=5,<6` です。
 
-## Phase 2B: LoRA metadata catalog
+## フェーズ2B: LoRA メタデータカタログ
 
-Phase 2B adds a local SQLite catalog for LoRA metadata. The default database is
-`<IMAGE_STUDIO_DATA_DIR>/database/image_studio.sqlite3`; set
-`IMAGE_STUDIO_DATABASE_URL` to use an explicit database URL. The application runs
-Alembic migrations explicitly during startup, and importing modules has no database
-or filesystem side effects.
+フェーズ2Bでは、LoRA メタデータ用のローカル SQLite カタログを追加します。既定のデータベースは
+`<IMAGE_STUDIO_DATA_DIR>/database/image_studio.sqlite3` です。明示的なデータベース URL を使う場合は
+`IMAGE_STUDIO_DATABASE_URL` を設定します。アプリケーションは起動時に Alembic のマイグレーションを
+明示的に実行し、モジュールの import によるデータベースまたはファイルシステムへの副作用はありません。
 
-The LoRA management tab supports capability synchronization, search, category and
-favorite/missing filters, metadata editing, usage sorting, and safe PNG/JPEG/WebP
-thumbnail conversion to UUID-named WebP files. Trigger words are appended to the
-positive prompt only when the user presses the explicit trigger-word button.
-Recommended strengths are applied only when a LoRA selection changes. Usage
-statistics are best-effort and never change a successful generation to a failure.
+LoRA 管理タブでは、能力情報の同期、検索、カテゴリ・お気に入り・不足項目による絞り込み、
+メタデータ編集、使用回数順の並べ替え、安全な PNG/JPEG/WebP サムネイル変換、UUID 名の WebP
+ファイル保存に対応します。トリガーワードは、利用者が明示的なトリガーワードボタンを押した場合に
+限って positive prompt へ追加します。推奨強度は LoRA の選択が変わった場合に限って適用します。
+使用統計は可能な範囲で収集し、成功した生成を失敗へ変更することはありません。
 
-Phase 2B does not connect to external metadata services, Civitai, Google Drive,
-rclone, or RunPod APIs. Gradio 5 remains the supported UI version.
+フェーズ2Bでは、外部メタデータサービス、Civitai、Google Drive、rclone、RunPod API へ接続しません。
+対応する UI バージョンは引き続き Gradio 5 です。
 
-Migration commands:
+マイグレーションコマンド:
 
 ```bash
 alembic upgrade head
@@ -41,9 +38,10 @@ alembic downgrade -1
 alembic upgrade head
 ```
 
-Phase 2A (multiple LoRA and VAE selection foundation): [PHASE_2A_IMPLEMENTATION.md](PHASE_2A_IMPLEMENTATION.md)
+フェーズ2A（複数 LoRA と VAE 選択の基盤）:
+[PHASE_2A_IMPLEMENTATION.md](PHASE_2A_IMPLEMENTATION.md)
 
-Phase 1B の実装範囲と手動確認手順は [PHASE_1B_IMPLEMENTATION.md](PHASE_1B_IMPLEMENTATION.md) にまとめています。
+フェーズ1B の実装範囲と手動確認手順は [PHASE_1B_IMPLEMENTATION.md](PHASE_1B_IMPLEMENTATION.md) にまとめています。
 
 RunPod GPU Pod 上で ComfyUI を画像生成バックエンドとして使用し、Gradio からスマートフォンでも快適に操作できる個人向け SDXL 画像生成アプリです。
 
@@ -61,14 +59,14 @@ RunPod GPU Pod 上で ComfyUI を画像生成バックエンドとして使用�
 
 ### 1. 基本画像生成
 
-- Positive / Negative Prompt
-- Seed の自動生成・固定・再利用
-- Width / Height
-- Steps
+- 正・負のプロンプト
+- seed の自動生成・固定・再利用
+- 幅 / 高さ
+- ステップ数
 - CFG
-- Sampler
-- Scheduler
-- Batch size / Batch count
+- サンプラー
+- スケジューラー
+- バッチサイズ / バッチ回数
 - SDXL checkpoint 選択
 - VAE 選択
 - Clip skip 相当設定（対応ワークフローのみ）
@@ -189,20 +187,20 @@ RunPod GPU Pod 上で ComfyUI を画像生成バックエンドとして使用�
 Gradio UI
         |
         v
-Application Services
+アプリケーションサービス
         |
-        +--> ComfyUI API Adapter
+        +--> ComfyUI API アダプター
         |       |
         |       v
-        |   ComfyUI Workflow / GPU
+        |   ComfyUI ワークフロー / GPU
         |
-        +--> Metadata / History Service
+        +--> メタデータ / 履歴サービス
         |
-        +--> Model / LoRA Catalog
+        +--> モデル / LoRA カタログ
         |
-        +--> Job Queue Service
+        +--> ジョブキューサービス
         |
-        +--> Google Drive Storage Adapter (rclone)
+        +--> Google Drive ストレージアダプター (rclone)
         |
         +--> SQLite
 ```
@@ -246,9 +244,9 @@ Google Drive/
 3. `CODING_RULES.md`
 4. `AGENTS.md`
 
-## Phase 0 の状態
+## フェーズ0の状態
 
-Phase 0 では、実装を安全に始めるためのプロジェクト基盤を提供します。
+フェーズ0では、実装を安全に始めるためのプロジェクト基盤を提供します。
 
 - `src` レイアウトの Python パッケージ
 - `pydantic-settings` による型付き設定
@@ -257,11 +255,11 @@ Phase 0 では、実装を安全に始めるためのプロジェクト基盤を
 - Python 3.11 / 3.12 用 GitHub Actions
 - 後続フェーズ用の domain / service / adapter / persistence / UI 境界
 
-Phase 0 の起動時には ComfyUI、データベース、GPU、rclone へ接続しません。画像生成、履歴、SQLite、Google Drive 同期などは後続フェーズで追加します。
+フェーズ0の起動時には ComfyUI、データベース、GPU、rclone へ接続しません。画像生成、履歴、SQLite、Google Drive 同期などは後続フェーズで追加します。
 
-## Phase 1A の状態
+## フェーズ1Aの状態
 
-Phase 1A では、ComfyUI の状態と利用可能な能力を確認する基盤を追加しました。
+フェーズ1Aでは、ComfyUI の状態と利用可能な能力を確認する基盤を追加しました。
 
 - `httpx.AsyncClient` による ComfyUI HTTP クライアント
 - `/system_stats` と `/object_info` の取得
@@ -272,11 +270,11 @@ Phase 1A では、ComfyUI の状態と利用可能な能力を確認する基盤
 - 接続確認とモデル一覧の手動再読込
 - 実 ComfyUI に接続しない fixture ベースの単体・統合テスト
 
-CSSをUI構築側の `gr.Blocks` に保持するため、Phase 1AではGradio 6未満を使用します。
+CSSをUI構築側の `gr.Blocks` に保持するため、フェーズ1AではGradio 6未満を使用します。
 
 ComfyUI は `COMFYUI_BASE_URL` で指定した URL から読み取ります。RunPod では通常、同一 Pod 内の `http://127.0.0.1:8188` へ接続する想定です。アプリ起動だけでは ComfyUI へ接続せず、「接続確認」または「モデル一覧を再読込」を押したときだけ通信します。
 
-Phase 1A では画像生成、`/prompt`、WebSocket、workflow、画像保存、SQLite、Google Drive 同期はまだ実装していません。
+フェーズ1Aでは画像生成、`/prompt`、WebSocket、ワークフロー、画像保存、SQLite、Google Drive 同期はまだ実装していません。
 
 ## 開発環境のセットアップ
 
@@ -296,7 +294,7 @@ copy .env.example .env  # Windows PowerShell
 
 設定値は `.env.example` をコピーした `.env` で変更します。設定読み込みだけではディレクトリ作成や外部接続は行われません。
 
-## Phase 0 の確認
+## フェーズ0の確認
 
 ```bash
 ruff format --check .
@@ -312,9 +310,9 @@ python -m runpod_sdxl_image_studio.app
 runpod-sdxl-image-studio
 ```
 
-ブラウザで `http://127.0.0.1:7860` を開くと、Phase 1A の状態画面が表示されます。`share=True` は使用しません。RunPod での本番起動設定は後続フェーズで追加します。
+ブラウザで `http://127.0.0.1:7860` を開くと、フェーズ1Aの状態画面が表示されます。`share=True` は使用しません。RunPod での本番起動設定は後続フェーズで追加します。
 
-## Phase 1A の手動確認
+## フェーズ1Aの手動確認
 
 ```bash
 cp .env.example .env

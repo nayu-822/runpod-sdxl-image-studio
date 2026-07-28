@@ -6,7 +6,7 @@
 
 また、追加希望された 1〜29 機能はすべてスコープに含める。ただし実装順は、運用上の重要度と依存関係に従って段階的に進める。
 
-## Phase 0: リポジトリ・設計基盤
+## フェーズ0: リポジトリ・設計基盤
 
 ### 目的
 
@@ -32,7 +32,7 @@
 - 秘密情報や生成画像が Git 対象外になっている
 - 文書間の優先順位が明確である
 
-## Phase 1A: ComfyUI接続・能力取得基盤
+## フェーズ1A: ComfyUI接続・能力取得基盤
 
 ### 目的
 
@@ -46,9 +46,9 @@ Gradio から Application Service を経由して ComfyUI の稼働状態と利�
 - 手動の接続確認・一覧再読込
 - fixture を使った単体・統合テスト
 
-画像生成、`/prompt`、WebSocket、workflow、SQLite、画像保存は Phase 1B 以降で実装する。
+画像生成、`/prompt`、WebSocket、ワークフロー、SQLite、画像保存はフェーズ1B以降で実装する。
 
-## Phase 1B: 最小画像生成基盤
+## フェーズ1B: 最小画像生成基盤
 
 ### 目的
 
@@ -58,10 +58,10 @@ RunPod 上で Gradio から ComfyUI へ txt2img を依頼し、画像を表示�
 
 - Gradio Blocks の最小 UI
 - モバイル向けレスポンシブ CSS
-- ComfyUI health check
+- ComfyUI のヘルスチェック
 - checkpoint 一覧取得
 - sampler / scheduler 一覧
-- positive / negative prompt
+- positive / negative prompt（正・負のプロンプト）
 - seed
 - width / height
 - steps / CFG
@@ -95,7 +95,7 @@ RunPod 上で Gradio から ComfyUI へ txt2img を依頼し、画像を表示�
 - seed を含む生成条件が保存される
 - 同じ snapshot から同条件再生成できる
 
-## Phase 2: モデル・複数 LoRA・LoRA 補助情報
+## フェーズ2: モデル・複数 LoRA・LoRA 補助情報
 
 ### 目的
 
@@ -103,12 +103,12 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 
 ### 対応
 
-- checkpoint catalog
-- VAE catalog
-- LoRA catalog
+- checkpoint カタログ
+- VAE カタログ
+- LoRA カタログ
 - 一覧再読込
 - LoRA 行の追加・削除
-- model strength / clip strength
+- model strength / clip strength（モデル強度 / CLIP 強度）
 - 最大 LoRA 数
 - 重複 LoRA 防止
 - LoRA 対応 workflow mapping
@@ -131,7 +131,7 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 - 同条件再生成時に LoRA の順序と強度が復元される
 - 許可ディレクトリ外のファイルが一覧へ出ない
 
-## Phase 3: 履歴・検索・再生成・プリセット
+## フェーズ3: 履歴・検索・再生成・プリセット
 
 ### 目的
 
@@ -140,7 +140,7 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 ### 対応
 
 - 日付別履歴
-- Gallery paging
+- Gallery のページング
 - generation 詳細
 - 同条件再生成
 - seed 固定 / ランダム / 前回再利用切替
@@ -148,11 +148,11 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 - 一部条件変更後の派生生成
 - お気に入り
 - メモ
-- generation preset
-- prompt preset
-- LoRA preset
-- upscale preset
-- preset schema version
+- 生成プリセット
+- prompt プリセット
+- LoRA プリセット
+- アップスケールプリセット
+- プリセットのスキーマバージョン
 - 元 generation との関連付け
 - プロンプト差分表示
 - 実使用 seed のコピー
@@ -166,7 +166,7 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 - スマートフォンから履歴を実用的に閲覧できる
 - 条件検索で過去画像を見つけられる
 
-## Phase 4: 生成キュー・バッチ生成・ジョブ管理強化
+## フェーズ4: 生成キュー・バッチ生成・ジョブ管理強化
 
 ### 目的
 
@@ -183,7 +183,7 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 - バッチ生成
 - ランダム seed / 連番 seed
 - ジョブ進捗表示
-- stale job recovery
+- stale job の復旧
 - 再起動後 reconciliation
 
 ### 完了条件
@@ -192,7 +192,7 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 - スマホから予約投入できる
 - ブラウザを閉じても進捗を後から確認できる
 
-## Phase 5: アップスケール
+## フェーズ5: アップスケール
 
 ### 目的
 
@@ -202,10 +202,10 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 
 - 直前画像のアップスケール
 - 履歴画像のアップスケール
-- parent generation relation
-- image upscale workflow
-- latent upscale / hires fix workflow
-- upscaler model catalog
+- 親 generation の関連付け
+- 画像アップスケール用ワークフロー
+- latent upscale / hires fix 用ワークフロー
+- アップスケーラーモデルのカタログ
 - 倍率または最終解像度
 - denoise
 - 同じ seed / prompt / model / LoRA の復元
@@ -224,7 +224,7 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 - metadata から条件が完全復元される
 - アップスケール固有条件も保存される
 
-## Phase 6: 外部画像 metadata インポート
+## フェーズ6: 外部画像 metadata インポート
 
 ### 目的
 
@@ -232,8 +232,8 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 
 ### 対応
 
-- PNG metadata parser
-- ComfyUI prompt metadata parser
+- PNG metadata パーサー
+- ComfyUI prompt metadata パーサー
 - アプリ sidecar JSON parser
 - 画像アップロード
 - 読取内容のプレビュー
@@ -241,7 +241,7 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 - 未解決項目の手動マッピング
 - 安全な設定変換
 - 読込元 metadata の原文保存
-- schema migration
+- スキーマ移行
 - インポート画像の hash
 
 ### 完了条件
@@ -251,7 +251,7 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 - 任意 workflow や任意コードが metadata から実行されない
 - sidecar JSON の読み込みに対応する
 
-## Phase 7: Google Drive 保存・再同期・容量可視化
+## フェーズ7: Google Drive 保存・再同期・容量可視化
 
 ### 目的
 
@@ -259,7 +259,7 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 
 ### 対応
 
-- rclone adapter
+- rclone アダプター
 - 接続確認
 - 日付フォルダ
 - `generated/`
@@ -267,8 +267,8 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 - `manifests/`
 - 画像と JSON の copy
 - 転送進捗
-- retry
-- pending / syncing / synced / failed
+- 再試行
+- pending / syncing / synced / failed（待機中 / 同期中 / 同期済み / 失敗）
 - 起動時の未同期検出
 - 手動再同期
 - 日次 manifest JSONL
@@ -285,7 +285,7 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 - `rclone sync` を使用しない
 - Asia/Tokyo の日付でフォルダ分けされる
 
-## Phase 8: モバイル UI 改善
+## フェーズ8: モバイル UI 改善
 
 ### 目的
 
@@ -294,10 +294,10 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 ### 対応
 
 - 1 カラム基調
-- sticky generate action
+- 生成操作の固定表示
 - prompt editor 改善
-- LoRA card
-- advanced accordion
+- LoRA カード
+- 高度な設定のアコーディオン
 - 生成中ステータス card
 - 大きなタップ領域
 - 画像比較
@@ -314,7 +314,7 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 - 生成状況と選択画像が明確
 - 大きい元画像を履歴一覧で直接読み込まない
 
-## Phase 9: システム状態・エラー履歴・生成前チェック強化
+## フェーズ9: システム状態・エラー履歴・生成前チェック強化
 
 ### 目的
 
@@ -351,11 +351,11 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 - img2img
 - inpainting
 - ControlNet
-- regional prompting
+- 領域別プロンプト
 - ADetailer 相当
 - queue reorder の高度化
 - 複数 workflow profile
-- prompt wildcard
+- prompt ワイルドカード
 - Dynamic Prompts
 - X/Y/Z plot
 - 自動 caption
@@ -367,26 +367,26 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 
 これらは初期設計へ直接組み込まず、Adapter と workflow template の拡張点だけ確保する。
 
-## Phase 2A status
+## フェーズ2Aの状況
 
-Phase 2A is complete: multiple ordered LoRA selection, model/CLIP strengths, checkpoint-internal or external VAE selection, fixed workflow mapping, capability prevalidation, and bounded UI editing are implemented. See [PHASE_2A_IMPLEMENTATION.md](PHASE_2A_IMPLEMENTATION.md).
+フェーズ2Aは完了しています。順序付き複数 LoRA 選択、モデル/CLIP 強度、checkpoint 内蔵または外部 VAE の選択、
+固定ワークフローの対応付け、能力情報の事前検証、制限付き UI 編集を実装しました。
+詳細は [PHASE_2A_IMPLEMENTATION.md](PHASE_2A_IMPLEMENTATION.md) を参照してください。
 
-## Phase 2B status
+## フェーズ2Bの状況
 
-Phase 2B is complete: the SQLite LoRA metadata catalog, categories, favorites,
-recommendations, trigger words, previews, search, safe failure handling, and
-generation-form synchronization are implemented. LoRA presets remain deferred.
+フェーズ2Bは完了しています。SQLite による LoRA metadata カタログ、カテゴリ、お気に入り、
+推奨情報、トリガーワード、プレビュー、検索、安全な失敗処理、生成フォームとの同期を実装しました。
+LoRA プリセットは引き続き延期しています。
 
-## Phase 3A status
+## フェーズ3Aの状況
 
-Phase 3A is complete for the initial history foundation. Generation, Job, and
-Artifact records are persisted through Alembic-backed SQLite repositories.
-Resolved settings snapshots, status transitions, prompt IDs, UTC timestamps,
-image hashes, relative artifact paths, WebP history thumbnails, JSON sidecars,
-history paging, detail display, restore, derived regeneration, favorites, and
-notes are implemented. Basic unfinished-generation recovery checks prompt IDs
-without automatically resubmitting prompts.
+フェーズ3Aの初期履歴基盤は完了しています。Generation、Job、Artifact レコードを Alembic 対応の
+SQLite リポジトリへ永続化します。確定済み設定スナップショット、状態遷移、prompt ID、UTC タイムスタンプ、
+画像ハッシュ、相対パスの成果物、WebP 履歴サムネイル、JSON sidecar、履歴ページング、詳細表示、復元、
+派生再生成、お気に入り、メモを実装しました。未完了生成の基本復旧では prompt ID を確認しますが、
+prompt の自動再送信は行いません。
 
-Phase 3B retains advanced history search (model, LoRA, seed, prompt, resolution,
-kind/status combinations), presets, preset schema migration, prompt diffs,
-recent-setting shortcuts, seed-copy helpers, and advanced derivation-tree UI.
+フェーズ3Bには、高度な履歴検索（モデル、LoRA、seed、prompt、解像度、種別/状態の組み合わせ）、
+プリセット、プリセットのスキーマ移行、プロンプト差分、最近使った設定へのショートカット、
+seed コピー用ヘルパー、高度な派生ツリー UI を残しています。

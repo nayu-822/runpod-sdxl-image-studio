@@ -1,4 +1,4 @@
-# ComfyUI fixtures
+# ComfyUI 用フィクスチャ
 
-HTTP and WebSocket payload fixtures are kept as JSON. Image bytes are generated in
-the storage unit test so the repository does not need to carry a binary fixture.
+HTTP と WebSocket のペイロード用フィクスチャは JSON として保存します。画像バイト列は
+ストレージの単体テスト内で生成するため、リポジトリにバイナリフィクスチャを含めません。

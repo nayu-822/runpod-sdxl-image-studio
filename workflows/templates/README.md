@@ -1,3 +1,3 @@
-# Workflow templates
+# ワークフローテンプレート
 
-アプリが利用する固定 ComfyUI workflow template を配置します。任意 workflow の実行入口にはしません。
+アプリが利用する固定 ComfyUI ワークフローテンプレートを配置します。任意ワークフローの実行入口にはしません。

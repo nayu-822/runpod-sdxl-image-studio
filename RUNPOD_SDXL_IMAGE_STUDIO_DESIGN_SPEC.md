@@ -32,9 +32,9 @@ ComfyUI は高い柔軟性を持つ一方、スマートフォンから日常的
 
 初期版では以下を対象外とする。
 
-- ComfyUI の汎用 workflow editor
+- ComfyUI の汎用ワークフローエディター
 - 不特定多数ユーザー向け SaaS
-- 任意 custom node の UI 追加
+- 任意カスタムノードの UI 追加
 - 任意 URL からのモデルダウンロード
 - モデルのライセンス自動判定
 - 自動的な NSFW 判定
@@ -48,7 +48,7 @@ ComfyUI は高い柔軟性を持つ一方、スマートフォンから日常的
 - Job: 非同期処理の実行管理単位
 - Snapshot: 生成時点の固定された設定
 - Parent Generation: アップスケールや派生生成の元画像
-- Workflow Template: アプリが許可した ComfyUI workflow JSON
+- Workflow Template: アプリが許可した ComfyUI ワークフロー JSON
 - Sidecar Metadata: 画像と同名で保存する JSON
 - Model Catalog: checkpoint、VAE、LoRA、upscaler の選択可能一覧
 - Preset: 再利用可能な設定テンプレート
@@ -94,7 +94,7 @@ ComfyUI 自体のポートは、可能な限り外部公開せず、Gradio ア�
 6. 同期・設定
 7. システム状態
 
-### 6.2 Application Services
+### 6.2 アプリケーションサービス
 
 - `GenerationService`
 - `UpscaleService`
@@ -108,7 +108,7 @@ ComfyUI 自体のポートは、可能な限り外部公開せず、Gradio ア�
 - `SystemStatusService`
 - `PromptDiffService`
 
-### 6.3 Domain
+### 6.3 ドメイン
 
 主要モデル:
 
@@ -125,7 +125,7 @@ ComfyUI 自体のポートは、可能な限り外部公開せず、Gradio ア�
 - `HistoryFilter`
 - `SystemStatusSnapshot`
 
-### 6.4 Adapters
+### 6.4 アダプター
 
 - `ComfyUIAdapter`
 - `WorkflowTemplateAdapter`
@@ -173,7 +173,7 @@ ComfyUI 自体のポートは、可能な限り外部公開せず、Gradio ア�
 
 ## 8. データモデル
 
-### 8.1 Generation
+### 8.1 Generation（生成）
 
 主な項目:
 
@@ -195,7 +195,7 @@ error_code: str | null
 error_summary: str | null
 ```
 
-### 8.2 GenerationArtifact
+### 8.2 GenerationArtifact（生成成果物）
 
 ```text
 id: UUID
@@ -210,7 +210,7 @@ mime_type: str
 created_at: datetime
 ```
 
-### 8.3 LoraSetting
+### 8.3 LoraSetting（LoRA 設定）
 
 ```json
 {
@@ -223,7 +223,7 @@ created_at: datetime
 }
 ```
 
-### 8.4 SyncRecord
+### 8.4 SyncRecord（同期記録）
 
 ```text
 id
@@ -236,7 +236,7 @@ last_attempt_at
 error_summary
 ```
 
-### 8.5 Preset
+### 8.5 Preset（プリセット）
 
 ```text
 id
@@ -248,7 +248,7 @@ created_at
 updated_at
 ```
 
-### 8.6 HistoryFilter
+### 8.6 HistoryFilter（履歴フィルター）
 
 ```json
 {
@@ -263,7 +263,7 @@ updated_at
 }
 ```
 
-## 9. GenerationSettings
+## 9. GenerationSettings（生成設定）
 
 推奨 schema:
 
@@ -294,7 +294,7 @@ seed がランダム指定の場合も、実行前に確定 seed を generation 
 
 Batch 生成では、各出力画像を別 Generation とする方式と、1 Generation に複数 Artifact を持つ方式がある。履歴・親子関係・個別アップスケールを簡単にするため、推奨は「Job 1件、出力画像ごとに Generation 1件」とする。
 
-## 10. ComfyUI Workflow Template
+## 10. ComfyUI ワークフローテンプレート
 
 ### 10.1 テンプレート種類
 
@@ -303,7 +303,7 @@ Batch 生成では、各出力画像を別 Generation とする方式と、1 Gen
 - `sdxl_image_upscale`
 - `sdxl_latent_upscale`
 
-### 10.2 Template Definition
+### 10.2 テンプレート定義
 
 ```json
 {
@@ -334,20 +334,20 @@ node ID は template adapter 内部だけで使用する。
 
 生成前に以下を確認する。
 
-- template JSON が読める
-- required node が存在する
-- binding path が存在する
-- checkpoint が catalog に存在する
-- LoRA が catalog に存在する
+- テンプレート JSON が読める
+- 必須ノードが存在する
+- 対応付けパスが存在する
+- checkpoint がカタログに存在する
+- LoRA がカタログに存在する
 - sampler / scheduler が対応値
-- 出力 node が存在する
-- 必須 custom node が ComfyUI 側で利用可能
+- 出力ノードが存在する
+- 必須カスタムノードが ComfyUI 側で利用可能
 
 ## 11. ComfyUI 通信
 
 ### 11.1 起動確認
 
-- `/system_stats` または利用可能な health endpoint
+- `/system_stats` または利用可能なヘルスエンドポイント
 - `/object_info`
 - WebSocket 接続
 
@@ -365,7 +365,7 @@ node ID は template adapter 内部だけで使用する。
 10. 画像検証
 11. metadata 作成
 12. ローカル確定保存
-13. DB completed
+13. DB の完了状態を記録
 14. GDrive 同期キュー
 
 DB 保存前に ComfyUI へ送信すると prompt ID と generation の関連が失われる可能性があるため、送信前に pending record を作成する。
@@ -373,23 +373,23 @@ DB 保存前に ComfyUI へ送信すると prompt ID と generation の関連が
 ### 11.3 復旧
 
 - WebSocket 切断時に即失敗扱いにしない
-- prompt ID がある場合は history を確認する
-- アプリ再起動時に running / queued job を reconcile する
-- ComfyUI history に結果があれば保存処理を再開する
-- 結果がなく queue にもなければ stale としてユーザー確認対象にする
+- prompt ID がある場合は履歴を確認する
+- アプリ再起動時に実行中 / 待機中のジョブを整合させる
+- ComfyUI の履歴に結果があれば保存処理を再開する
+- 結果がなくキューにもなければ、古い状態としてユーザー確認対象にする
 
 ## 12. アップスケール
 
 ### 12.1 方式
 
-#### Image Upscale
+#### 画像アップスケール
 
 - 元画像を入力
-- upscaler model で拡大
-- 必要に応じて VAE encode + sampler
+- アップスケーラーモデルで拡大
+- 必要に応じて VAE エンコード + sampler
 - 元画像の構図を維持しやすい
 
-#### Latent / Hires Generation
+#### Latent / Hires 生成
 
 - 親 generation の prompt、seed、checkpoint、LoRA を復元
 - 高解像度 latent または二段階生成
@@ -444,9 +444,9 @@ UI は方式、倍率、最終サイズ、denoise を明示する。
 
 埋め込まれた ComfyUI workflow をそのまま実行してはならない。
 
-## 13. Metadata
+## 13. メタデータ
 
-### 13.1 Sidecar JSON
+### 13.1 sidecar JSON
 
 ```json
 {
@@ -476,7 +476,7 @@ UI は方式、倍率、最終サイズ、denoise を明示する。
 }
 ```
 
-### 13.2 PNG Metadata
+### 13.2 PNG メタデータ
 
 PNG には JSON 全体または主要項目を埋め込む。ただし閲覧・加工ソフトが metadata を削除する可能性があるため、sidecar JSON を必須とする。
 
@@ -532,12 +532,12 @@ prompt やモデル名を直接ファイル名に含めない。
 7. 生成ボタン
 8. 生成中 status
 9. 結果画像
-10. action buttons
-11. advanced settings
+10. 画像操作ボタン
+11. 高度な設定
 
 主要項目を上部へ、高度な設定を Accordion へ配置する。
 
-### 15.2 画像 action
+### 15.2 画像操作
 
 - 同条件再生成
 - 設定を編集
@@ -545,20 +545,20 @@ prompt やモデル名を直接ファイル名に含めない。
 - seed をコピー
 - お気に入り
 - GDrive 再同期
-- metadata 表示
+- metadata の表示
 - 親子画像を表示
 - プロンプト差分を表示
 
 ### 15.3 CSS 方針
 
-- モバイルでは 1 column
-- desktop では設定と preview の 2 column を許可
-- button min-height を確保
-- dropdown の高さを制御
-- Gallery thumbnail を軽量化
-- fixed width を避ける
-- prompt textbox を狭くしない
-- sticky generate action を許可
+- モバイルでは 1 カラム
+- desktop では設定とプレビューの 2 カラムを許可
+- ボタンの最小高さを確保
+- ドロップダウンの高さを制御
+- Gallery のサムネイルを軽量化
+- 固定幅を避ける
+- prompt 入力欄を狭くしない
+- 生成操作の固定表示を許可
 
 ## 16. システム状態
 
@@ -593,7 +593,7 @@ prompt やモデル名を直接ファイル名に含めない。
 - 失敗した generation を一覧表示する
 - ユーザー向けの簡潔なエラーを表示する
 - 詳細ログファイルへの導線を持つ
-- retryable / non-retryable を区別する
+- 再試行可能 / 再試行不可を区別する
 
 ## 19. 設定
 
@@ -636,11 +636,11 @@ RCLONE_CONFIG=
 
 - Gradio 認証または RunPod のアクセス制御を使用する
 - ComfyUI を直接外部公開しない
-- model path は allowlist directory 配下に限定
-- symlink 解決後の path を検証
+- モデルパスは許可リストのディレクトリ配下に限定
+- シンボリックリンク解決後のパスを検証
 - 外部 metadata を信頼しない
-- workflow の任意実行を許可しない
-- shell command の自由入力を許可しない
+- ワークフローの任意実行を許可しない
+- シェルコマンドの自由入力を許可しない
 - prompt はログへ不用意に全文出力しない
 - 秘密情報を DB や metadata に入れない
 - 画像 upload は実体形式とサイズを検証する
@@ -655,24 +655,24 @@ RCLONE_CONFIG=
 
 ### 性能
 
-- 履歴は thumbnail と paging を使用
+- 履歴はサムネイルとページングを使用
 - 元画像を一覧で一括読込しない
-- workflow template は必要に応じて cache
-- model catalog は手動更新または短時間 cache
+- ワークフローテンプレートは必要に応じてキャッシュする
+- モデルカタログは手動更新または短時間のキャッシュを使用する
 
 ### 再現性
 
 - 実行設定 snapshot を保存
 - seed を確定保存
-- workflow template version を保存
-- model reference を保存
+- ワークフローテンプレートのバージョンを保存
+- モデル参照情報を保存
 - 画像 hash を保存
 
 ### 保守性
 
 - UI と ComfyUI Adapter を分離
-- workflow binding を設定化
-- schema migration を用意
+- ワークフローの対応付けを設定化
+- スキーマ移行を用意
 - 外部依存を interface 化
 
 ## 22. 推奨ディレクトリ
