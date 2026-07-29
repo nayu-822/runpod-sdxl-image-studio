@@ -24,6 +24,7 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_reposito
     GenerationArtifactRepositoryProtocol,
     GenerationCompletionRepositoryProtocol,
     GenerationJobRepositoryProtocol,
+    GenerationQueueRepositoryProtocol,
     GenerationRepositoryError,
     GenerationRepositoryProtocol,
 )
@@ -89,6 +90,7 @@ class GenerationService:
         artifact_repository: GenerationArtifactRepositoryProtocol | None = None,
         completion_repository: GenerationCompletionRepositoryProtocol | None = None,
         job_repository: GenerationJobRepositoryProtocol | None = None,
+        queue_repository: GenerationQueueRepositoryProtocol | None = None,
         thumbnail_storage: HistoryThumbnailStorage | None = None,
         metadata_storage: GenerationMetadataStorage | None = None,
     ) -> None:
@@ -105,8 +107,20 @@ class GenerationService:
         self._artifact_repository = artifact_repository
         self._completion_repository = completion_repository
         self._job_repository = job_repository
+        self._queue_repository = queue_repository
         self._thumbnail_storage = thumbnail_storage
         self._metadata_storage = metadata_storage
+        repositories = (
+            generation_repository,
+            job_repository,
+            artifact_repository,
+            queue_repository,
+            completion_repository,
+        )
+        if any(repository is not None for repository in repositories) and any(
+            repository is None for repository in repositories
+        ):
+            raise ValueError("generation persistence repositories must be configured together")
         self._jobs: dict[UUID, GenerationJob] = {}
         self._results: dict[UUID, GenerationResult] = {}
         self._lock = asyncio.Lock()
@@ -327,8 +341,9 @@ class GenerationService:
                 self._job_repository.mark_failed(job.id, code, summary)
         except GenerationRepositoryError:
             logger.error(
-                "Failed to persist failed generation id=%s prompt_id=%s",
+                "Failed to persist failed generation generation=%s job=%s prompt_id=%s",
                 job.generation_id,
+                job.id,
                 job.prompt_id or "",
             )
 
@@ -355,16 +370,20 @@ class GenerationService:
         job.prompt_id = queued.prompt_id
         job.status = GenerationStatus.QUEUED
         try:
-            if self._generation_repository is not None:
-                self._generation_repository.mark_queued(job.generation_id, queued.prompt_id)
-            if self._job_repository is not None:
-                self._job_repository.update_prompt_id(job.id, queued.prompt_id)
-        except GenerationRepositoryError:
+            if self._queue_repository is not None:
+                self._queue_repository.mark_queued(
+                    generation_id=job.generation_id,
+                    job_id=job.id,
+                    prompt_id=queued.prompt_id,
+                )
+        except GenerationRepositoryError as exc:
             logger.error(
-                "Failed to persist prompt id generation=%s prompt_id=%s",
+                "Prompt ID persistence failed generation=%s job=%s prompt_id=%s",
                 job.generation_id,
+                job.id,
                 queued.prompt_id,
             )
+            raise GenerationPersistenceError("prompt ID could not be persisted") from exc
         self._emit(
             progress_callback,
             GenerationProgress(
@@ -721,6 +740,10 @@ def _validate_generation(
 
 
 def _safe_generation_error(error: Exception) -> str:
+    if isinstance(error, GenerationPersistenceError):
+        return (
+            "生成要求は送信されましたが、履歴情報を保存できませんでした。再送信は行っていません。"
+        )
     if isinstance(error, GenerationRepositoryError):
         return "生成結果の保存状態を確定できませんでした。"
     if isinstance(error, WorkflowError):

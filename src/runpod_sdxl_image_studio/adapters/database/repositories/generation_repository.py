@@ -269,6 +269,68 @@ class GenerationRepository(GenerationRepositoryProtocol):
             raise GenerationRepositoryError("generation status could not be updated") from exc
 
 
+class GenerationQueueRepositoryProtocol(Protocol):
+    """Protocol for atomically associating a ComfyUI prompt with a job pair."""
+
+    def mark_queued(self, generation_id: UUID, job_id: UUID, prompt_id: str) -> None: ...
+
+
+class GenerationQueueRepository(GenerationQueueRepositoryProtocol):
+    """Persist the queued state and prompt ID for Generation and Job atomically."""
+
+    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+        self._session_factory = session_factory
+
+    def mark_queued(self, generation_id: UUID, job_id: UUID, prompt_id: str) -> None:
+        normalized_prompt_id = prompt_id.strip()
+        if not normalized_prompt_id:
+            raise GenerationRepositoryError("prompt id must not be empty")
+        try:
+            with session_scope(self._session_factory) as session:
+                generation = _require_generation(session, generation_id)
+                job = _require_job(session, job_id)
+                if job.generation_id != str(generation_id):
+                    raise GenerationRepositoryError("job generation does not match")
+
+                generation_status = GenerationStatus(generation.status)
+                job_status = GenerationStatus(job.status)
+                generation_prompt_id = generation.comfy_prompt_id
+                job_prompt_id = job.comfy_prompt_id
+
+                if (
+                    generation_status is GenerationStatus.QUEUED
+                    and job_status is GenerationStatus.QUEUED
+                    and generation_prompt_id == normalized_prompt_id
+                    and job_prompt_id == normalized_prompt_id
+                ):
+                    return
+                if generation_status in {
+                    GenerationStatus.COMPLETED,
+                    GenerationStatus.FAILED,
+                    GenerationStatus.CANCELLED,
+                } or job_status in {
+                    GenerationStatus.COMPLETED,
+                    GenerationStatus.FAILED,
+                    GenerationStatus.CANCELLED,
+                }:
+                    raise GenerationRepositoryError("cannot queue a terminal generation or job")
+                if (
+                    generation_status is not GenerationStatus.PENDING
+                    or job_status is not GenerationStatus.PENDING
+                ):
+                    raise GenerationRepositoryError("generation and job are not both pending")
+                if generation_prompt_id is not None or job_prompt_id is not None:
+                    raise GenerationRepositoryError("prompt ID is already assigned inconsistently")
+
+                _mark_generation_queued(generation, normalized_prompt_id)
+                _mark_job_queued(job, normalized_prompt_id)
+                session.flush()
+        except GenerationRepositoryError:
+            raise
+        except (IntegrityError, SQLAlchemyError) as exc:
+            raise GenerationRepositoryError("prompt ID could not be persisted") from exc
+
+
 class GenerationArtifactRepositoryProtocol(Protocol):
     def add(self, artifact: GenerationArtifact) -> GenerationArtifact: ...
 
@@ -462,6 +524,24 @@ def _require_job(session: Session, job_id: UUID) -> GenerationJobModel:
     if row is None:
         raise GenerationRepositoryError("job was not found")
     return row
+
+
+def _mark_generation_queued(row: GenerationModel, prompt_id: str) -> None:
+    current = GenerationStatus(row.status)
+    if not is_valid_status_transition(current, GenerationStatus.QUEUED):
+        raise GenerationRepositoryError("invalid generation queue transition")
+    row.comfy_prompt_id = prompt_id
+    row.status = GenerationStatus.QUEUED.value
+    row.updated_at = datetime.now(UTC)
+
+
+def _mark_job_queued(row: GenerationJobModel, prompt_id: str) -> None:
+    current = GenerationStatus(row.status)
+    if not is_valid_status_transition(current, GenerationStatus.QUEUED):
+        raise GenerationRepositoryError("invalid job queue transition")
+    row.comfy_prompt_id = prompt_id
+    row.status = GenerationStatus.QUEUED.value
+    row.updated_at = datetime.now(UTC)
 
 
 def _mark_generation_completed(row: GenerationModel, completed_at: datetime) -> None:

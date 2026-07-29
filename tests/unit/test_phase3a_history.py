@@ -232,6 +232,83 @@ def test_completion_repository_commits_required_rows_atomically(tmp_path: Path) 
     engine.dispose()
 
 
+def test_queue_repository_persists_prompt_and_status_for_both_rows_atomically(
+    tmp_path: Path,
+) -> None:
+    settings, engine, repository, _, _, jobs = _repositories(tmp_path)
+    queue = repository_module.GenerationQueueRepository(repository._session_factory)
+    generation = repository.create_pending(GenerationSettingsSnapshot.from_settings(_settings()))
+    job = jobs.create(GenerationJob(generation.id, GenerationStatus.PENDING))
+
+    queue.mark_queued(generation.id, job.id, "prompt-queue")
+    queue.mark_queued(generation.id, job.id, "prompt-queue")
+
+    persisted_generation = repository.get_by_id(generation.id)
+    persisted_job = jobs.get_by_generation(generation.id)
+    assert persisted_generation is not None
+    assert persisted_job is not None
+    assert persisted_generation.status is GenerationStatus.QUEUED
+    assert persisted_job.status is GenerationStatus.QUEUED
+    assert persisted_generation.comfy_prompt_id == "prompt-queue"
+    assert persisted_job.prompt_id == "prompt-queue"
+    engine.dispose()
+
+
+def test_queue_repository_rolls_back_both_rows_when_job_update_fails(tmp_path: Path) -> None:
+    settings, engine, repository, _, _, jobs = _repositories(tmp_path)
+    queue = repository_module.GenerationQueueRepository(repository._session_factory)
+    generation = repository.create_pending(GenerationSettingsSnapshot.from_settings(_settings()))
+    job = jobs.create(GenerationJob(generation.id, GenerationStatus.PENDING))
+
+    def fail_job_queue(row: object, prompt_id: str) -> None:
+        del row, prompt_id
+        raise GenerationRepositoryError("forced job queue failure")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(repository_module, "_mark_job_queued", fail_job_queue)
+    try:
+        with pytest.raises(GenerationRepositoryError):
+            queue.mark_queued(generation.id, job.id, "prompt-rollback")
+    finally:
+        monkeypatch.undo()
+
+    persisted_generation = repository.get_by_id(generation.id)
+    persisted_job = jobs.get_by_generation(generation.id)
+    assert persisted_generation is not None
+    assert persisted_job is not None
+    assert persisted_generation.status is GenerationStatus.PENDING
+    assert persisted_job.status is GenerationStatus.PENDING
+    assert persisted_generation.comfy_prompt_id is None
+    assert persisted_job.prompt_id is None
+    engine.dispose()
+
+
+def test_queue_repository_rejects_prompt_id_reuse_without_changing_original_pair(
+    tmp_path: Path,
+) -> None:
+    settings, engine, repository, _, _, jobs = _repositories(tmp_path)
+    queue = repository_module.GenerationQueueRepository(repository._session_factory)
+    first = repository.create_pending(GenerationSettingsSnapshot.from_settings(_settings()))
+    first_job = jobs.create(GenerationJob(first.id, GenerationStatus.PENDING))
+    second = repository.create_pending(GenerationSettingsSnapshot.from_settings(_settings()))
+    second_job = jobs.create(GenerationJob(second.id, GenerationStatus.PENDING))
+    queue.mark_queued(first.id, first_job.id, "prompt-unique")
+
+    with pytest.raises(GenerationRepositoryError):
+        queue.mark_queued(second.id, second_job.id, "prompt-unique")
+
+    persisted_first = repository.get_by_id(first.id)
+    persisted_second = repository.get_by_id(second.id)
+    assert persisted_first is not None
+    assert persisted_second is not None
+    assert persisted_first.comfy_prompt_id == "prompt-unique"
+    assert persisted_first.status is GenerationStatus.QUEUED
+    assert persisted_second.comfy_prompt_id is None
+    assert persisted_second.status is GenerationStatus.PENDING
+    assert jobs.get_by_generation(second.id).prompt_id is None  # type: ignore[union-attr]
+    engine.dispose()
+
+
 def test_generation_repository_rejects_invalid_parent_and_migration_round_trip(
     tmp_path: Path,
 ) -> None:
@@ -338,6 +415,7 @@ async def test_generation_service_persists_pending_failure_before_prompt(tmp_pat
         artifact_repository=artifacts,
         completion_repository=completion,
         job_repository=jobs,
+        queue_repository=repository_module.GenerationQueueRepository(repository._session_factory),
     )
     result = await service.generate(_settings())
 
@@ -355,6 +433,8 @@ async def test_generation_service_persists_artifacts_and_snapshot(tmp_path: Path
     image = BytesIO()
     Image.new("RGB", (8, 4), "red").save(image, format="PNG")
     image_bytes = image.getvalue()
+    events: list[str] = []
+    prompt_calls = 0
     capabilities_value = ComfyUICapabilities(
         checkpoints=("sdxl.safetensors",),
         vaes=("vae.safetensors",),
@@ -369,6 +449,9 @@ async def test_generation_service_persists_artifacts_and_snapshot(tmp_path: Path
     class Client:
         async def queue_prompt(self, workflow: object, client_id: str) -> QueuedPrompt:
             del workflow, client_id
+            nonlocal prompt_calls
+            prompt_calls += 1
+            events.append("prompt")
             return QueuedPrompt("prompt-success", 1, {})
 
         async def get_prompt_history(self, prompt_id: str) -> PromptHistory:
@@ -387,6 +470,7 @@ async def test_generation_service_persists_artifacts_and_snapshot(tmp_path: Path
     class Websocket:
         async def watch_prompt(self, prompt_id: str, client_id: str):
             del prompt_id, client_id
+            events.append("websocket")
             yield GenerationProgress(state=GenerationStatus.RUNNING, value=1, maximum=2)
 
     async def capabilities() -> CapabilityRefreshResult:
@@ -403,6 +487,7 @@ async def test_generation_service_persists_artifacts_and_snapshot(tmp_path: Path
         artifact_repository=artifacts,
         completion_repository=completion,
         job_repository=jobs,
+        queue_repository=repository_module.GenerationQueueRepository(repository._session_factory),
         thumbnail_storage=HistoryThumbnailStorage(settings),
         metadata_storage=GenerationMetadataStorage(settings.data_dir),
     )
@@ -410,11 +495,131 @@ async def test_generation_service_persists_artifacts_and_snapshot(tmp_path: Path
 
     assert result.status is GenerationStatus.COMPLETED
     persisted = repository.get_by_id(result.generation_id)
+    persisted_job = jobs.get_by_generation(result.generation_id)
     assert persisted is not None and persisted.settings_snapshot.seed == 123
+    assert persisted.comfy_prompt_id == "prompt-success"
+    assert persisted_job is not None and persisted_job.prompt_id == "prompt-success"
+    assert prompt_calls == 1
+    assert events == ["prompt", "websocket"]
     assert {
         artifact.artifact_type for artifact in artifacts.list_by_generation(result.generation_id)
     } == {ArtifactType.IMAGE, ArtifactType.THUMBNAIL, ArtifactType.METADATA}
     assert jobs.list_recoverable() == ()
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_prompt_persistence_failure_stops_monitoring_without_resubmitting(
+    tmp_path: Path,
+) -> None:
+    settings, engine, repository, artifacts, completion, jobs = _repositories(tmp_path)
+    image_bytes = b"must not be downloaded"
+    websocket_calls = 0
+    history_calls = 0
+    image_calls = 0
+
+    class Client:
+        async def queue_prompt(self, workflow: object, client_id: str) -> QueuedPrompt:
+            del workflow, client_id
+            return QueuedPrompt("prompt-database-failure", 1, {})
+
+        async def get_prompt_history(self, prompt_id: str) -> PromptHistory:
+            del prompt_id
+            nonlocal history_calls
+            history_calls += 1
+            raise AssertionError("history must not be requested")
+
+        async def get_output_image(self, output: ComfyUIOutputImage) -> bytes:
+            del output
+            nonlocal image_calls
+            image_calls += 1
+            return image_bytes
+
+    class Websocket:
+        async def watch_prompt(self, prompt_id: str, client_id: str):
+            del prompt_id, client_id
+            nonlocal websocket_calls
+            websocket_calls += 1
+            raise AssertionError("WebSocket must not be started")
+            yield  # pragma: no cover
+
+    class FailingQueue:
+        def mark_queued(self, generation_id: UUID, job_id: UUID, prompt_id: str) -> None:
+            del generation_id, job_id
+            assert prompt_id == "prompt-database-failure"
+            raise GenerationRepositoryError("database is unavailable")
+
+    capabilities_value = ComfyUICapabilities(
+        checkpoints=("sdxl.safetensors",),
+        vaes=("vae.safetensors",),
+        samplers=("euler",),
+        schedulers=("normal",),
+        loras=(),
+        upscale_models=(),
+        available_node_classes=frozenset({"VAELoader"}),
+        warnings=(),
+    )
+
+    async def capabilities() -> CapabilityRefreshResult:
+        return CapabilityRefreshResult(True, "ok", capabilities_value)
+
+    service = GenerationService(
+        Client(),  # type: ignore[arg-type]
+        WorkflowAdapter(load_txt2img_template().as_mapping()),
+        Websocket(),  # type: ignore[arg-type]
+        LocalStorageAdapter(settings),
+        capabilities,
+        settings,
+        generation_repository=repository,
+        artifact_repository=artifacts,
+        completion_repository=completion,
+        job_repository=jobs,
+        queue_repository=FailingQueue(),  # type: ignore[arg-type]
+    )
+    result = await service.generate(_settings())
+
+    persisted = repository.get_by_id(result.generation_id)
+    persisted_job = jobs.get_by_generation(result.generation_id)
+    assert result.status is GenerationStatus.FAILED
+    assert result.prompt_id == "prompt-database-failure"
+    assert result.error_message == (
+        "生成要求は送信されましたが、履歴情報を保存できませんでした。再送信は行っていません。"
+    )
+    assert persisted is not None and persisted.status is GenerationStatus.FAILED
+    assert persisted.error_code == "database_error"
+    assert persisted.comfy_prompt_id is None
+    assert persisted_job is not None and persisted_job.status is GenerationStatus.FAILED
+    assert persisted_job.error_code == "database_error"
+    assert persisted_job.prompt_id is None
+    assert websocket_calls == 0
+    assert history_calls == 0
+    assert image_calls == 0
+    engine.dispose()
+
+
+def test_generation_service_rejects_partial_persistence_configuration(tmp_path: Path) -> None:
+    settings, engine, repository, artifacts, completion, jobs = _repositories(tmp_path)
+    configured = {
+        "generation_repository": repository,
+        "artifact_repository": artifacts,
+        "completion_repository": completion,
+        "job_repository": jobs,
+        "queue_repository": repository_module.GenerationQueueRepository(
+            repository._session_factory
+        ),
+    }
+    for missing_name in configured:
+        partial = {name: value for name, value in configured.items() if name != missing_name}
+        with pytest.raises(ValueError, match="configured together"):
+            GenerationService(
+                object(),  # type: ignore[arg-type]
+                object(),  # type: ignore[arg-type]
+                object(),  # type: ignore[arg-type]
+                object(),  # type: ignore[arg-type]
+                lambda: None,  # type: ignore[arg-type]
+                settings,
+                **partial,
+            )
     engine.dispose()
 
 
@@ -454,6 +659,7 @@ async def test_required_completion_failure_keeps_image_but_never_returns_success
         artifact_repository=artifacts,
         completion_repository=FailingCompletion(),  # type: ignore[arg-type]
         job_repository=jobs,
+        queue_repository=repository_module.GenerationQueueRepository(repository._session_factory),
     )
     job = GenerationJob(
         generation_id=generation.id,
@@ -504,6 +710,7 @@ async def test_optional_thumbnail_failure_does_not_fail_completed_generation(
         artifact_repository=artifacts,
         completion_repository=completion,
         job_repository=jobs,
+        queue_repository=repository_module.GenerationQueueRepository(repository._session_factory),
         thumbnail_storage=FailingThumbnail(),  # type: ignore[arg-type]
     )
     job = GenerationJob(
@@ -611,6 +818,7 @@ async def test_recovery_reconciles_existing_primary_artifact_idempotently(tmp_pa
         artifact_repository=artifacts,
         completion_repository=completion,
         job_repository=jobs,
+        queue_repository=repository_module.GenerationQueueRepository(repository._session_factory),
     )
 
     assert await service.recover_prompt(generation.id, "prompt-existing") is True
