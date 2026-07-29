@@ -14,6 +14,7 @@ from runpod_sdxl_image_studio.adapters.database.engine import (
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_repository import (
     GenerationArtifactRepository,
     GenerationCompletionRepository,
+    GenerationFailureRepository,
     GenerationJobRepository,
     GenerationQueueRepository,
     GenerationRepository,
@@ -116,6 +117,7 @@ def build_app(
     generation_repository = GenerationRepository(session_factory)
     artifact_repository = GenerationArtifactRepository(session_factory)
     completion_repository = GenerationCompletionRepository(session_factory)
+    failure_repository = GenerationFailureRepository(session_factory)
     job_repository = GenerationJobRepository(session_factory)
     queue_repository = GenerationQueueRepository(session_factory)
     catalog_service = LoraCatalogService(
@@ -140,6 +142,7 @@ def build_app(
         generation_repository=generation_repository,
         artifact_repository=artifact_repository,
         completion_repository=completion_repository,
+        failure_repository=failure_repository,
         job_repository=job_repository,
         queue_repository=queue_repository,
         thumbnail_storage=HistoryThumbnailStorage(app_settings),
@@ -157,6 +160,7 @@ def build_app(
         artifact_repository,
         app_settings,
         completed_prompt_handler=generation_service.recover_prompt,
+        failure_repository=failure_repository,
     )
     with gr.Blocks(title=APP_TITLE, css=APP_CSS) as demo:
         gr.Markdown(f"# {APP_TITLE}")

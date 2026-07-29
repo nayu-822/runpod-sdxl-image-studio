@@ -23,6 +23,7 @@ from runpod_sdxl_image_studio.adapters.comfyui.workflow_adapter import WorkflowA
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_repository import (
     GenerationArtifactRepositoryProtocol,
     GenerationCompletionRepositoryProtocol,
+    GenerationFailureRepositoryProtocol,
     GenerationJobRepositoryProtocol,
     GenerationQueueRepositoryProtocol,
     GenerationRepositoryError,
@@ -50,6 +51,16 @@ from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettin
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
 from runpod_sdxl_image_studio.domain.job import GenerationJob
 from runpod_sdxl_image_studio.domain.system_status import CapabilityRefreshResult
+from runpod_sdxl_image_studio.services.generation_errors import (
+    ArtifactPersistenceError,
+    CompletionPersistenceError,
+    FailurePersistenceError,
+    GenerationPersistenceError,
+    PromptPersistenceError,
+    RecoveryPersistenceError,
+    persistence_error_code,
+    persistence_error_message,
+)
 
 logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[GenerationProgress], None]
@@ -57,10 +68,6 @@ ProgressCallback = Callable[[GenerationProgress], None]
 
 class HistoryTimeoutError(ComfyUIPromptError):
     """History polling reached its configured attempt limit."""
-
-
-class GenerationPersistenceError(GenerationRepositoryError):
-    """A required generation record could not be persisted safely."""
 
 
 class CapabilitiesProvider(Protocol):
@@ -91,6 +98,7 @@ class GenerationService:
         completion_repository: GenerationCompletionRepositoryProtocol | None = None,
         job_repository: GenerationJobRepositoryProtocol | None = None,
         queue_repository: GenerationQueueRepositoryProtocol | None = None,
+        failure_repository: GenerationFailureRepositoryProtocol | None = None,
         thumbnail_storage: HistoryThumbnailStorage | None = None,
         metadata_storage: GenerationMetadataStorage | None = None,
     ) -> None:
@@ -108,6 +116,7 @@ class GenerationService:
         self._completion_repository = completion_repository
         self._job_repository = job_repository
         self._queue_repository = queue_repository
+        self._failure_repository = failure_repository
         self._thumbnail_storage = thumbnail_storage
         self._metadata_storage = metadata_storage
         repositories = (
@@ -116,6 +125,7 @@ class GenerationService:
             artifact_repository,
             queue_repository,
             completion_repository,
+            failure_repository,
         )
         if any(repository is not None for repository in repositories) and any(
             repository is None for repository in repositories
@@ -184,6 +194,7 @@ class GenerationService:
                 generation.created_at,
                 generation.kind,
                 generation.parent_generation_id,
+                is_recovery=True,
             )
             return True
         except (ComfyUIError, GenerationRepositoryError, StorageError, ValueError) as exc:
@@ -192,6 +203,7 @@ class GenerationService:
                 generation_id,
                 prompt_id,
                 type(exc).__name__,
+                exc_info=True,
             )
             return False
 
@@ -228,7 +240,23 @@ class GenerationService:
         ):
             job.status = GenerationStatus.FAILED
             job.error_message = "生成履歴を保存できませんでした。"
-            self._persist_failed(job, GenerationRepositoryError("pending record failed"))
+            failed_at = datetime.now(UTC)
+            try:
+                self._persist_failure(
+                    job,
+                    error_code=GenerationErrorCode.DATABASE.value,
+                    error_summary=job.error_message,
+                    failed_at=failed_at,
+                )
+            except FailurePersistenceError as exc:
+                logger.error(
+                    "Failure persistence also failed generation=%s job=%s "
+                    "original_error=pending_record_failure",
+                    job.generation_id,
+                    job.id,
+                    exc_info=True,
+                )
+                job.error_message = persistence_error_message(exc)
             result = GenerationResult(
                 generation_id=generation_id,
                 prompt_id="",
@@ -280,10 +308,39 @@ class GenerationService:
                 except Exception:  # noqa: BLE001 - usage statistics are best effort
                     logger.warning("LoRA usage statistics update failed", exc_info=True)
         except Exception as exc:  # noqa: BLE001 - boundary converts failures to safe UI text
-            logger.error("Generation job failed: %s", type(exc).__name__)
+            logger.error(
+                "Generation job failed generation=%s job=%s prompt_id=%s error=%s",
+                generation_id,
+                job.id,
+                job.prompt_id or "",
+                type(exc).__name__,
+                exc_info=True,
+            )
             job.status = GenerationStatus.FAILED
-            job.error_message = _safe_generation_error(exc)
-            self._persist_failed(job, exc)
+            error_code = _generation_error_code(exc)
+            error_summary = _safe_generation_error(exc)
+            job.error_code = error_code
+            job.error_summary = error_summary
+            job.error_message = error_summary
+            try:
+                self._persist_failure(
+                    job,
+                    error_code=error_code,
+                    error_summary=error_summary,
+                    failed_at=datetime.now(UTC),
+                )
+            except FailurePersistenceError as failure_error:
+                logger.error(
+                    "Failure persistence failed generation=%s job=%s prompt_id=%s "
+                    "original_error=%s error_code=%s",
+                    generation_id,
+                    job.id,
+                    job.prompt_id or "",
+                    type(exc).__name__,
+                    error_code,
+                    exc_info=True,
+                )
+                job.error_message = _safe_generation_error(failure_error, original_error=exc)
             result = GenerationResult(
                 generation_id=generation_id,
                 prompt_id=job.prompt_id or "",
@@ -331,21 +388,37 @@ class GenerationService:
             logger.error("Generation persistence failed before prompt: %s", type(exc).__name__)
             return False
 
-    def _persist_failed(self, job: GenerationJob, error: Exception) -> None:
-        code = _generation_error_code(error)
-        summary = _safe_generation_error(error)
+    def _persist_failure(
+        self,
+        job: GenerationJob,
+        *,
+        error_code: str,
+        error_summary: str,
+        failed_at: datetime,
+    ) -> None:
+        if self._failure_repository is None:
+            return
         try:
-            if self._generation_repository is not None:
-                self._generation_repository.mark_failed(job.generation_id, code, summary)
-            if self._job_repository is not None:
-                self._job_repository.mark_failed(job.id, code, summary)
-        except GenerationRepositoryError:
+            self._failure_repository.fail_generation(
+                generation_id=job.generation_id,
+                job_id=job.id,
+                error_code=error_code,
+                error_summary=error_summary,
+                failed_at=failed_at,
+            )
+        except GenerationRepositoryError as exc:
             logger.error(
-                "Failed to persist failed generation generation=%s job=%s prompt_id=%s",
+                "Failed to persist generation failure generation=%s job=%s prompt_id=%s "
+                "error_code=%s",
                 job.generation_id,
                 job.id,
                 job.prompt_id or "",
+                error_code,
+                exc_info=True,
             )
+            raise FailurePersistenceError(
+                "generation failure state could not be persisted"
+            ) from exc
 
     async def _run_job(
         self,
@@ -383,7 +456,7 @@ class GenerationService:
                 job.id,
                 queued.prompt_id,
             )
-            raise GenerationPersistenceError("prompt ID could not be persisted") from exc
+            raise PromptPersistenceError("prompt ID could not be persisted") from exc
         self._emit(
             progress_callback,
             GenerationProgress(
@@ -457,6 +530,8 @@ class GenerationService:
         created_at: datetime,
         kind: GenerationKind,
         parent_generation_id: UUID | None,
+        *,
+        is_recovery: bool = False,
     ) -> None:
         if job.stored_image is None:
             raise GenerationPersistenceError("stored image is missing")
@@ -482,12 +557,13 @@ class GenerationService:
                         primary_artifact.local_path,
                         type(exc).__name__,
                     )
-                    raise GenerationPersistenceError(
-                        "generation completion could not be persisted"
-                    ) from exc
+                    error_type = (
+                        RecoveryPersistenceError if is_recovery else CompletionPersistenceError
+                    )
+                    raise error_type("generation completion could not be persisted") from exc
             else:
                 if self._job_repository is None:
-                    raise GenerationPersistenceError("job persistence is unavailable")
+                    raise CompletionPersistenceError("job persistence is unavailable")
                 self._persist_primary_image_artifact(job, primary_artifact)
                 try:
                     self._generation_repository.mark_completed(job.generation_id, completed_at)
@@ -501,9 +577,10 @@ class GenerationService:
                         job.prompt_id or "",
                         primary_artifact.local_path,
                     )
-                    raise GenerationPersistenceError(
-                        "generation completion could not be persisted"
-                    ) from exc
+                    error_type = (
+                        RecoveryPersistenceError if is_recovery else CompletionPersistenceError
+                    )
+                    raise error_type("generation completion could not be persisted") from exc
         job.status = GenerationStatus.COMPLETED
         job.completed_at = completed_at
         self._persist_optional_artifacts(
@@ -518,14 +595,25 @@ class GenerationService:
     def _complete_existing_generation(self, generation_id: UUID, job_id: UUID) -> None:
         completed_at = datetime.now(UTC)
         if self._completion_repository is not None:
-            self._completion_repository.complete_existing_artifact(
-                generation_id,
-                job_id,
-                completed_at,
-            )
+            try:
+                self._completion_repository.complete_existing_artifact(
+                    generation_id,
+                    job_id,
+                    completed_at,
+                )
+            except GenerationRepositoryError as exc:
+                logger.error(
+                    "Existing artifact recovery persistence failed generation=%s job=%s",
+                    generation_id,
+                    job_id,
+                    exc_info=True,
+                )
+                raise RecoveryPersistenceError(
+                    "existing generation completion could not be persisted"
+                ) from exc
             return
         if self._generation_repository is None or self._job_repository is None:
-            raise GenerationPersistenceError("generation persistence is unavailable")
+            raise RecoveryPersistenceError("generation persistence is unavailable")
         try:
             self._generation_repository.mark_completed(generation_id, completed_at)
             self._job_repository.mark_completed(job_id, completed_at)
@@ -535,7 +623,7 @@ class GenerationService:
                 generation_id,
                 job_id,
             )
-            raise GenerationPersistenceError(
+            raise RecoveryPersistenceError(
                 "existing generation completion could not be persisted"
             ) from exc
 
@@ -543,7 +631,7 @@ class GenerationService:
         self, job: GenerationJob, artifact: GenerationArtifact
     ) -> None:
         if self._artifact_repository is None:
-            raise GenerationPersistenceError("primary image artifact repository is unavailable")
+            raise ArtifactPersistenceError("primary image artifact repository is unavailable")
         try:
             self._artifact_repository.add(artifact)
         except (GenerationRepositoryError, StorageError, OSError) as exc:
@@ -555,9 +643,7 @@ class GenerationService:
                 artifact.local_path,
                 type(exc).__name__,
             )
-            raise GenerationPersistenceError(
-                "primary image artifact could not be persisted"
-            ) from exc
+            raise ArtifactPersistenceError("primary image artifact could not be persisted") from exc
 
     def _persist_optional_artifacts(
         self,
@@ -659,7 +745,12 @@ class GenerationService:
         job.status = GenerationStatus.FAILED
         job.error_code = code
         job.error_summary = summary
-        self._persist_failed(job, GenerationRepositoryError(summary))
+        self._persist_failure(
+            job,
+            error_code=code,
+            error_summary=summary,
+            failed_at=datetime.now(UTC),
+        )
 
     async def _poll_history(self, prompt_id: str) -> PromptHistory:
         last_error: ComfyUIError | None = None
@@ -739,11 +830,15 @@ def _validate_generation(
         raise WorkflowError("Requested image area exceeds the configured limit")
 
 
-def _safe_generation_error(error: Exception) -> str:
+def _safe_generation_error(
+    error: Exception,
+    *,
+    original_error: Exception | None = None,
+) -> str:
     if isinstance(error, GenerationPersistenceError):
-        return (
-            "生成要求は送信されましたが、履歴情報を保存できませんでした。再送信は行っていません。"
-        )
+        if isinstance(error, FailurePersistenceError) and original_error is not None:
+            return "生成に失敗しました。加えて、履歴の失敗状態を完全に保存できませんでした。"
+        return persistence_error_message(error)
     if isinstance(error, GenerationRepositoryError):
         return "生成結果の保存状態を確定できませんでした。"
     if isinstance(error, WorkflowError):
@@ -758,6 +853,8 @@ def _safe_generation_error(error: Exception) -> str:
 
 
 def _generation_error_code(error: Exception) -> str:
+    if isinstance(error, GenerationPersistenceError):
+        return persistence_error_code(error)
     if isinstance(error, WorkflowError):
         return GenerationErrorCode.WORKFLOW.value
     if isinstance(error, StorageError):

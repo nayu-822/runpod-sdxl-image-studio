@@ -7,6 +7,8 @@
 確定済みの生成設定を、スキーマバージョン付き JSON スナップショットとして保存します。
 完了した画像は、`<IMAGE_STUDIO_DATA_DIR>/generations/YYYY-MM-DD/` 配下に、相対パスの画像、
 サムネイル、UTF-8 の sidecar metadata 成果物として保存されます。
+Queue・Completion・Failure は用途別のトランザクション Repository として分離し、失敗時は
+Generation と Job を同一トランザクションで更新します。prompt ID 保存に失敗しても同じ要求を自動再送信しません。
 
 履歴タブでは、サービス API を通じて日付・状態・お気に入り・種別によるページング、
 詳細表示、設定復元、同条件の派生生成、お気に入り、2,000 文字のメモに対応します。

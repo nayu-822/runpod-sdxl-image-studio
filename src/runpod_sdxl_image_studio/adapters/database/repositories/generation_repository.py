@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from typing import Protocol
 from uuid import UUID, uuid4
@@ -270,13 +271,13 @@ class GenerationRepository(GenerationRepositoryProtocol):
 
 
 class GenerationQueueRepositoryProtocol(Protocol):
-    """Protocol for atomically associating a ComfyUI prompt with a job pair."""
+    """ComfyUI promptをGeneration/Jobへ原子的に関連付ける契約。"""
 
     def mark_queued(self, generation_id: UUID, job_id: UUID, prompt_id: str) -> None: ...
 
 
 class GenerationQueueRepository(GenerationQueueRepositoryProtocol):
-    """Persist the queued state and prompt ID for Generation and Job atomically."""
+    """Generation/Jobのqueued状態とprompt IDを原子的に保存する。"""
 
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self._session_factory = session_factory
@@ -329,6 +330,106 @@ class GenerationQueueRepository(GenerationQueueRepositoryProtocol):
             raise
         except (IntegrityError, SQLAlchemyError) as exc:
             raise GenerationRepositoryError("prompt ID could not be persisted") from exc
+
+
+class GenerationFailureRepositoryProtocol(Protocol):
+    """Generation/Jobのfailed状態を原子的に保存する契約。"""
+
+    def fail_generation(
+        self,
+        generation_id: UUID,
+        job_id: UUID,
+        *,
+        error_code: str,
+        error_summary: str,
+        failed_at: datetime,
+    ) -> None: ...
+
+
+class GenerationFailureRepository(GenerationFailureRepositoryProtocol):
+    """両方のfailed状態を1つのSQLiteトランザクションで保存する。"""
+
+    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+        self._session_factory = session_factory
+
+    def fail_generation(
+        self,
+        generation_id: UUID,
+        job_id: UUID,
+        *,
+        error_code: str,
+        error_summary: str,
+        failed_at: datetime,
+    ) -> None:
+        if re.fullmatch(r"[a-z0-9_]+", error_code) is None:
+            raise GenerationRepositoryError("error code is invalid")
+        normalized_summary = error_summary[:1000]
+        timestamp = _utc(failed_at)
+        if timestamp is None:
+            raise GenerationRepositoryError("failed time is required")
+        try:
+            with session_scope(self._session_factory) as session:
+                generation = _require_generation(session, generation_id)
+                job = _require_job(session, job_id)
+                if job.generation_id != str(generation_id):
+                    raise GenerationRepositoryError("job generation does not match")
+
+                generation_status = GenerationStatus(generation.status)
+                job_status = GenerationStatus(job.status)
+                if generation_status is not job_status:
+                    raise GenerationRepositoryError("generation and job statuses are inconsistent")
+                if (
+                    generation_status is GenerationStatus.FAILED
+                    and job_status is GenerationStatus.FAILED
+                ):
+                    if (
+                        generation.error_code == error_code
+                        and generation.error_summary == normalized_summary
+                        and job.error_code == error_code
+                        and job.error_summary == normalized_summary
+                    ):
+                        return
+                    raise GenerationRepositoryError("failure information is already finalized")
+                if GenerationStatus.FAILED in {generation_status, job_status}:
+                    raise GenerationRepositoryError(
+                        "generation and job failure states are inconsistent"
+                    )
+                if generation_status in {
+                    GenerationStatus.COMPLETED,
+                    GenerationStatus.CANCELLED,
+                } or job_status in {
+                    GenerationStatus.COMPLETED,
+                    GenerationStatus.CANCELLED,
+                }:
+                    raise GenerationRepositoryError("cannot fail a terminal generation or job")
+                if generation_status not in {
+                    GenerationStatus.PENDING,
+                    GenerationStatus.QUEUED,
+                    GenerationStatus.RUNNING,
+                } or job_status not in {
+                    GenerationStatus.PENDING,
+                    GenerationStatus.QUEUED,
+                    GenerationStatus.RUNNING,
+                }:
+                    raise GenerationRepositoryError("generation and job states are invalid")
+
+                _mark_generation_failed(
+                    generation,
+                    error_code=error_code,
+                    error_summary=normalized_summary,
+                    failed_at=timestamp,
+                )
+                _mark_job_failed(
+                    job,
+                    error_code=error_code,
+                    error_summary=normalized_summary,
+                    failed_at=timestamp,
+                )
+                session.flush()
+        except GenerationRepositoryError:
+            raise
+        except (IntegrityError, SQLAlchemyError, ValueError) as exc:
+            raise GenerationRepositoryError("generation failure could not be persisted") from exc
 
 
 class GenerationArtifactRepositoryProtocol(Protocol):
@@ -541,6 +642,40 @@ def _mark_job_queued(row: GenerationJobModel, prompt_id: str) -> None:
         raise GenerationRepositoryError("invalid job queue transition")
     row.comfy_prompt_id = prompt_id
     row.status = GenerationStatus.QUEUED.value
+    row.updated_at = datetime.now(UTC)
+
+
+def _mark_generation_failed(
+    row: GenerationModel,
+    *,
+    error_code: str,
+    error_summary: str,
+    failed_at: datetime,
+) -> None:
+    current = GenerationStatus(row.status)
+    if not is_valid_status_transition(current, GenerationStatus.FAILED):
+        raise GenerationRepositoryError("invalid generation failure transition")
+    row.status = GenerationStatus.FAILED.value
+    row.completed_at = failed_at
+    row.error_code = error_code
+    row.error_summary = error_summary
+    row.updated_at = datetime.now(UTC)
+
+
+def _mark_job_failed(
+    row: GenerationJobModel,
+    *,
+    error_code: str,
+    error_summary: str,
+    failed_at: datetime,
+) -> None:
+    current = GenerationStatus(row.status)
+    if not is_valid_status_transition(current, GenerationStatus.FAILED):
+        raise GenerationRepositoryError("invalid job failure transition")
+    row.status = GenerationStatus.FAILED.value
+    row.completed_at = failed_at
+    row.error_code = error_code
+    row.error_summary = error_summary
     row.updated_at = datetime.now(UTC)
 
 

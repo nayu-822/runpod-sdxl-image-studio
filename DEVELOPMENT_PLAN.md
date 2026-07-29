@@ -388,6 +388,9 @@ SQLite リポジトリへ永続化します。確定済み設定スナップシ�
 prompt の自動再送信は行いません。レビュー指摘への修正として、主 `image` Artifact と Generation / Job 完了を
 同一 SQLite トランザクションで確定し、補助成果物の失敗を分離しました。既存 Artifact を優先する冪等な復旧、
 一覧未取得と空一覧を区別する設定復元、LoRA 編集行の復元、再生成ボタンの排他制御も実装しています。
+保守性改善として、prompt ID・主画像Artifact・完了・復旧・失敗状態の永続化エラーを分類し、
+Generation と Job の failed 更新を `GenerationFailureRepository` の同一 SQLite トランザクションで確定します。
+prompt ID の保存失敗時は自動再送信せず、失敗状態の保存自体に失敗した場合も元の生成エラーをログへ残します。
 
 フェーズ3Aでは、バッチ、生成キュー、キャンセル、アップスケール、Google Drive 同期などのフェーズ3B以降の機能は実装しません。
 

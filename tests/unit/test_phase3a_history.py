@@ -60,6 +60,16 @@ from runpod_sdxl_image_studio.domain.generation_snapshot import (
 from runpod_sdxl_image_studio.domain.job import GenerationJob
 from runpod_sdxl_image_studio.domain.lora import LoraSetting
 from runpod_sdxl_image_studio.domain.system_status import CapabilityRefreshResult
+from runpod_sdxl_image_studio.services.generation_errors import (
+    ArtifactPersistenceError,
+    CompletionPersistenceError,
+    FailurePersistenceError,
+    GenerationPersistenceError,
+    PromptPersistenceError,
+    RecoveryPersistenceError,
+    persistence_error_code,
+    persistence_error_message,
+)
 from runpod_sdxl_image_studio.services.generation_history_service import (
     GenerationHistoryService,
 )
@@ -309,6 +319,194 @@ def test_queue_repository_rejects_prompt_id_reuse_without_changing_original_pair
     engine.dispose()
 
 
+def test_persistence_error_types_codes_and_messages_are_stable() -> None:
+    errors = (
+        (
+            PromptPersistenceError("secret database detail"),
+            "prompt_persistence_error",
+            "生成要求はComfyUIへ送信されましたが、履歴へ関連付けできませんでした。"
+            "同じ生成要求の再送信は行っていません。",
+        ),
+        (
+            ArtifactPersistenceError("C:/private/database.sqlite3"),
+            "artifact_persistence_error",
+            "画像は保存されましたが、履歴へ画像情報を登録できませんでした。",
+        ),
+        (
+            CompletionPersistenceError("sql traceback"),
+            "completion_persistence_error",
+            "画像は保存されましたが、履歴の完了状態を確定できませんでした。",
+        ),
+        (
+            RecoveryPersistenceError("absolute path"),
+            "recovery_persistence_error",
+            "未完了生成の結果は確認できましたが、履歴の復旧状態を保存できませんでした。",
+        ),
+        (
+            FailurePersistenceError("database URL"),
+            "failure_persistence_error",
+            "生成は失敗しましたが、履歴の失敗状態を完全に保存できませんでした。",
+        ),
+    )
+    for error, expected_code, expected_message in errors:
+        assert isinstance(error, GenerationPersistenceError)
+        assert persistence_error_code(error) == expected_code
+        assert persistence_error_message(error) == expected_message
+        assert "secret" not in persistence_error_message(error)
+        assert "database" not in persistence_error_message(error)
+
+
+def test_failure_repository_updates_pending_queued_and_running_pairs_atomically(
+    tmp_path: Path,
+) -> None:
+    settings, engine, repository, _, _, jobs = _repositories(tmp_path)
+    failure = repository_module.GenerationFailureRepository(repository._session_factory)
+    failed_at = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
+
+    for index, status in enumerate(
+        (GenerationStatus.PENDING, GenerationStatus.QUEUED, GenerationStatus.RUNNING)
+    ):
+        generation = repository.create_pending(
+            GenerationSettingsSnapshot.from_settings(_settings())
+        )
+        job = jobs.create(GenerationJob(generation.id, GenerationStatus.PENDING))
+        if status is GenerationStatus.QUEUED:
+            repository.mark_queued(generation.id, f"prompt-failure-{index}")
+            jobs.update_prompt_id(job.id, f"prompt-failure-{index}")
+        elif status is GenerationStatus.RUNNING:
+            repository.mark_queued(generation.id, f"prompt-failure-{index}")
+            jobs.update_prompt_id(job.id, f"prompt-failure-{index}")
+            repository.mark_running(generation.id)
+            jobs.update_progress(job.id, 1, 2, "KSampler")
+
+        failure.fail_generation(
+            generation.id,
+            job.id,
+            error_code="comfyui_execution_error",
+            error_summary="ComfyUIで生成が失敗しました。",
+            failed_at=failed_at,
+        )
+        persisted_generation = repository.get_by_id(generation.id)
+        persisted_job = jobs.get_by_generation(generation.id)
+        assert persisted_generation is not None
+        assert persisted_job is not None
+        assert persisted_generation.status is GenerationStatus.FAILED
+        assert persisted_job.status is GenerationStatus.FAILED
+        assert persisted_generation.error_code == persisted_job.error_code
+        assert persisted_generation.error_summary == persisted_job.error_summary
+        assert persisted_generation.completed_at == failed_at
+        assert persisted_job.completed_at == failed_at
+
+    engine.dispose()
+
+
+def test_failure_repository_is_idempotent_and_preserves_first_failure(tmp_path: Path) -> None:
+    settings, engine, repository, _, _, jobs = _repositories(tmp_path)
+    failure = repository_module.GenerationFailureRepository(repository._session_factory)
+    generation = repository.create_pending(GenerationSettingsSnapshot.from_settings(_settings()))
+    job = jobs.create(GenerationJob(generation.id, GenerationStatus.PENDING))
+    first_failed_at = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
+    second_failed_at = datetime(2026, 7, 29, 13, 0, tzinfo=UTC)
+
+    failure.fail_generation(
+        generation.id,
+        job.id,
+        error_code="workflow_error",
+        error_summary="生成設定を確認できませんでした。",
+        failed_at=first_failed_at,
+    )
+    failure.fail_generation(
+        generation.id,
+        job.id,
+        error_code="workflow_error",
+        error_summary="生成設定を確認できませんでした。",
+        failed_at=second_failed_at,
+    )
+
+    persisted_generation = repository.get_by_id(generation.id)
+    persisted_job = jobs.get_by_generation(generation.id)
+    assert persisted_generation is not None
+    assert persisted_job is not None
+    assert persisted_generation.completed_at == first_failed_at
+    assert persisted_job.completed_at == first_failed_at
+    with pytest.raises(GenerationRepositoryError):
+        failure.fail_generation(
+            generation.id,
+            job.id,
+            error_code="database_error",
+            error_summary="別の失敗情報",
+            failed_at=second_failed_at,
+        )
+    engine.dispose()
+
+
+def test_failure_repository_rolls_back_when_job_update_fails(tmp_path: Path) -> None:
+    settings, engine, repository, _, _, jobs = _repositories(tmp_path)
+    failure = repository_module.GenerationFailureRepository(repository._session_factory)
+    generation = repository.create_pending(GenerationSettingsSnapshot.from_settings(_settings()))
+    job = jobs.create(GenerationJob(generation.id, GenerationStatus.PENDING))
+
+    def fail_job(row: object, **values: object) -> None:
+        del row, values
+        raise GenerationRepositoryError("forced job failure")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(repository_module, "_mark_job_failed", fail_job)
+    try:
+        with pytest.raises(GenerationRepositoryError):
+            failure.fail_generation(
+                generation.id,
+                job.id,
+                error_code="storage_error",
+                error_summary="生成画像を保存できませんでした。",
+                failed_at=datetime.now(UTC),
+            )
+    finally:
+        monkeypatch.undo()
+
+    persisted_generation = repository.get_by_id(generation.id)
+    persisted_job = jobs.get_by_generation(generation.id)
+    assert persisted_generation is not None
+    assert persisted_job is not None
+    assert persisted_generation.status is GenerationStatus.PENDING
+    assert persisted_job.status is GenerationStatus.PENDING
+    assert persisted_generation.error_code is None
+    assert persisted_job.error_code is None
+    engine.dispose()
+
+
+def test_failure_repository_rejects_completed_and_inconsistent_pairs(tmp_path: Path) -> None:
+    settings, engine, repository, _, _, jobs = _repositories(tmp_path)
+    failure = repository_module.GenerationFailureRepository(repository._session_factory)
+    completed = repository.create_pending(GenerationSettingsSnapshot.from_settings(_settings()))
+    completed_job = jobs.create(GenerationJob(completed.id, GenerationStatus.PENDING))
+    repository.mark_queued(completed.id, "prompt-completed")
+    jobs.update_prompt_id(completed_job.id, "prompt-completed")
+    repository.mark_completed(completed.id)
+    jobs.mark_completed(completed_job.id)
+    with pytest.raises(GenerationRepositoryError):
+        failure.fail_generation(
+            completed.id,
+            completed_job.id,
+            error_code="database_error",
+            error_summary="不正な失敗更新",
+            failed_at=datetime.now(UTC),
+        )
+
+    inconsistent = repository.create_pending(GenerationSettingsSnapshot.from_settings(_settings()))
+    inconsistent_job = jobs.create(GenerationJob(inconsistent.id, GenerationStatus.PENDING))
+    repository.mark_failed(inconsistent.id, "database_error", "Generationだけ失敗")
+    with pytest.raises(GenerationRepositoryError):
+        failure.fail_generation(
+            inconsistent.id,
+            inconsistent_job.id,
+            error_code="database_error",
+            error_summary="同じ失敗情報",
+            failed_at=datetime.now(UTC),
+        )
+    engine.dispose()
+
+
 def test_generation_repository_rejects_invalid_parent_and_migration_round_trip(
     tmp_path: Path,
 ) -> None:
@@ -416,6 +614,9 @@ async def test_generation_service_persists_pending_failure_before_prompt(tmp_pat
         completion_repository=completion,
         job_repository=jobs,
         queue_repository=repository_module.GenerationQueueRepository(repository._session_factory),
+        failure_repository=repository_module.GenerationFailureRepository(
+            repository._session_factory
+        ),
     )
     result = await service.generate(_settings())
 
@@ -488,6 +689,9 @@ async def test_generation_service_persists_artifacts_and_snapshot(tmp_path: Path
         completion_repository=completion,
         job_repository=jobs,
         queue_repository=repository_module.GenerationQueueRepository(repository._session_factory),
+        failure_repository=repository_module.GenerationFailureRepository(
+            repository._session_factory
+        ),
         thumbnail_storage=HistoryThumbnailStorage(settings),
         metadata_storage=GenerationMetadataStorage(settings.data_dir),
     )
@@ -575,6 +779,9 @@ async def test_prompt_persistence_failure_stops_monitoring_without_resubmitting(
         completion_repository=completion,
         job_repository=jobs,
         queue_repository=FailingQueue(),  # type: ignore[arg-type]
+        failure_repository=repository_module.GenerationFailureRepository(
+            repository._session_factory
+        ),
     )
     result = await service.generate(_settings())
 
@@ -583,13 +790,14 @@ async def test_prompt_persistence_failure_stops_monitoring_without_resubmitting(
     assert result.status is GenerationStatus.FAILED
     assert result.prompt_id == "prompt-database-failure"
     assert result.error_message == (
-        "生成要求は送信されましたが、履歴情報を保存できませんでした。再送信は行っていません。"
+        "生成要求はComfyUIへ送信されましたが、履歴へ関連付けできませんでした。"
+        "同じ生成要求の再送信は行っていません。"
     )
     assert persisted is not None and persisted.status is GenerationStatus.FAILED
-    assert persisted.error_code == "database_error"
+    assert persisted.error_code == "prompt_persistence_error"
     assert persisted.comfy_prompt_id is None
     assert persisted_job is not None and persisted_job.status is GenerationStatus.FAILED
-    assert persisted_job.error_code == "database_error"
+    assert persisted_job.error_code == "prompt_persistence_error"
     assert persisted_job.prompt_id is None
     assert websocket_calls == 0
     assert history_calls == 0
@@ -607,6 +815,9 @@ def test_generation_service_rejects_partial_persistence_configuration(tmp_path: 
         "queue_repository": repository_module.GenerationQueueRepository(
             repository._session_factory
         ),
+        "failure_repository": repository_module.GenerationFailureRepository(
+            repository._session_factory
+        ),
     }
     for missing_name in configured:
         partial = {name: value for name, value in configured.items() if name != missing_name}
@@ -620,6 +831,44 @@ def test_generation_service_rejects_partial_persistence_configuration(tmp_path: 
                 settings,
                 **partial,
             )
+    engine.dispose()
+
+
+def test_failure_repository_error_is_wrapped_without_exposing_low_level_details(
+    tmp_path: Path,
+) -> None:
+    settings, engine, repository, artifacts, completion, jobs = _repositories(tmp_path)
+
+    class FailingFailureRepository:
+        def fail_generation(self, **values: object) -> None:
+            del values
+            raise GenerationRepositoryError("sqlite://secret database detail")
+
+    service = GenerationService(
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        lambda: None,  # type: ignore[arg-type]
+        settings,
+        generation_repository=repository,
+        artifact_repository=artifacts,
+        completion_repository=completion,
+        job_repository=jobs,
+        queue_repository=repository_module.GenerationQueueRepository(repository._session_factory),
+        failure_repository=FailingFailureRepository(),  # type: ignore[arg-type]
+    )
+    generation = repository.create_pending(GenerationSettingsSnapshot.from_settings(_settings()))
+    job = jobs.create(GenerationJob(generation.id, GenerationStatus.PENDING))
+    with pytest.raises(FailurePersistenceError) as error_info:
+        service._persist_failure(
+            job,
+            error_code="workflow_error",
+            error_summary="生成設定を確認できませんでした。",
+            failed_at=datetime.now(UTC),
+        )
+    assert isinstance(error_info.value.__cause__, GenerationRepositoryError)
+    assert "sqlite://" not in str(error_info.value)
     engine.dispose()
 
 
@@ -660,6 +909,9 @@ async def test_required_completion_failure_keeps_image_but_never_returns_success
         completion_repository=FailingCompletion(),  # type: ignore[arg-type]
         job_repository=jobs,
         queue_repository=repository_module.GenerationQueueRepository(repository._session_factory),
+        failure_repository=repository_module.GenerationFailureRepository(
+            repository._session_factory
+        ),
     )
     job = GenerationJob(
         generation_id=generation.id,
@@ -711,6 +963,9 @@ async def test_optional_thumbnail_failure_does_not_fail_completed_generation(
         completion_repository=completion,
         job_repository=jobs,
         queue_repository=repository_module.GenerationQueueRepository(repository._session_factory),
+        failure_repository=repository_module.GenerationFailureRepository(
+            repository._session_factory
+        ),
         thumbnail_storage=FailingThumbnail(),  # type: ignore[arg-type]
     )
     job = GenerationJob(
@@ -759,6 +1014,9 @@ async def test_recovery_marks_stale_pending_and_comfyui_failure_without_resubmit
         jobs,
         artifacts,
         settings,
+        failure_repository=repository_module.GenerationFailureRepository(
+            repository._session_factory
+        ),
     )
     messages = await recovery.recover(datetime(2026, 7, 26, 1, 0, tzinfo=UTC))
 
@@ -819,6 +1077,9 @@ async def test_recovery_reconciles_existing_primary_artifact_idempotently(tmp_pa
         completion_repository=completion,
         job_repository=jobs,
         queue_repository=repository_module.GenerationQueueRepository(repository._session_factory),
+        failure_repository=repository_module.GenerationFailureRepository(
+            repository._session_factory
+        ),
     )
 
     assert await service.recover_prompt(generation.id, "prompt-existing") is True

@@ -12,6 +12,7 @@ from runpod_sdxl_image_studio.adapters.comfyui.client import ComfyUIClient
 from runpod_sdxl_image_studio.adapters.comfyui.exceptions import ComfyUIError
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_repository import (
     GenerationArtifactRepositoryProtocol,
+    GenerationFailureRepositoryProtocol,
     GenerationJobRepositoryProtocol,
     GenerationRepositoryError,
     GenerationRepositoryProtocol,
@@ -35,6 +36,7 @@ class GenerationRecoveryService:
         artifact_repository: GenerationArtifactRepositoryProtocol,
         settings: Settings | None = None,
         completed_prompt_handler: CompletedPromptHandler | None = None,
+        failure_repository: GenerationFailureRepositoryProtocol | None = None,
     ) -> None:
         app_settings = settings or get_settings()
         self._client = client
@@ -44,6 +46,7 @@ class GenerationRecoveryService:
         self._stale_seconds = app_settings.stale_pending_seconds
         self._max_items = app_settings.recovery_max_items
         self._completed_prompt_handler = completed_prompt_handler
+        self._failure_repository = failure_repository
 
     async def recover(self, now: datetime | None = None) -> tuple[str, ...]:
         timestamp = now or datetime.now(UTC)
@@ -67,29 +70,23 @@ class GenerationRecoveryService:
                         generation.status.value == "pending"
                         and (timestamp - created).total_seconds() >= self._stale_seconds
                     ):
-                        self._generation_repository.mark_failed(
+                        self._mark_failed(
                             job.generation_id,
-                            GenerationErrorCode.RECOVERY.value,
-                            "送信前の処理が長時間停止したため終了しました。",
-                        )
-                        self._job_repository.mark_failed(
                             job.id,
                             GenerationErrorCode.RECOVERY.value,
                             "送信前の処理が長時間停止したため終了しました。",
+                            timestamp,
                         )
                         messages.append(f"{job.generation_id}: stale pending")
                     continue
                 history = await self._client.get_prompt_history(job.prompt_id)
                 if history.is_failed:
-                    self._generation_repository.mark_failed(
+                    self._mark_failed(
                         job.generation_id,
-                        GenerationErrorCode.COMFYUI_EXECUTION.value,
-                        "ComfyUIで生成が失敗しました。",
-                    )
-                    self._job_repository.mark_failed(
                         job.id,
                         GenerationErrorCode.COMFYUI_EXECUTION.value,
                         "ComfyUIで生成が失敗しました。",
+                        timestamp,
                     )
                     messages.append(f"{job.generation_id}: failed")
                 elif history.is_completed and self._completed_prompt_handler is not None:
@@ -103,3 +100,23 @@ class GenerationRecoveryService:
                 )
                 messages.append(f"{job.generation_id}: 状態を維持しました")
         return tuple(messages)
+
+    def _mark_failed(
+        self,
+        generation_id: UUID,
+        job_id: UUID,
+        error_code: str,
+        error_summary: str,
+        failed_at: datetime,
+    ) -> None:
+        if self._failure_repository is not None:
+            self._failure_repository.fail_generation(
+                generation_id,
+                job_id,
+                error_code=error_code,
+                error_summary=error_summary,
+                failed_at=failed_at,
+            )
+            return
+        self._generation_repository.mark_failed(generation_id, error_code, error_summary)
+        self._job_repository.mark_failed(job_id, error_code, error_summary)
