@@ -20,6 +20,10 @@ from runpod_sdxl_image_studio.adapters.comfyui.exceptions import (
 from runpod_sdxl_image_studio.adapters.comfyui.models import PromptHistory
 from runpod_sdxl_image_studio.adapters.comfyui.websocket_client import ComfyUIWebSocketClient
 from runpod_sdxl_image_studio.adapters.comfyui.workflow_adapter import WorkflowAdapter
+from runpod_sdxl_image_studio.adapters.database.repositories.generation_progress_repository import (
+    GenerationProgressRepository,
+    GenerationProgressRepositoryProtocol,
+)
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_repository import (
     GenerationArtifactRepositoryProtocol,
     GenerationCompletionRepositoryProtocol,
@@ -28,6 +32,10 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_reposito
     GenerationQueueRepositoryProtocol,
     GenerationRepositoryError,
     GenerationRepositoryProtocol,
+)
+from runpod_sdxl_image_studio.adapters.database.repositories.generation_start_repository import (
+    GenerationStartRepository,
+    GenerationStartRepositoryProtocol,
 )
 from runpod_sdxl_image_studio.adapters.storage.exceptions import StorageError
 from runpod_sdxl_image_studio.adapters.storage.generation_metadata_storage import (
@@ -99,6 +107,8 @@ class GenerationService:
         job_repository: GenerationJobRepositoryProtocol | None = None,
         queue_repository: GenerationQueueRepositoryProtocol | None = None,
         failure_repository: GenerationFailureRepositoryProtocol | None = None,
+        start_repository: GenerationStartRepositoryProtocol | None = None,
+        progress_repository: GenerationProgressRepositoryProtocol | None = None,
         thumbnail_storage: HistoryThumbnailStorage | None = None,
         metadata_storage: GenerationMetadataStorage | None = None,
     ) -> None:
@@ -117,9 +127,7 @@ class GenerationService:
         self._job_repository = job_repository
         self._queue_repository = queue_repository
         self._failure_repository = failure_repository
-        self._thumbnail_storage = thumbnail_storage
-        self._metadata_storage = metadata_storage
-        repositories = (
+        legacy_repositories = (
             generation_repository,
             job_repository,
             artifact_repository,
@@ -127,10 +135,29 @@ class GenerationService:
             completion_repository,
             failure_repository,
         )
-        if any(repository is not None for repository in repositories) and any(
-            repository is None for repository in repositories
+        all_repositories = (*legacy_repositories, start_repository, progress_repository)
+        if any(repository is not None for repository in all_repositories) and any(
+            repository is None for repository in all_repositories
         ):
-            raise ValueError("generation persistence repositories must be configured together")
+            # 既存のテスト用構成（旧6 Repositoryのみ）は、新しい原子的 Repositoryへ接続する。
+            if (
+                all(repository is not None for repository in legacy_repositories)
+                and start_repository is None
+                and progress_repository is None
+            ):
+                session_factory = getattr(generation_repository, "_session_factory", None)
+                if session_factory is None:
+                    raise ValueError(
+                        "generation persistence repositories must be configured together"
+                    )
+                start_repository = GenerationStartRepository(session_factory)
+                progress_repository = GenerationProgressRepository(session_factory)
+            else:
+                raise ValueError("generation persistence repositories must be configured together")
+        self._start_repository = start_repository
+        self._progress_repository = progress_repository
+        self._thumbnail_storage = thumbnail_storage
+        self._metadata_storage = metadata_storage
         self._jobs: dict[UUID, GenerationJob] = {}
         self._results: dict[UUID, GenerationResult] = {}
         self._lock = asyncio.Lock()
@@ -240,23 +267,6 @@ class GenerationService:
         ):
             job.status = GenerationStatus.FAILED
             job.error_message = "生成履歴を保存できませんでした。"
-            failed_at = datetime.now(UTC)
-            try:
-                self._persist_failure(
-                    job,
-                    error_code=GenerationErrorCode.DATABASE.value,
-                    error_summary=job.error_message,
-                    failed_at=failed_at,
-                )
-            except FailurePersistenceError as exc:
-                logger.error(
-                    "Failure persistence also failed generation=%s job=%s "
-                    "original_error=pending_record_failure",
-                    job.generation_id,
-                    job.id,
-                    exc_info=True,
-                )
-                job.error_message = persistence_error_message(exc)
             result = GenerationResult(
                 generation_id=generation_id,
                 prompt_id="",
@@ -362,30 +372,36 @@ class GenerationService:
         created_at: datetime,
         job: GenerationJob,
     ) -> bool:
-        if self._generation_repository is None:
+        if self._start_repository is None:
             return True
         try:
             snapshot = GenerationSettingsSnapshot.from_settings(settings)
-            self._generation_repository.create_pending(
+            persisted_generation, persisted_job = self._start_repository.create_pending(
                 snapshot,
+                generation_id=generation_id,
+                job_id=job.id,
                 kind=kind,
                 parent_generation_id=parent_generation_id,
-                generation_id=generation_id,
                 created_at=created_at,
             )
-            if self._job_repository is not None:
-                persisted_job = self._job_repository.create(
-                    job.__class__(
-                        generation_id=job.generation_id,
-                        status=GenerationStatus.PENDING,
-                        id=job.id,
-                        created_at=created_at,
-                    )
-                )
-                job.id = persisted_job.id
+            if (
+                persisted_generation.id != generation_id
+                or persisted_job.id != job.id
+                or persisted_job.generation_id != generation_id
+                or persisted_generation.created_at != persisted_job.created_at
+            ):
+                raise GenerationRepositoryError("pending generation pair is inconsistent")
+            job.created_at = persisted_job.created_at
+            job.updated_at = persisted_job.updated_at
             return True
         except (GenerationRepositoryError, ValueError) as exc:
-            logger.error("Generation persistence failed before prompt: %s", type(exc).__name__)
+            logger.error(
+                "Pending generation pair could not be persisted generation=%s job=%s error=%s",
+                generation_id,
+                job.id,
+                type(exc).__name__,
+                exc_info=True,
+            )
             return False
 
     def _persist_failure(
@@ -511,14 +527,15 @@ class GenerationService:
 
     def _persist_progress(self, job: GenerationJob, progress: GenerationProgress) -> None:
         try:
-            if (
-                progress.state is GenerationStatus.RUNNING
-                and self._generation_repository is not None
-            ):
-                self._generation_repository.mark_running(job.generation_id)
-            if self._job_repository is not None:
-                self._job_repository.update_progress(
-                    job.id, progress.value, progress.maximum, progress.current_node
+            if self._progress_repository is not None:
+                self._progress_repository.update_progress(
+                    generation_id=job.generation_id,
+                    job_id=job.id,
+                    state=progress.state,
+                    value=progress.value,
+                    maximum=progress.maximum,
+                    current_node=progress.current_node,
+                    updated_at=datetime.now(UTC),
                 )
         except GenerationRepositoryError:
             logger.warning("Failed to persist progress generation=%s", job.generation_id)

@@ -11,6 +11,9 @@ from runpod_sdxl_image_studio.adapters.database.engine import (
     create_image_studio_engine,
     create_session_factory,
 )
+from runpod_sdxl_image_studio.adapters.database.repositories.generation_progress_repository import (
+    GenerationProgressRepository,
+)
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_repository import (
     GenerationArtifactRepository,
     GenerationCompletionRepository,
@@ -18,6 +21,9 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_reposito
     GenerationJobRepository,
     GenerationQueueRepository,
     GenerationRepository,
+)
+from runpod_sdxl_image_studio.adapters.database.repositories.generation_start_repository import (
+    GenerationStartRepository,
 )
 from runpod_sdxl_image_studio.adapters.database.repositories.lora_metadata_repository import (
     LoraMetadataRepository,
@@ -120,6 +126,8 @@ def build_app(
     failure_repository = GenerationFailureRepository(session_factory)
     job_repository = GenerationJobRepository(session_factory)
     queue_repository = GenerationQueueRepository(session_factory)
+    start_repository = GenerationStartRepository(session_factory)
+    progress_repository = GenerationProgressRepository(session_factory)
     catalog_service = LoraCatalogService(
         LoraMetadataRepository(create_session_factory(database_engine)),
         LoraThumbnailStorage(
@@ -145,6 +153,8 @@ def build_app(
         failure_repository=failure_repository,
         job_repository=job_repository,
         queue_repository=queue_repository,
+        start_repository=start_repository,
+        progress_repository=progress_repository,
         thumbnail_storage=HistoryThumbnailStorage(app_settings),
         metadata_storage=GenerationMetadataStorage(app_settings.data_dir),
     )
