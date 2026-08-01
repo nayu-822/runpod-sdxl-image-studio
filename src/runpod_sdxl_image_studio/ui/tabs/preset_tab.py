@@ -21,7 +21,10 @@ from runpod_sdxl_image_studio.services.preset_service import (
     PresetService,
     PresetServiceError,
 )
-from runpod_sdxl_image_studio.services.recent_settings_service import RecentSettingsService
+from runpod_sdxl_image_studio.services.recent_settings_service import (
+    RecentSettingsService,
+    RecentSettingsServiceError,
+)
 from runpod_sdxl_image_studio.ui.components.lora_editor import (
     LoraEditorComponents,
     add_lora_row,
@@ -568,7 +571,7 @@ def make_recent_settings_handler(
                 ),
                 "最近使った設定を更新しました。",
             )
-        except (PresetServiceError, ValueError, RuntimeError):
+        except (RecentSettingsServiceError, PresetServiceError, ValueError):
             return (
                 gr.skip(),
                 gr.skip(),

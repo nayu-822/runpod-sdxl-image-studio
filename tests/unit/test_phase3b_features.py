@@ -16,6 +16,7 @@ from runpod_sdxl_image_studio.adapters.database.engine import create_session_fac
 from runpod_sdxl_image_studio.adapters.database.models import Base
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_repository import (
     GenerationRepository,
+    GenerationRepositoryError,
 )
 from runpod_sdxl_image_studio.adapters.database.repositories.preset_repository import (
     PresetRepository,
@@ -36,7 +37,10 @@ from runpod_sdxl_image_studio.domain.preset_payload import LoraPresetPayload, Pr
 from runpod_sdxl_image_studio.domain.recent_settings import RecentSettings
 from runpod_sdxl_image_studio.services.generation_diff_service import GenerationDiffService
 from runpod_sdxl_image_studio.services.preset_service import PresetService
-from runpod_sdxl_image_studio.services.recent_settings_service import RecentSettingsService
+from runpod_sdxl_image_studio.services.recent_settings_service import (
+    RecentSettingsService,
+    RecentSettingsServiceError,
+)
 from runpod_sdxl_image_studio.ui.tabs.history_tab import seed_copy_value
 from runpod_sdxl_image_studio.ui.tabs.preset_tab import (
     make_preset_apply_handler,
@@ -473,7 +477,7 @@ def test_recent_settings_handler_capabilities_and_errors() -> None:
 
     class BrokenRecentSettingsService:
         def get_recent(self) -> None:
-            raise RuntimeError("database password leaked")
+            raise RecentSettingsServiceError("database password leaked")
 
     failed = make_recent_settings_handler(
         BrokenRecentSettingsService(),
@@ -484,6 +488,43 @@ def test_recent_settings_handler_capabilities_and_errors() -> None:
     assert failed[6] == "最近使った設定を取得できませんでした。"
     assert "password" not in failed[6]
     engine.dispose()
+
+
+def test_recent_settings_service_error_boundary() -> None:
+    class BrokenGenerationRepository:
+        def list_history(self, query: object) -> None:
+            raise GenerationRepositoryError("SQL database URL leaked")
+
+    class BrokenPresetRepository:
+        def list(self, **kwargs: object) -> None:
+            raise PresetRepositoryError("absolute path leaked")
+
+    service = RecentSettingsService(
+        BrokenGenerationRepository(),
+        BrokenPresetRepository(),  # type: ignore[arg-type]
+    )
+    try:
+        service.get_recent()
+    except RecentSettingsServiceError as exc:
+        assert str(exc) == "recent settings could not be loaded"
+        assert isinstance(exc.__cause__, GenerationRepositoryError)
+        assert "leaked" not in str(exc)
+    else:
+        raise AssertionError("RecentSettingsServiceError was not raised")
+
+    class UnexpectedRecentSettingsService:
+        def get_recent(self) -> None:
+            raise RuntimeError("unexpected programming error")
+
+    handler = make_recent_settings_handler(
+        UnexpectedRecentSettingsService(), PresetService(BrokenPresetRepository())
+    )  # type: ignore[arg-type]
+    try:
+        handler(None, None, None)
+    except RuntimeError as exc:
+        assert str(exc) == "unexpected programming error"
+    else:
+        raise AssertionError("unexpected RuntimeError was swallowed")
 
 
 def test_recent_lora_shortcut_appends_and_rejects_duplicate_limit_and_missing() -> None:
