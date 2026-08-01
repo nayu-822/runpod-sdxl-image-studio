@@ -1,0 +1,68 @@
+"""Domain models for the persistent single-worker generation queue."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from enum import StrEnum
+from uuid import UUID
+
+from runpod_sdxl_image_studio.domain.generation import Generation
+from runpod_sdxl_image_studio.domain.job import GenerationJob
+
+
+class BatchSeedStrategy(StrEnum):
+    """How seeds are resolved when a batch is enqueued."""
+
+    RANDOM = "random"
+    SEQUENTIAL = "sequential"
+
+
+@dataclass(frozen=True)
+class GenerationBatch:
+    """Persisted batch metadata; child Generation snapshots remain authoritative."""
+
+    id: UUID
+    name: str
+    item_count: int
+    seed_strategy: BatchSeedStrategy
+    start_seed: int | None
+    seed_step: int
+    retry_of_batch_id: UUID | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class GenerationQueueEntry:
+    """Persistent FIFO position and worker lease for one Generation."""
+
+    sequence: int
+    generation_id: UUID
+    job_id: UUID
+    batch_id: UUID | None
+    batch_index: int
+    worker_id: str | None
+    claimed_at: datetime | None
+    lease_expires_at: datetime | None
+    cancel_requested_at: datetime | None
+    enqueued_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class GenerationQueueItem:
+    """Queue entry with the persisted Generation and Job projections."""
+
+    entry: GenerationQueueEntry
+    generation: Generation
+    job: GenerationJob
+    batch: GenerationBatch | None = None
+
+
+__all__ = [
+    "BatchSeedStrategy",
+    "GenerationBatch",
+    "GenerationQueueEntry",
+    "GenerationQueueItem",
+]

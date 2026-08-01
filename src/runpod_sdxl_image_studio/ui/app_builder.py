@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import gradio as gr
 
+from runpod_sdxl_image_studio.adapters.comfyui.cancellation import ComfyUICancellationAdapter
 from runpod_sdxl_image_studio.adapters.comfyui.client import ComfyUIClient
 from runpod_sdxl_image_studio.adapters.comfyui.websocket_client import ComfyUIWebSocketClient
 from runpod_sdxl_image_studio.adapters.comfyui.workflow_adapter import WorkflowAdapter
 from runpod_sdxl_image_studio.adapters.database.engine import (
     create_image_studio_engine,
     create_session_factory,
+)
+from runpod_sdxl_image_studio.adapters.database.repositories.generation_dispatch_queue_repository import (  # noqa: E501
+    GenerationDispatchQueueRepository,
 )
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_progress_repository import (
     GenerationProgressRepository,
@@ -40,15 +46,24 @@ from runpod_sdxl_image_studio.adapters.storage.history_thumbnail_storage import 
 from runpod_sdxl_image_studio.adapters.storage.local_storage import LocalStorageAdapter
 from runpod_sdxl_image_studio.adapters.storage.lora_thumbnail_storage import LoraThumbnailStorage
 from runpod_sdxl_image_studio.config import Settings, get_settings
+from runpod_sdxl_image_studio.domain.generation_queue import GenerationQueueItem
 from runpod_sdxl_image_studio.domain.lora_search import append_trigger_words
+from runpod_sdxl_image_studio.jobs.generation_queue_worker import (
+    GenerationQueueRuntime,
+    GenerationQueueWorker,
+)
 from runpod_sdxl_image_studio.services.comfyui_service import ComfyUIService
 from runpod_sdxl_image_studio.services.generation_diff_service import GenerationDiffService
+from runpod_sdxl_image_studio.services.generation_execution_service import (
+    GenerationExecutionService,
+)
 from runpod_sdxl_image_studio.services.generation_history_service import (
     GenerationHistoryService,
 )
 from runpod_sdxl_image_studio.services.generation_persistence import (
     GenerationPersistenceRepositories,
 )
+from runpod_sdxl_image_studio.services.generation_queue_service import GenerationQueueService
 from runpod_sdxl_image_studio.services.generation_recovery_service import (
     GenerationRecoveryService,
 )
@@ -114,13 +129,22 @@ from runpod_sdxl_image_studio.ui.tabs.preset_tab import (
     make_recent_vae_handler,
     preset_apply_output_count,
 )
+from runpod_sdxl_image_studio.ui.tabs.queue_tab import (
+    build_queue_tab,
+    make_queue_cancel_handler,
+    make_queue_detail_handler,
+    make_queue_refresh_handler,
+    make_queue_retry_batch_handler,
+    make_queue_retry_handler,
+)
 from runpod_sdxl_image_studio.ui.tabs.system_tab import (
     build_generation_tab,
     build_system_tab,
     capability_refresh_outputs,
     disable_generate_button,
+    make_batch_enqueue_handler,
     make_check_connection_handler,
-    make_generate_handler,
+    make_enqueue_handler,
     make_refresh_handler,
     size_preset_values,
 )
@@ -135,6 +159,24 @@ APP_CSS = """
   button { min-height: 2.75rem; }
 }
 """
+
+
+@dataclass(frozen=True)
+class ApplicationRuntime:
+    """The app and its one explicitly owned background worker runtime."""
+
+    demo: gr.Blocks
+    queue_runtime: GenerationQueueRuntime
+
+    def start(self) -> None:
+        """Start the process-level queue worker."""
+
+        self.queue_runtime.start()
+
+    def stop(self) -> None:
+        """Stop the process-level queue worker."""
+
+        self.queue_runtime.stop()
 
 
 def build_app(
@@ -154,6 +196,7 @@ def build_app(
     failure_repository = GenerationFailureRepository(session_factory)
     job_repository = GenerationJobRepository(session_factory)
     queue_repository = GenerationQueueRepository(session_factory)
+    dispatch_queue_repository = GenerationDispatchQueueRepository(session_factory)
     start_repository = GenerationStartRepository(session_factory)
     progress_repository = GenerationProgressRepository(session_factory)
     catalog_service = LoraCatalogService(
@@ -188,6 +231,15 @@ def build_app(
         thumbnail_storage=HistoryThumbnailStorage(app_settings),
         metadata_storage=GenerationMetadataStorage(app_settings.data_dir),
     )
+    queue_service = GenerationQueueService(
+        dispatch_queue_repository,
+        app_settings,
+        ComfyUICancellationAdapter(client),
+    )
+    execution_service = GenerationExecutionService(
+        generation_service,
+        dispatch_queue_repository,
+    )
     history_service = GenerationHistoryService(
         generation_repository,
         artifact_repository,
@@ -202,6 +254,22 @@ def build_app(
         completed_prompt_handler=generation_service.recover_prompt,
         failure_repository=failure_repository,
     )
+
+    async def reconcile_queue_item(item: GenerationQueueItem) -> bool:
+        queue_item = item
+        prompt_id = queue_item.job.prompt_id or queue_item.generation.comfy_prompt_id
+        if not prompt_id:
+            return False
+        return await generation_service.recover_prompt(queue_item.generation.id, prompt_id)
+
+    queue_worker = GenerationQueueWorker(
+        dispatch_queue_repository,
+        execution_service,
+        app_settings,
+        reconcile_handler=reconcile_queue_item,
+    )
+    queue_runtime = GenerationQueueRuntime(queue_worker)
+    queue_service.set_wake_callback(queue_runtime.wake)
     preset_repository = PresetRepository(session_factory)
     preset_service = PresetService(preset_repository, app_settings)
     recent_settings_service = RecentSettingsService(
@@ -219,6 +287,18 @@ def build_app(
                 app_settings.comfyui_base_url,
                 initial_status_markdown(),
             )
+        with gr.Tab("キュー"):
+            (
+                queue_refresh,
+                queue_status,
+                queue_batch_filter,
+                queue_jobs,
+                queue_detail,
+                queue_cancel,
+                queue_retry,
+                queue_retry_batch,
+                queue_message,
+            ) = build_queue_tab()
         with gr.Tab("LoRA管理"):
             lora_management = build_lora_management_tab(catalog_service)
         with gr.Tab("履歴"):
@@ -256,6 +336,76 @@ def build_app(
             fn=lambda preset: size_preset_values(preset),
             inputs=[generation.size_preset],
             outputs=[generation.width, generation.height],
+        )
+        generation.batch_enqueue_button.click(
+            fn=make_batch_enqueue_handler(queue_service, app_settings.max_loras),
+            inputs=[
+                generation.checkpoint,
+                generation.positive_prompt,
+                generation.negative_prompt,
+                generation.width,
+                generation.height,
+                generation.seed_mode,
+                generation.seed,
+                generation.steps,
+                generation.cfg_scale,
+                generation.sampler,
+                generation.scheduler,
+                generation.vae,
+                generation.lora_editor.state,
+                generation.batch_count,
+                generation.batch_seed_strategy,
+                generation.batch_start_seed,
+                generation.batch_seed_step,
+                generation.batch_name,
+            ],
+            outputs=[
+                generation.batch_enqueue_button,
+                generation.progress,
+                generation.batch_message,
+            ],
+        )
+        queue_refresh.click(
+            fn=make_queue_refresh_handler(queue_service),
+            inputs=[queue_status, queue_batch_filter],
+            outputs=[queue_jobs, queue_message],
+        )
+        queue_status.change(
+            fn=make_queue_refresh_handler(queue_service),
+            inputs=[queue_status, queue_batch_filter],
+            outputs=[queue_jobs, queue_message],
+        )
+        queue_jobs.change(
+            fn=make_queue_detail_handler(queue_service),
+            inputs=[queue_jobs],
+            outputs=[queue_detail],
+        )
+        queue_cancel.click(
+            fn=make_queue_cancel_handler(queue_service),
+            inputs=[queue_jobs],
+            outputs=[queue_message],
+        ).then(
+            fn=make_queue_refresh_handler(queue_service),
+            inputs=[queue_status, queue_batch_filter],
+            outputs=[queue_jobs, queue_message],
+        )
+        queue_retry.click(
+            fn=make_queue_retry_handler(queue_service),
+            inputs=[queue_jobs],
+            outputs=[queue_message],
+        ).then(
+            fn=make_queue_refresh_handler(queue_service),
+            inputs=[queue_status, queue_batch_filter],
+            outputs=[queue_jobs, queue_message],
+        )
+        queue_retry_batch.click(
+            fn=make_queue_retry_batch_handler(queue_service),
+            inputs=[queue_jobs],
+            outputs=[queue_message],
+        ).then(
+            fn=make_queue_refresh_handler(queue_service),
+            inputs=[queue_status, queue_batch_filter],
+            outputs=[queue_jobs, queue_message],
         )
         presets.refresh.click(
             fn=make_preset_search_handler(preset_service),
@@ -1001,7 +1151,7 @@ def build_app(
             outputs=restore_outputs,
         )
         regeneration_generation_event = regenerate_event.then(
-            fn=make_generate_handler(generation_service, app_settings.max_loras),
+            fn=make_enqueue_handler(queue_service, app_settings.max_loras),
             inputs=generation_inputs,
             outputs=[
                 generation.generate_button,
@@ -1022,7 +1172,7 @@ def build_app(
             queue=False,
         )
         generate_event.then(
-            fn=make_generate_handler(generation_service, app_settings.max_loras),
+            fn=make_enqueue_handler(queue_service, app_settings.max_loras),
             inputs=generation_inputs,
             outputs=[
                 generation.generate_button,
@@ -1033,7 +1183,18 @@ def build_app(
             ],
             concurrency_limit=1,
         )
+    demo.generation_queue_runtime = queue_runtime
     return demo
+
+
+def build_application_runtime(settings: Settings | None = None) -> ApplicationRuntime:
+    """Build the demo and obtain its unstarted process-level worker runtime."""
+
+    demo = build_app(settings)
+    runtime = getattr(demo, "generation_queue_runtime", None)
+    if not isinstance(runtime, GenerationQueueRuntime):
+        raise RuntimeError("generation queue runtime was not configured")
+    return ApplicationRuntime(demo=demo, queue_runtime=runtime)
 
 
 def _filter_lora_category(

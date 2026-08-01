@@ -6,7 +6,18 @@ import json
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from runpod_sdxl_image_studio.domain.lora_metadata import LoraMetadata
@@ -87,6 +98,10 @@ class GenerationModel(Base):
     parent_generation_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("generations.id", ondelete="RESTRICT"), nullable=True
     )
+    retry_of_generation_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("generations.id", ondelete="RESTRICT"), nullable=True
+    )
+    retry_attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     settings_snapshot_json: Mapped[str] = mapped_column(Text, nullable=False)
     snapshot_schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
     checkpoint_name: Mapped[str | None] = mapped_column(String(500), nullable=True)
@@ -142,6 +157,15 @@ class GenerationJobModel(Base):
     progress_value: Mapped[int | None] = mapped_column(Integer, nullable=True)
     progress_maximum: Mapped[int | None] = mapped_column(Integer, nullable=True)
     current_node: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    worker_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -186,6 +210,63 @@ class PresetModel(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class GenerationBatchModel(Base):
+    """Persistent batch metadata for one FIFO enqueue operation."""
+
+    __tablename__ = "generation_batches"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    item_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    seed_strategy: Mapped[str] = mapped_column(String(32), nullable=False)
+    start_seed: Mapped[int | None] = mapped_column(BigInteger(), nullable=True)
+    seed_step: Mapped[int] = mapped_column(BigInteger(), nullable=False)
+    retry_of_batch_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("generation_batches.id", ondelete="RESTRICT"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    __table_args__ = (
+        CheckConstraint("item_count > 0", name="ck_generation_batch_item_count_positive"),
+        CheckConstraint("seed_step > 0", name="ck_generation_batch_seed_step_positive"),
+    )
+
+
+class GenerationQueueEntryModel(Base):
+    """Persistent FIFO sequence and single-worker lease."""
+
+    __tablename__ = "generation_queue_entries"
+
+    sequence: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    generation_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("generations.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    job_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("generation_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    batch_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("generation_batches.id", ondelete="CASCADE"), nullable=True
+    )
+    batch_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    worker_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    enqueued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    __table_args__ = (
+        CheckConstraint("batch_index >= 0", name="ck_generation_queue_batch_index_nonnegative"),
+        UniqueConstraint("batch_id", "batch_index", name="uq_generation_queue_batch_index"),
+    )
+
+
 Index("ix_generations_created_at", GenerationModel.created_at)
 Index("ix_generations_status", GenerationModel.status)
 Index("ix_generations_kind", GenerationModel.kind)
@@ -210,6 +291,9 @@ Index("ix_presets_name", PresetModel.name)
 Index("ix_presets_favorite", PresetModel.favorite)
 Index("ix_presets_last_used", PresetModel.last_used_at)
 Index("ix_presets_updated", PresetModel.updated_at)
+Index("ix_generation_batches_created", GenerationBatchModel.created_at)
+Index("ix_generation_queue_batch", GenerationQueueEntryModel.batch_id)
+Index("ix_generation_queue_lease", GenerationQueueEntryModel.lease_expires_at)
 
 
 def _utc(value: datetime | None) -> datetime | None:

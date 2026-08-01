@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -110,6 +110,21 @@ class Settings(BaseSettings):
     )
     stale_pending_seconds: int = Field(300, validation_alias="IMAGE_STUDIO_STALE_PENDING_SECONDS")
     recovery_max_items: int = Field(50, validation_alias="IMAGE_STUDIO_RECOVERY_MAX_ITEMS")
+    queue_poll_interval_seconds: float = Field(
+        2.0, validation_alias="IMAGE_STUDIO_QUEUE_POLL_INTERVAL_SECONDS"
+    )
+    queue_lease_seconds: float = Field(60.0, validation_alias="IMAGE_STUDIO_QUEUE_LEASE_SECONDS")
+    queue_heartbeat_seconds: float = Field(
+        20.0, validation_alias="IMAGE_STUDIO_QUEUE_HEARTBEAT_SECONDS"
+    )
+    queue_max_pending_jobs: int = Field(200, validation_alias="IMAGE_STUDIO_QUEUE_MAX_PENDING_JOBS")
+    batch_max_items: int = Field(50, validation_alias="IMAGE_STUDIO_BATCH_MAX_ITEMS")
+    reconciliation_grace_seconds: float = Field(
+        120.0, validation_alias="IMAGE_STUDIO_RECONCILIATION_GRACE_SECONDS"
+    )
+    queue_auto_refresh_seconds: float = Field(
+        3.0, validation_alias="IMAGE_STUDIO_QUEUE_AUTO_REFRESH_SECONDS"
+    )
     max_trigger_words: int = Field(50, validation_alias="IMAGE_STUDIO_MAX_TRIGGER_WORDS")
     max_compatible_models: int = Field(20, validation_alias="IMAGE_STUDIO_MAX_COMPATIBLE_MODELS")
 
@@ -162,6 +177,8 @@ class Settings(BaseSettings):
         "history_thumbnail_max_edge",
         "stale_pending_seconds",
         "recovery_max_items",
+        "queue_max_pending_jobs",
+        "batch_max_items",
     )
     @classmethod
     def validate_positive_integer(cls, value: int) -> int:
@@ -189,6 +206,28 @@ class Settings(BaseSettings):
         if value > 100:
             raise ValueError("recovery_max_items must not exceed 100")
         return value
+
+    @field_validator(
+        "queue_poll_interval_seconds", "queue_lease_seconds", "queue_heartbeat_seconds"
+    )
+    @classmethod
+    def validate_queue_timing(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("queue timing values must be greater than zero")
+        return value
+
+    @field_validator("reconciliation_grace_seconds", "queue_auto_refresh_seconds")
+    @classmethod
+    def validate_queue_optional_timing(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("queue optional timing values must not be negative")
+        return value
+
+    @model_validator(mode="after")
+    def validate_queue_lease(self) -> Settings:
+        if self.queue_lease_seconds <= self.queue_heartbeat_seconds:
+            raise ValueError("queue_lease_seconds must be greater than queue_heartbeat_seconds")
+        return self
 
     @field_validator("max_upscale_factor")
     @classmethod

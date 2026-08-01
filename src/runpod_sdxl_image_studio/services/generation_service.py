@@ -73,10 +73,15 @@ from runpod_sdxl_image_studio.services.generation_persistence import (
 
 logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[GenerationProgress], None]
+CancelCheck = Callable[[], bool]
 
 
 class HistoryTimeoutError(ComfyUIPromptError):
     """履歴のポーリングが設定された試行回数に達した。"""
+
+
+class GenerationCancelledError(RuntimeError):
+    """The queue requested cancellation before a prompt was submitted."""
 
 
 class CapabilitiesProvider(Protocol):
@@ -257,6 +262,123 @@ class GenerationService:
             return await self._generate_locked(
                 settings, progress_callback, parent_generation_id, kind
             )
+
+    async def execute_persisted(
+        self,
+        generation_id: UUID,
+        job_id: UUID,
+        progress_callback: ProgressCallback | None = None,
+        cancel_check: CancelCheck | None = None,
+    ) -> GenerationResult:
+        """Execute an already persisted pending queue item without creating records."""
+
+        if (
+            self._generation_repository is None
+            or self._job_repository is None
+            or self._start_repository is None
+        ):
+            raise GenerationPersistenceError("generation persistence is unavailable")
+        async with self._lock:
+            generation = self._generation_repository.get_by_id(generation_id)
+            persisted_job = self._job_repository.get_by_generation(generation_id)
+            if generation is None or persisted_job is None:
+                raise GenerationPersistenceError("persisted generation or job was not found")
+            if persisted_job.id != job_id or persisted_job.generation_id != generation_id:
+                raise GenerationPersistenceError("persisted generation and job do not match")
+            if generation.status in {
+                GenerationStatus.COMPLETED,
+                GenerationStatus.FAILED,
+                GenerationStatus.CANCELLED,
+            }:
+                return GenerationResult(
+                    generation_id=generation_id,
+                    prompt_id=generation.comfy_prompt_id or "",
+                    status=generation.status,
+                    seed=generation.settings_snapshot.seed,
+                    stored_image=None,
+                    error_message=generation.error_summary,
+                    created_at=generation.created_at,
+                )
+            if generation.comfy_prompt_id or persisted_job.prompt_id:
+                raise GenerationPersistenceError(
+                    "prompt ID already exists; reconciliation is required"
+                )
+            if (
+                generation.status is not GenerationStatus.PENDING
+                or persisted_job.status is not GenerationStatus.PENDING
+            ):
+                raise GenerationPersistenceError("persisted queue item is not pending")
+
+            settings = generation.settings_snapshot.to_generation_settings()
+            job = GenerationJob(
+                generation_id=generation_id,
+                status=GenerationStatus.PENDING,
+                id=job_id,
+                prompt_id=None,
+                created_at=generation.created_at,
+                updated_at=persisted_job.updated_at,
+            )
+            self._jobs[generation_id] = job
+            self._emit(
+                progress_callback,
+                GenerationProgress(
+                    prompt_id="",
+                    state=GenerationStatus.PENDING,
+                    percentage=0.0,
+                    message="キューから生成を開始します",
+                ),
+            )
+            try:
+                await asyncio.wait_for(
+                    self._run_job(
+                        job,
+                        settings,
+                        generation.created_at,
+                        progress_callback,
+                        generation.kind,
+                        generation.parent_generation_id,
+                        cancel_check=cancel_check,
+                    ),
+                    timeout=self._settings.generation_timeout_seconds,
+                )
+                result = self._result_for_job(job, settings.seed, generation.created_at)
+                if (
+                    self._lora_catalog_service is not None
+                    and settings.loras
+                    and result.status is GenerationStatus.COMPLETED
+                ):
+                    try:
+                        self._lora_catalog_service.record_usage(
+                            tuple(lora.name for lora in settings.loras), datetime.now(UTC)
+                        )
+                    except Exception:  # noqa: BLE001 - usage statistics are best effort
+                        logger.warning("LoRA usage statistics update failed", exc_info=True)
+            except GenerationCancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - execution boundary persists safe failures
+                error_code = _generation_error_code(exc)
+                error_summary = _safe_generation_error(exc)
+                job.status = GenerationStatus.FAILED
+                job.error_code = error_code
+                job.error_summary = error_summary
+                job.error_message = error_summary
+                self._persist_failure(
+                    job,
+                    error_code=error_code,
+                    error_summary=error_summary,
+                    failed_at=datetime.now(UTC),
+                )
+                result = GenerationResult(
+                    generation_id=generation_id,
+                    prompt_id=job.prompt_id or "",
+                    status=GenerationStatus.FAILED,
+                    seed=settings.seed,
+                    stored_image=None,
+                    error_message=error_summary,
+                    created_at=generation.created_at,
+                )
+            self._results[generation_id] = result
+            return result
 
     async def _generate_locked(
         self,
@@ -453,12 +575,16 @@ class GenerationService:
         progress_callback: ProgressCallback | None,
         kind: GenerationKind,
         parent_generation_id: UUID | None,
+        cancel_check: CancelCheck | None = None,
     ) -> None:
         capabilities_result = await self._capabilities_provider()
         capabilities = capabilities_result.capabilities
         if not capabilities_result.is_success or capabilities is None:
             raise ComfyUIPromptError("ComfyUI capabilities are unavailable")
         _validate_generation(settings, capabilities, self._settings)
+
+        if cancel_check is not None and cancel_check():
+            raise GenerationCancelledError("generation was cancelled before prompt submission")
 
         workflow = self._workflow_adapter.build_txt2img_workflow(settings)
         client_id = str(self._id_factory())
@@ -498,6 +624,8 @@ class GenerationService:
         websocket_failed = False
         try:
             async for progress in self._websocket_client.watch_prompt(queued.prompt_id, client_id):
+                if cancel_check is not None and cancel_check():
+                    raise GenerationCancelledError("generation was cancelled during execution")
                 job.status = progress.state
                 self._persist_progress(job, progress)
                 self._emit(progress_callback, progress)
@@ -508,6 +636,8 @@ class GenerationService:
             websocket_failed = True
             logger.info("Falling back to ComfyUI history after WebSocket loss")
 
+        if cancel_check is not None and cancel_check():
+            raise GenerationCancelledError("generation was cancelled during execution")
         history = await self._poll_history(queued.prompt_id)
         if history.is_failed or not history.is_completed:
             raise ComfyUIPromptError("ComfyUI did not complete the prompt")
@@ -526,6 +656,8 @@ class GenerationService:
             )
         if not history.outputs:
             raise ComfyUIPromptError("ComfyUI completed without an output image")
+        if cancel_check is not None and cancel_check():
+            raise GenerationCancelledError("generation was cancelled during execution")
         image_bytes = await self._client.get_output_image(history.outputs[0])
         job.stored_image = self._storage.store_image(
             image_bytes,

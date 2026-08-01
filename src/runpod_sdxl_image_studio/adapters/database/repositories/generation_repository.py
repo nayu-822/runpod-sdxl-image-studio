@@ -886,6 +886,10 @@ def _generation_domain(row: GenerationModel) -> Generation:
             user_note=row.user_note,
             error_code=row.error_code,
             error_summary=row.error_summary,
+            retry_of_generation_id=(
+                UUID(row.retry_of_generation_id) if row.retry_of_generation_id is not None else None
+            ),
+            retry_attempt=row.retry_attempt,
             created_at=_utc(row.created_at) or datetime.now(UTC),
             started_at=_utc(row.started_at),
             completed_at=_utc(row.completed_at),
@@ -926,6 +930,11 @@ def _job_domain(row: GenerationJobModel) -> GenerationJob:
         error_code=row.error_code,
         error_summary=row.error_summary,
         error_message=row.error_summary,
+        worker_id=row.worker_id,
+        claimed_at=_utc(row.claimed_at),
+        lease_expires_at=_utc(row.lease_expires_at),
+        cancel_requested_at=_utc(row.cancel_requested_at),
+        cancelled_at=_utc(row.cancelled_at),
     )
 
 

@@ -1,5 +1,12 @@
 # RunPod SDXL Image Studio 開発計画
 
+## Phase 4 status
+
+Phase 4 persistent FIFO queue, single-worker lease runtime, batch seed strategies, cancellation,
+retry, failed-only batch retry, startup reconciliation, queue filters, settings, migration 0004,
+and automated tests are implemented. Queue reorder, multiple workers/GPUs, automatic retry,
+upscale, image metadata import, and cloud synchronization remain outside this phase.
+
 ## 方針
 
 機能を小さなフェーズに分け、各フェーズで動作確認可能な状態を維持する。最初から高度なワークフロー編集機能を作らず、固定された安全な workflow template を利用して、日常的な画像生成操作を先に完成させる。

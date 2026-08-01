@@ -26,3 +26,8 @@ class GenerationJob:
     error_summary: str | None = None
     error_message: str | None = None
     stored_image: StoredImage | None = None
+    worker_id: str | None = None
+    claimed_at: datetime | None = None
+    lease_expires_at: datetime | None = None
+    cancel_requested_at: datetime | None = None
+    cancelled_at: datetime | None = None

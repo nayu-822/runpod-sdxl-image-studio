@@ -18,6 +18,10 @@ from runpod_sdxl_image_studio.domain.generation import (
 )
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
 from runpod_sdxl_image_studio.services.comfyui_service import ComfyUIService
+from runpod_sdxl_image_studio.services.generation_queue_service import (
+    GenerationQueueService,
+    GenerationQueueServiceError,
+)
 from runpod_sdxl_image_studio.services.generation_service import GenerationService
 from runpod_sdxl_image_studio.services.lora_catalog_service import (
     LoraCatalogError,
@@ -74,6 +78,13 @@ class GenerationTabComponents:
     steps: gr.Number
     cfg_scale: gr.Number
     generate_button: gr.Button
+    batch_count: gr.Number
+    batch_seed_strategy: gr.Radio
+    batch_start_seed: gr.Number
+    batch_seed_step: gr.Number
+    batch_name: gr.Textbox
+    batch_enqueue_button: gr.Button
+    batch_message: gr.Markdown
     progress: gr.Markdown
     result_image: gr.Image
     result_details: gr.Markdown
@@ -156,7 +167,21 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
     lora_list = gr.Markdown("**LoRA list:** unavailable")
     lora_editor = build_lora_editor(max_loras)
     lora_category_filter = gr.Dropdown([], label="LoRAカテゴリ", interactive=False)
-    generate_button = gr.Button("Generate", variant="primary", interactive=False, size="lg")
+    generate_button = gr.Button(
+        "生成をキューへ追加", variant="primary", interactive=False, size="lg"
+    )
+    with gr.Accordion("バッチ生成", open=False):
+        batch_count = gr.Number(value=2, precision=0, label="生成枚数")
+        batch_seed_strategy = gr.Radio(
+            [("ランダム", "random"), ("連番", "sequential")],
+            value="random",
+            label="seed方式",
+        )
+        batch_start_seed = gr.Number(value=0, precision=0, label="開始seed")
+        batch_seed_step = gr.Number(value=1, precision=0, label="seed増分")
+        batch_name = gr.Textbox(value="Batch", label="バッチ名", max_length=200)
+        batch_enqueue_button = gr.Button("バッチをキューへ追加", variant="primary")
+        batch_message = gr.Markdown("")
     progress = gr.Markdown("")
     result_image = gr.Image(label="Generated image", type="filepath")
     result_details = gr.Markdown("")
@@ -181,6 +206,13 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
         steps=steps,
         cfg_scale=cfg_scale,
         generate_button=generate_button,
+        batch_count=batch_count,
+        batch_seed_strategy=batch_seed_strategy,
+        batch_start_seed=batch_start_seed,
+        batch_seed_step=batch_seed_step,
+        batch_name=batch_name,
+        batch_enqueue_button=batch_enqueue_button,
+        batch_message=batch_message,
         progress=progress,
         result_image=result_image,
         result_details=result_details,
@@ -403,6 +435,187 @@ def make_generate_handler(
     return handler
 
 
+def make_enqueue_handler(
+    service: GenerationQueueService,
+    max_loras: int,
+) -> Callable[..., Awaitable[tuple[object, ...]]]:
+    """Create the non-blocking UI boundary that only persists queue work."""
+
+    async def handler(
+        checkpoint: str | None,
+        positive_prompt: str,
+        negative_prompt: str,
+        size_preset: str,
+        width: float | int,
+        height: float | int,
+        seed_mode: str,
+        seed: float | int,
+        steps: float | int,
+        cfg_scale: float | int,
+        sampler: str | None,
+        scheduler: str | None,
+        vae: str | None = None,
+        lora_state: object = None,
+        restored_from_generation_id: str | None = None,
+        regeneration_valid: bool = False,
+        regeneration_requested: bool = False,
+    ) -> tuple[object, ...]:
+        del size_preset
+        try:
+            loras = lora_settings_from_state(lora_state, max_loras=max_loras)
+            generation_settings = GenerationSettings(
+                positive_prompt=positive_prompt or "",
+                negative_prompt=negative_prompt or "",
+                checkpoint_name=checkpoint or "",
+                sampler_name=sampler or "",
+                scheduler_name=scheduler or "",
+                vae_name=vae,
+                loras=loras,
+                width=int(width),
+                height=int(height),
+                seed=-1 if seed_mode == "Random" else int(seed),
+                steps=int(steps),
+                cfg_scale=float(cfg_scale),
+            )
+        except (TypeError, ValueError, ValidationError):
+            return (
+                gr.Button("生成をキューへ追加", interactive=True),
+                "",
+                None,
+                "入力値を確認してください。",
+                False,
+            )
+        if regeneration_requested and not restored_from_generation_id:
+            return (
+                gr.Button("生成をキューへ追加", interactive=True),
+                "",
+                None,
+                "履歴設定の復元に失敗したため、キューへ追加しませんでした。",
+                False,
+            )
+        if regeneration_requested and not regeneration_valid:
+            return (
+                gr.Button("生成をキューへ追加", interactive=True),
+                "",
+                None,
+                "利用できない設定があるため、キューへ追加しませんでした。",
+                False,
+            )
+        if seed_mode == "Previous seed" and not restored_from_generation_id:
+            return (
+                gr.Button("生成をキューへ追加", interactive=True),
+                "",
+                None,
+                "復元元Generationがありません。",
+                False,
+            )
+        parent_id: UUID | None = None
+        if restored_from_generation_id:
+            try:
+                parent_id = UUID(restored_from_generation_id)
+            except ValueError:
+                return (
+                    gr.Button("生成をキューへ追加", interactive=True),
+                    "",
+                    None,
+                    "復元元Generationが不正です。",
+                    False,
+                )
+        try:
+            queued = service.enqueue(
+                generation_settings,
+                parent_generation_id=parent_id,
+            )
+        except GenerationQueueServiceError as exc:
+            return (
+                gr.Button("生成をキューへ追加", interactive=True),
+                "",
+                None,
+                str(exc),
+                False,
+            )
+        details = (
+            f"Queued Generation ID: `{queued.item.generation.id}`\n"
+            f"Queue position: `{queued.queue_position}`\n"
+            f"Seed: `{queued.item.generation.settings_snapshot.seed}`"
+        )
+        return (
+            gr.Button("生成をキューへ追加", interactive=True),
+            "Queued",
+            None,
+            details,
+            False,
+        )
+
+    return handler
+
+
+def make_batch_enqueue_handler(
+    service: GenerationQueueService,
+    max_loras: int,
+) -> Callable[..., Awaitable[tuple[object, ...]]]:
+    """Create the UI boundary for one atomic batch enqueue."""
+
+    async def handler(
+        checkpoint: str | None,
+        positive_prompt: str,
+        negative_prompt: str,
+        width: float | int,
+        height: float | int,
+        seed_mode: str,
+        seed: float | int,
+        steps: float | int,
+        cfg_scale: float | int,
+        sampler: str | None,
+        scheduler: str | None,
+        vae: str | None,
+        lora_state: object,
+        count: float | int,
+        strategy: str,
+        start_seed: float | int,
+        seed_step: float | int,
+        name: str,
+    ) -> tuple[object, ...]:
+        try:
+            settings = GenerationSettings(
+                positive_prompt=positive_prompt or "",
+                negative_prompt=negative_prompt or "",
+                checkpoint_name=checkpoint or "",
+                sampler_name=sampler or "",
+                scheduler_name=scheduler or "",
+                vae_name=vae,
+                loras=lora_settings_from_state(lora_state, max_loras=max_loras),
+                width=int(width),
+                height=int(height),
+                seed=-1 if seed_mode == "Random" else int(seed),
+                steps=int(steps),
+                cfg_scale=float(cfg_scale),
+            )
+            result = service.enqueue_batch(
+                settings,
+                count=int(count),
+                seed_strategy=strategy,
+                start_seed=int(start_seed) if start_seed is not None else None,
+                seed_step=int(seed_step),
+                name=name or "Batch",
+            )
+        except (TypeError, ValueError, ValidationError, GenerationQueueServiceError) as exc:
+            return (
+                gr.Button("バッチをキューへ追加", interactive=True),
+                "",
+                str(exc)
+                if isinstance(exc, GenerationQueueServiceError)
+                else "入力値を確認してください。",
+            )
+        return (
+            gr.Button("バッチをキューへ追加", interactive=True),
+            "Queued",
+            f"Batch `{result.batch.id}` を{len(result.items)}件キューへ追加しました。",
+        )
+
+    return handler
+
+
 def _legacy_disable_generate_button() -> gr.Button:
     """Disable the action before the queued generation handler starts."""
 
@@ -428,6 +641,12 @@ def disable_generate_button() -> gr.Button:
         value="\u751f\u6210\u4e2d...",
         interactive=False,
     )
+
+
+def disable_enqueue_button() -> gr.Button:
+    """Disable the queue button while the atomic enqueue request is running."""
+
+    return gr.Button(value="キューへ追加中...", interactive=False)
 
 
 def report_gradio_progress(progress: gr.Progress, update: GenerationProgress) -> None:

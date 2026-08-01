@@ -52,15 +52,18 @@ def is_valid_status_transition(current: GenerationStatus, target: GenerationStat
         GenerationStatus.PENDING: {
             GenerationStatus.QUEUED,
             GenerationStatus.FAILED,
+            GenerationStatus.CANCELLED,
         },
         GenerationStatus.QUEUED: {
             GenerationStatus.RUNNING,
             GenerationStatus.COMPLETED,
             GenerationStatus.FAILED,
+            GenerationStatus.CANCELLED,
         },
         GenerationStatus.RUNNING: {
             GenerationStatus.COMPLETED,
             GenerationStatus.FAILED,
+            GenerationStatus.CANCELLED,
         },
     }
     return target in allowed.get(current, set())
@@ -97,6 +100,8 @@ class Generation:
     started_at: datetime | None
     completed_at: datetime | None
     updated_at: datetime
+    retry_of_generation_id: UUID | None = None
+    retry_attempt: int = 0
 
 
 @dataclass(frozen=True)

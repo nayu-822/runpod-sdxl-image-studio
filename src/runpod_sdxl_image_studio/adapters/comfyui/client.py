@@ -121,6 +121,12 @@ class ComfyUIClient:
         response_payload = await self._post_json("/prompt", request_payload)
         return parse_queued_prompt(response_payload)
 
+    async def interrupt_prompt(self, prompt_id: str) -> None:
+        """Request interruption of the single active ComfyUI prompt."""
+
+        safe_prompt_id = _validate_identifier(prompt_id, "prompt id")
+        await self._post_json("/interrupt", {"prompt_id": safe_prompt_id})
+
     async def get_prompt_history(self, prompt_id: str) -> PromptHistory:
         """Fetch and parse one prompt's history entry."""
 

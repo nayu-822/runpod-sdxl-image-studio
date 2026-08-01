@@ -1,5 +1,24 @@
 # RunPod SDXL Image Studio
 
+## Phase 4: Persistent generation queue
+
+Phase 4 adds a SQLite-backed FIFO dispatch queue and a single process worker. The generation form
+only persists a validated `Generation`/`GenerationJob` pair and queue entry; the worker performs
+the ComfyUI call independently of the browser session.
+
+- One-item enqueue and atomic batch enqueue are supported.
+- Batch seeds support random and sequential strategies with explicit `start_seed` and `seed_step`.
+- Pending, queued, and running jobs can be cancelled; failed or cancelled jobs retry as new
+  generations linked by `retry_of_generation_id` and `retry_attempt`.
+- Failed-only batch retry creates a new batch and preserves each source snapshot.
+- Queue rows include FIFO sequence, worker lease, heartbeat, cancellation request, status filter,
+  and optional Batch ID filter.
+- Startup reconciliation never resubmits a persisted ComfyUI prompt. Missing or unrecoverable
+  prompt state is marked failed after `reconciliation_grace_seconds`.
+
+Queue reorder, multi-worker or multi-GPU execution, automatic retry, upscale, image import, and
+cloud synchronization are intentionally outside Phase 4.
+
 ## フェーズ3A: 生成履歴・スナップショット・再生成
 
 フェーズ3Aでは、SQLite による `Generation`、`GenerationJob`、
