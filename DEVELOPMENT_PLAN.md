@@ -397,3 +397,20 @@ prompt ID の保存失敗時は自動再送信せず、失敗状態の保存自�
 フェーズ3Bには、高度な履歴検索（モデル、LoRA、seed、prompt、解像度、種別/状態の組み合わせ）、
 プリセット、プリセットのスキーマ移行、プロンプト差分、最近使った設定へのショートカット、
 seed コピー用ヘルパー、高度な派生ツリー UI を残しています。
+
+## フェーズ3A保守性改善の完了
+
+永続化Repositoryの自動補完を削除し、永続化を使わない構成または8 Repositoryを明示した構成だけを
+GenerationServiceが受け付けるようにしました。Repository群は`GenerationPersistenceRepositories`へまとめ、
+本番のcomposition rootから型付きで注入します。Start/Progressを含む原子的な責務は個別Repositoryに保持します。
+
+## フェーズ3Bの完了状況
+
+高度な履歴検索、検索用非正規化インデックス、Generation/Prompt/LoRA Preset、schema version 1のPayload、
+最近使った設定、実使用seedのコピー用ヘルパー、親Generationとの差分、スマートフォン向け検索Accordionを
+実装しました。Phase 3の完了条件である履歴からの設定復元、再生成と派生生成の区別、条件検索、Presetからの
+設定復元、親Generationとの差分確認を満たします。
+
+Phase 4へは、生成キュー、複数ジョブ、キャンセル、再試行、失敗のみ再実行、バッチ生成、stale jobの高度な
+reconciliationを残します。アップスケール実処理、Google Drive同期、外部metadata import、複数ユーザー対応も
+従来計画どおり後続フェーズです。

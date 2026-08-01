@@ -21,7 +21,6 @@ from runpod_sdxl_image_studio.adapters.comfyui.models import PromptHistory
 from runpod_sdxl_image_studio.adapters.comfyui.websocket_client import ComfyUIWebSocketClient
 from runpod_sdxl_image_studio.adapters.comfyui.workflow_adapter import WorkflowAdapter
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_progress_repository import (
-    GenerationProgressRepository,
     GenerationProgressRepositoryProtocol,
 )
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_repository import (
@@ -34,7 +33,6 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_reposito
     GenerationRepositoryProtocol,
 )
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_start_repository import (
-    GenerationStartRepository,
     GenerationStartRepositoryProtocol,
 )
 from runpod_sdxl_image_studio.adapters.storage.exceptions import StorageError
@@ -69,13 +67,16 @@ from runpod_sdxl_image_studio.services.generation_errors import (
     persistence_error_code,
     persistence_error_message,
 )
+from runpod_sdxl_image_studio.services.generation_persistence import (
+    GenerationPersistenceRepositories,
+)
 
 logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[GenerationProgress], None]
 
 
 class HistoryTimeoutError(ComfyUIPromptError):
-    """History polling reached its configured attempt limit."""
+    """履歴のポーリングが設定された試行回数に達した。"""
 
 
 class CapabilitiesProvider(Protocol):
@@ -87,7 +88,7 @@ class LoraUsageRecorder(Protocol):
 
 
 class GenerationService:
-    """Coordinate validation, queueing, monitoring, recovery, and local storage."""
+    """検証、生成監視、復旧、ローカル保存を調整するApplication Service。"""
 
     def __init__(
         self,
@@ -109,6 +110,7 @@ class GenerationService:
         failure_repository: GenerationFailureRepositoryProtocol | None = None,
         start_repository: GenerationStartRepositoryProtocol | None = None,
         progress_repository: GenerationProgressRepositoryProtocol | None = None,
+        persistence: GenerationPersistenceRepositories | None = None,
         thumbnail_storage: HistoryThumbnailStorage | None = None,
         metadata_storage: GenerationMetadataStorage | None = None,
     ) -> None:
@@ -121,41 +123,48 @@ class GenerationService:
         self._lora_catalog_service = lora_catalog_service
         self._sleep = sleep
         self._id_factory = id_factory
-        self._generation_repository = generation_repository
-        self._artifact_repository = artifact_repository
-        self._completion_repository = completion_repository
-        self._job_repository = job_repository
-        self._queue_repository = queue_repository
-        self._failure_repository = failure_repository
-        legacy_repositories = (
+        individual_repositories = (
             generation_repository,
             job_repository,
             artifact_repository,
+            start_repository,
             queue_repository,
+            progress_repository,
             completion_repository,
             failure_repository,
         )
-        all_repositories = (*legacy_repositories, start_repository, progress_repository)
+        if persistence is not None and any(
+            repository is not None for repository in individual_repositories
+        ):
+            raise ValueError("persistence cannot be combined with individual repositories")
+        if persistence is None and any(
+            repository is not None for repository in individual_repositories
+        ):
+            if not all(repository is not None for repository in individual_repositories):
+                raise ValueError("generation persistence repositories must be configured together")
+            persistence = GenerationPersistenceRepositories(
+                generation=generation_repository,  # type: ignore[arg-type]
+                job=job_repository,  # type: ignore[arg-type]
+                artifact=artifact_repository,  # type: ignore[arg-type]
+                start=start_repository,  # type: ignore[arg-type]
+                queue=queue_repository,  # type: ignore[arg-type]
+                progress=progress_repository,  # type: ignore[arg-type]
+                completion=completion_repository,  # type: ignore[arg-type]
+                failure=failure_repository,  # type: ignore[arg-type]
+            )
+        self._generation_repository = persistence.generation if persistence else None
+        self._job_repository = persistence.job if persistence else None
+        self._artifact_repository = persistence.artifact if persistence else None
+        self._queue_repository = persistence.queue if persistence else None
+        self._progress_repository = persistence.progress if persistence else None
+        self._completion_repository = persistence.completion if persistence else None
+        self._failure_repository = persistence.failure if persistence else None
+        all_repositories = individual_repositories
         if any(repository is not None for repository in all_repositories) and any(
             repository is None for repository in all_repositories
         ):
-            # 既存のテスト用構成（旧6 Repositoryのみ）は、新しい原子的 Repositoryへ接続する。
-            if (
-                all(repository is not None for repository in legacy_repositories)
-                and start_repository is None
-                and progress_repository is None
-            ):
-                session_factory = getattr(generation_repository, "_session_factory", None)
-                if session_factory is None:
-                    raise ValueError(
-                        "generation persistence repositories must be configured together"
-                    )
-                start_repository = GenerationStartRepository(session_factory)
-                progress_repository = GenerationProgressRepository(session_factory)
-            else:
-                raise ValueError("generation persistence repositories must be configured together")
-        self._start_repository = start_repository
-        self._progress_repository = progress_repository
+            raise ValueError("generation persistence repositories must be configured together")
+        self._start_repository = persistence.start if persistence else None
         self._thumbnail_storage = thumbnail_storage
         self._metadata_storage = metadata_storage
         self._jobs: dict[UUID, GenerationJob] = {}

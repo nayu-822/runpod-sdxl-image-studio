@@ -23,7 +23,13 @@ from runpod_sdxl_image_studio.adapters.database.engine import (
     create_session_factory,
 )
 from runpod_sdxl_image_studio.adapters.database.repositories import (
+    generation_progress_repository as progress_module,
+)
+from runpod_sdxl_image_studio.adapters.database.repositories import (
     generation_repository as repository_module,
+)
+from runpod_sdxl_image_studio.adapters.database.repositories import (
+    generation_start_repository as start_module,
 )
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_repository import (
     GenerationArtifactRepository,
@@ -617,6 +623,10 @@ async def test_generation_service_persists_pending_failure_before_prompt(tmp_pat
         failure_repository=repository_module.GenerationFailureRepository(
             repository._session_factory
         ),
+        start_repository=start_module.GenerationStartRepository(repository._session_factory),
+        progress_repository=progress_module.GenerationProgressRepository(
+            repository._session_factory
+        ),
     )
     result = await service.generate(_settings())
 
@@ -690,6 +700,10 @@ async def test_generation_service_persists_artifacts_and_snapshot(tmp_path: Path
         job_repository=jobs,
         queue_repository=repository_module.GenerationQueueRepository(repository._session_factory),
         failure_repository=repository_module.GenerationFailureRepository(
+            repository._session_factory
+        ),
+        start_repository=start_module.GenerationStartRepository(repository._session_factory),
+        progress_repository=progress_module.GenerationProgressRepository(
             repository._session_factory
         ),
         thumbnail_storage=HistoryThumbnailStorage(settings),
@@ -782,6 +796,10 @@ async def test_prompt_persistence_failure_stops_monitoring_without_resubmitting(
         failure_repository=repository_module.GenerationFailureRepository(
             repository._session_factory
         ),
+        start_repository=start_module.GenerationStartRepository(repository._session_factory),
+        progress_repository=progress_module.GenerationProgressRepository(
+            repository._session_factory
+        ),
     )
     result = await service.generate(_settings())
 
@@ -857,6 +875,10 @@ def test_failure_repository_error_is_wrapped_without_exposing_low_level_details(
         job_repository=jobs,
         queue_repository=repository_module.GenerationQueueRepository(repository._session_factory),
         failure_repository=FailingFailureRepository(),  # type: ignore[arg-type]
+        start_repository=start_module.GenerationStartRepository(repository._session_factory),
+        progress_repository=progress_module.GenerationProgressRepository(
+            repository._session_factory
+        ),
     )
     generation = repository.create_pending(GenerationSettingsSnapshot.from_settings(_settings()))
     job = jobs.create(GenerationJob(generation.id, GenerationStatus.PENDING))
@@ -912,6 +934,10 @@ async def test_required_completion_failure_keeps_image_but_never_returns_success
         failure_repository=repository_module.GenerationFailureRepository(
             repository._session_factory
         ),
+        start_repository=start_module.GenerationStartRepository(repository._session_factory),
+        progress_repository=progress_module.GenerationProgressRepository(
+            repository._session_factory
+        ),
     )
     job = GenerationJob(
         generation_id=generation.id,
@@ -964,6 +990,10 @@ async def test_optional_thumbnail_failure_does_not_fail_completed_generation(
         job_repository=jobs,
         queue_repository=repository_module.GenerationQueueRepository(repository._session_factory),
         failure_repository=repository_module.GenerationFailureRepository(
+            repository._session_factory
+        ),
+        start_repository=start_module.GenerationStartRepository(repository._session_factory),
+        progress_repository=progress_module.GenerationProgressRepository(
             repository._session_factory
         ),
         thumbnail_storage=FailingThumbnail(),  # type: ignore[arg-type]
@@ -1078,6 +1108,10 @@ async def test_recovery_reconciles_existing_primary_artifact_idempotently(tmp_pa
         job_repository=jobs,
         queue_repository=repository_module.GenerationQueueRepository(repository._session_factory),
         failure_repository=repository_module.GenerationFailureRepository(
+            repository._session_factory
+        ),
+        start_repository=start_module.GenerationStartRepository(repository._session_factory),
+        progress_repository=progress_module.GenerationProgressRepository(
             repository._session_factory
         ),
     )

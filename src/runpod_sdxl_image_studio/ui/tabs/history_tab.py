@@ -4,17 +4,25 @@ from __future__ import annotations
 
 import html
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from datetime import date
+from dataclasses import dataclass, replace
+from datetime import UTC, date, datetime, time, timedelta
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import gradio as gr
 
 from runpod_sdxl_image_studio.domain.generation import GenerationKind, GenerationStatus
+from runpod_sdxl_image_studio.domain.generation_diff import GenerationDiff, PromptTokenChange
 from runpod_sdxl_image_studio.domain.generation_history import (
     GenerationDetailView,
-    GenerationHistoryFilter,
     GenerationHistoryItem,
+    GenerationHistoryQuery,
+    GenerationHistorySort,
+    LoraSearchMode,
+)
+from runpod_sdxl_image_studio.services.generation_diff_service import (
+    GenerationDiffError,
+    GenerationDiffService,
 )
 from runpod_sdxl_image_studio.services.generation_history_service import (
     GenerationHistoryError,
@@ -50,6 +58,20 @@ class HistoryTabComponents:
     restore_button: gr.Button
     regenerate_button: gr.Button
     message: gr.Markdown
+    search_text: gr.Textbox
+    date_from_search: gr.Textbox
+    date_to_search: gr.Textbox
+    checkpoint_search: gr.Textbox
+    vae_search: gr.Textbox
+    lora_search: gr.Textbox
+    lora_search_mode: gr.Dropdown
+    seed_search: gr.Number
+    width_search: gr.Number
+    height_search: gr.Number
+    error_code_search: gr.Textbox
+    sort_search: gr.Dropdown
+    diff_button: gr.Button
+    diff_view: gr.Markdown
 
 
 def begin_regeneration() -> tuple[gr.Button, bool]:
@@ -66,6 +88,41 @@ def enable_regeneration_button() -> gr.Button:
 
 def build_history_tab() -> HistoryTabComponents:
     gr.Markdown("## 生成履歴")
+    with gr.Accordion("高度な履歴検索", open=False):
+        search_text = gr.Textbox(label="検索テキスト", lines=2, max_lines=4, max_length=500)
+        with gr.Row():
+            date_from_search = gr.Textbox(label="開始日（YYYY-MM-DD）")
+            date_to_search = gr.Textbox(label="終了日（YYYY-MM-DD）")
+        with gr.Row():
+            checkpoint_search = gr.Textbox(label="checkpoint")
+            vae_search = gr.Textbox(label="VAE")
+        with gr.Row():
+            lora_search = gr.Textbox(label="LoRA（カンマ区切り）")
+            lora_search_mode = gr.Dropdown(
+                [
+                    ("いずれかを含む", LoraSearchMode.ANY.value),
+                    ("すべてを含む", LoraSearchMode.ALL.value),
+                ],
+                value=LoraSearchMode.ANY.value,
+                label="LoRA検索方式",
+            )
+        with gr.Row():
+            seed_search = gr.Number(label="seed", precision=0)
+            width_search = gr.Number(label="幅", precision=0)
+            height_search = gr.Number(label="高さ", precision=0)
+        error_code_search = gr.Textbox(label="error code")
+        sort_search = gr.Dropdown(
+            [
+                ("新しい順", GenerationHistorySort.NEWEST.value),
+                ("古い順", GenerationHistorySort.OLDEST.value),
+                ("seed昇順", GenerationHistorySort.SEED_ASC.value),
+                ("seed降順", GenerationHistorySort.SEED_DESC.value),
+                ("解像度が大きい順", GenerationHistorySort.RESOLUTION_DESC.value),
+                ("最近完了した順", GenerationHistorySort.RECENTLY_COMPLETED.value),
+            ],
+            value=GenerationHistorySort.NEWEST.value,
+            label="並び順",
+        )
     with gr.Row():
         date_filter = gr.Textbox(label="日付 (YYYY-MM-DD)", placeholder="2026-07-26")
         status_filter = gr.Dropdown(
@@ -107,6 +164,9 @@ def build_history_tab() -> HistoryTabComponents:
         restore_button = gr.Button("設定を生成画面へ復元")
         regenerate_button = gr.Button("同条件で再生成")
     message = gr.Markdown("")
+    with gr.Row():
+        diff_button = gr.Button("親Generationとの差分")
+        diff_view = gr.Markdown("")
     return HistoryTabComponents(
         refresh_button,
         page_state,
@@ -128,7 +188,70 @@ def build_history_tab() -> HistoryTabComponents:
         restore_button,
         regenerate_button,
         message,
+        search_text,
+        date_from_search,
+        date_to_search,
+        checkpoint_search,
+        vae_search,
+        lora_search,
+        lora_search_mode,
+        seed_search,
+        width_search,
+        height_search,
+        error_code_search,
+        sort_search,
+        diff_button,
+        diff_view,
     )
+
+
+def build_advanced_history_query(
+    text: str | None = None,
+    date_from_text: str | None = None,
+    date_to_text: str | None = None,
+    checkpoint: str | None = None,
+    vae: str | None = None,
+    loras: str | None = None,
+    lora_mode: str | None = None,
+    seed: float | int | None = None,
+    width: float | int | None = None,
+    height: float | int | None = None,
+    error_code: str | None = None,
+    sort: str | None = None,
+) -> GenerationHistoryQuery:
+    """UI入力を型付き検索条件へ変換する。"""
+
+    def integer(value: float | int | None) -> int | None:
+        return int(value) if value is not None else None
+
+    return GenerationHistoryQuery(
+        text=text,
+        date_from=_tokyo_date_start(date_from_text),
+        date_to=_tokyo_date_end(date_to_text),
+        checkpoint_names=(checkpoint,) if checkpoint else (),
+        vae_names=(vae,) if vae else (),
+        lora_names=tuple(value.strip() for value in (loras or "").split(",") if value.strip()),
+        lora_search_mode=LoraSearchMode(lora_mode or LoraSearchMode.ANY.value),
+        seed=integer(seed),
+        width=integer(width),
+        height=integer(height),
+        error_codes=(error_code,) if error_code else (),
+        sort=GenerationHistorySort(sort or GenerationHistorySort.NEWEST.value),
+    )
+
+
+def _tokyo_date_start(value: str | None) -> datetime | None:
+    if not value or not value.strip():
+        return None
+    local = datetime.combine(date.fromisoformat(value.strip()), time.min, ZoneInfo("Asia/Tokyo"))
+    return local.astimezone(UTC)
+
+
+def _tokyo_date_end(value: str | None) -> datetime | None:
+    if not value or not value.strip():
+        return None
+    local = datetime.combine(date.fromisoformat(value.strip()), time.min, ZoneInfo("Asia/Tokyo"))
+    return (local + timedelta(days=1)).astimezone(UTC)
 
 
 def make_history_refresh_handler(
@@ -141,14 +264,41 @@ def make_history_refresh_handler(
         status: str | None = None,
         kind: str | None = None,
         favorite: str | None = None,
+        search_text: str | None = None,
+        date_from_text: str | None = None,
+        date_to_text: str | None = None,
+        checkpoint: str | None = None,
+        vae: str | None = None,
+        loras: str | None = None,
+        lora_mode: str | None = None,
+        seed: float | int | None = None,
+        width: float | int | None = None,
+        height: float | int | None = None,
+        error_code: str | None = None,
+        sort: str | None = None,
     ) -> tuple[object, ...]:
         if recovery_service is not None:
             await recovery_service.recover()
         try:
             normalized_page = max(1, int(page))
             selected_date = date.fromisoformat(date_text) if date_text.strip() else None
+            advanced_query = build_advanced_history_query(
+                search_text,
+                date_from_text,
+                date_to_text,
+                checkpoint,
+                vae,
+                loras,
+                lora_mode,
+                seed,
+                width,
+                height,
+                error_code,
+                sort,
+            )
             result = service.list_history(
-                GenerationHistoryFilter(
+                replace(
+                    advanced_query,
                     date=selected_date,
                     status=GenerationStatus(status) if status else None,
                     kind=GenerationKind(kind) if kind else None,
@@ -190,6 +340,28 @@ def make_history_refresh_handler(
                 gr.skip(),
                 "",
             )
+
+    return handler
+
+
+def make_generation_diff_handler(
+    history_service: GenerationHistoryService,
+    diff_service: GenerationDiffService,
+) -> Callable[[str | None], str]:
+    """Render a safe parent-generation diff for the selected item."""
+
+    def handler(selected: str | None) -> str:
+        if not selected:
+            return "Generationを選択してください。"
+        try:
+            target = history_service.get_generation(UUID(selected))
+            if target.parent_generation_id is None:
+                return "親Generationがありません。"
+            source = history_service.get_generation(target.parent_generation_id)
+            diff = diff_service.compare(source, target)
+            return render_generation_diff(diff)
+        except (GenerationHistoryError, GenerationDiffError, ValueError) as exc:
+            return str(exc)
 
     return handler
 
@@ -425,3 +597,34 @@ def render_generation_detail(generation: GenerationDetailView) -> str:
     if generation.error_summary:
         values.append(f"error: {html.escape(generation.error_summary)}")
     return "\n\n".join(values)
+
+
+def render_generation_diff(diff: GenerationDiff) -> str:
+    """Render typed diff values as escaped Markdown text."""
+
+    def tokens(items: tuple[PromptTokenChange, ...]) -> str:
+        return (
+            ", ".join(
+                f"{html.escape(item.value)} ({html.escape(item.change_type.value)})"
+                for item in items
+            )
+            or "変更なし"
+        )
+
+    lines = [
+        f"### Prompt差分 `{html.escape(str(diff.source_generation_id))}` → "
+        f"`{html.escape(str(diff.target_generation_id))}`",
+        f"Positive: {tokens(diff.positive_prompt_changes)}",
+        f"Negative: {tokens(diff.negative_prompt_changes)}",
+    ]
+    for setting_change in diff.setting_changes:
+        lines.append(
+            f"- {html.escape(setting_change.field_name)}: "
+            f"`{html.escape(str(setting_change.before))}` → "
+            f"`{html.escape(str(setting_change.after))}`"
+        )
+    for lora_change in diff.lora_changes:
+        lines.append(
+            f"- LoRA {html.escape(lora_change.name)}: {html.escape(lora_change.change_type.value)}"
+        )
+    return "\n\n".join(lines)

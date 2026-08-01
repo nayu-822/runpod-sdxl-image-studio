@@ -20,7 +20,7 @@ from runpod_sdxl_image_studio.domain.generation import GenerationStatus
 
 
 class GenerationProgressRepositoryProtocol(Protocol):
-    """契約 for atomic running transitions and progress updates."""
+    """GenerationとJobの進捗を原子的に更新する契約。"""
 
     def update_progress(
         self,
@@ -36,7 +36,7 @@ class GenerationProgressRepositoryProtocol(Protocol):
 
 
 class GenerationProgressRepository(GenerationProgressRepositoryProtocol):
-    """Update the Generation/Job pair without leaving a partial transition."""
+    """GenerationとJobを部分的な状態遷移なしに更新するRepository。"""
 
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self._session_factory = session_factory

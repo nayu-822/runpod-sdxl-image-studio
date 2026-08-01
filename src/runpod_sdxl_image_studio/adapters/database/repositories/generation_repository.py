@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Protocol, cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
@@ -16,6 +16,7 @@ from runpod_sdxl_image_studio.adapters.database.engine import session_scope
 from runpod_sdxl_image_studio.adapters.database.models import (
     GenerationArtifactModel,
     GenerationJobModel,
+    GenerationLoraModel,
     GenerationModel,
 )
 from runpod_sdxl_image_studio.domain.generation import (
@@ -31,6 +32,10 @@ from runpod_sdxl_image_studio.domain.generation_artifact import (
 from runpod_sdxl_image_studio.domain.generation_history import (
     GenerationHistoryFilter,
     GenerationHistoryPage,
+    GenerationHistoryQuery,
+    GenerationHistorySort,
+    decode_history_cursor,
+    encode_history_cursor,
 )
 from runpod_sdxl_image_studio.domain.generation_snapshot import (
     GenerationSettingsSnapshot,
@@ -114,6 +119,13 @@ class GenerationRepository(GenerationRepositoryProtocol):
                     ),
                     settings_snapshot_json=snapshot.to_json(),
                     snapshot_schema_version=snapshot.schema_version,
+                    checkpoint_name=snapshot.checkpoint_name,
+                    vae_name=snapshot.vae_name,
+                    seed=snapshot.seed,
+                    width=snapshot.width,
+                    height=snapshot.height,
+                    positive_prompt_search=snapshot.positive_prompt,
+                    negative_prompt_search=snapshot.negative_prompt,
                     workflow_template_id=snapshot.workflow_template_id,
                     workflow_template_version=snapshot.workflow_template_version,
                     favorite=False,
@@ -121,6 +133,17 @@ class GenerationRepository(GenerationRepositoryProtocol):
                     updated_at=timestamp,
                 )
                 session.add(row)
+                session.flush()
+                session.add_all(
+                    GenerationLoraModel(
+                        generation_id=str(generation_id),
+                        lora_name=lora.name,
+                        order_index=lora.order,
+                        model_strength=lora.model_strength,
+                        clip_strength=lora.clip_strength,
+                    )
+                    for lora in snapshot.loras
+                )
                 session.flush()
                 return _generation_domain(row)
         except GenerationRepositoryError:
@@ -181,25 +204,40 @@ class GenerationRepository(GenerationRepositoryProtocol):
         limit = min(max(1, query.limit), 100)
         try:
             with session_scope(self._session_factory) as session:
+                normalized = _as_history_query(query)
                 statement = select(GenerationModel)
                 count_statement = select(func.count()).select_from(GenerationModel)
-                filters = _history_filters(query)
+                filters = _history_filters(normalized)
                 if filters:
                     statement = statement.where(*filters)
                     count_statement = count_statement.where(*filters)
+                cursor_values = decode_history_cursor(normalized.cursor)
+                if cursor_values is not None:
+                    try:
+                        cursor_filter = _cursor_filter(normalized.sort, cursor_values)
+                    except (TypeError, ValueError):
+                        cursor_filter = None
+                    if cursor_filter is not None:
+                        statement = statement.where(cursor_filter)
+                ordering = _history_ordering(normalized.sort)
                 rows = session.scalars(
-                    statement.order_by(GenerationModel.created_at.desc(), GenerationModel.id.desc())
-                    .offset(offset)
-                    .limit(limit)
+                    statement.order_by(*ordering).offset(offset).limit(limit)
                 ).all()
                 total = int(session.scalar(count_statement) or 0)
                 generations = tuple(_generation_domain(row) for row in rows)
+                next_cursor = None
+                if len(generations) == limit and generations:
+                    last = generations[-1]
+                    next_cursor = encode_history_cursor(
+                        normalized.sort, _sort_value(last, normalized.sort), str(last.id)
+                    )
                 return GenerationHistoryPage(
                     generations=generations,
                     page=offset // limit + 1,
                     page_size=limit,
                     total_count=total,
                     has_next=offset + len(generations) < total,
+                    next_cursor=next_cursor,
                 )
         except (SQLAlchemyError, SnapshotError) as exc:
             raise GenerationRepositoryError("generation history could not be read") from exc
@@ -908,19 +946,188 @@ def _job_domain(row: GenerationJobModel) -> GenerationJob:
     )
 
 
-def _history_filters(query: GenerationHistoryFilter) -> list[ColumnElement[bool]]:
+def _as_history_query(
+    query: GenerationHistoryFilter | GenerationHistoryQuery,
+) -> GenerationHistoryQuery:
+    if isinstance(query, GenerationHistoryQuery):
+        return query
+    return GenerationHistoryQuery(
+        date=query.date,
+        status=query.status,
+        favorite=query.favorite,
+        kind=query.kind,
+        offset=query.offset,
+        limit=query.limit,
+        start_utc=query.start_utc,
+        end_utc=query.end_utc,
+    )
+
+
+def _history_filters(query: GenerationHistoryQuery) -> list[ColumnElement[bool]]:
     filters: list[ColumnElement[bool]] = []
-    if query.status is not None:
-        filters.append(GenerationModel.status == query.status.value)
-    if query.favorite is not None:
-        filters.append(GenerationModel.favorite.is_(query.favorite))
-    if query.kind is not None:
-        filters.append(GenerationModel.kind == query.kind.value)
-    if query.start_utc is not None:
-        filters.append(GenerationModel.created_at >= _utc(query.start_utc))
-    if query.end_utc is not None:
-        filters.append(GenerationModel.created_at < _utc(query.end_utc))
+    statuses = query.statuses or ((query.status,) if query.status is not None else ())
+    kinds = query.kinds or ((query.kind,) if query.kind is not None else ())
+    if statuses:
+        filters.append(GenerationModel.status.in_([value.value for value in statuses]))
+    if query.favorite_only or query.favorite is True:
+        filters.append(GenerationModel.favorite.is_(True))
+    if query.favorite is False:
+        filters.append(GenerationModel.favorite.is_(False))
+    if kinds:
+        filters.append(GenerationModel.kind.in_([value.value for value in kinds]))
+    if query.checkpoint_names:
+        filters.append(GenerationModel.checkpoint_name.in_(query.checkpoint_names))
+    if query.vae_names:
+        filters.append(GenerationModel.vae_name.in_(query.vae_names))
+    if query.seed is not None:
+        filters.append(GenerationModel.seed == query.seed)
+    if query.width is not None:
+        filters.append(GenerationModel.width == query.width)
+    if query.height is not None:
+        filters.append(GenerationModel.height == query.height)
+    if query.error_codes:
+        filters.append(GenerationModel.error_code.in_(query.error_codes))
+    if query.parent_generation_id is not None:
+        filters.append(GenerationModel.parent_generation_id == str(query.parent_generation_id))
+    if query.lora_names:
+        if query.lora_search_mode.value == "all":
+            filters.extend(
+                cast(
+                    ColumnElement[bool],
+                    exists().where(
+                        and_(
+                            GenerationLoraModel.generation_id == GenerationModel.id,
+                            GenerationLoraModel.lora_name == lora_name,
+                        )
+                    ),
+                )
+                for lora_name in query.lora_names
+            )
+        else:
+            filters.append(
+                exists().where(
+                    and_(
+                        GenerationLoraModel.generation_id == GenerationModel.id,
+                        GenerationLoraModel.lora_name.in_(query.lora_names),
+                    )
+                )
+            )
+    if query.text is not None:
+        pattern = f"%{_escape_like(query.text.lower())}%"
+        text_columns = (
+            GenerationModel.positive_prompt_search,
+            GenerationModel.negative_prompt_search,
+            GenerationModel.user_note,
+            GenerationModel.checkpoint_name,
+            GenerationModel.vae_name,
+            GenerationModel.error_summary,
+        )
+        text_match: list[ColumnElement[bool]] = [
+            func.lower(column).like(pattern, escape="\\") for column in text_columns
+        ]
+        text_match.append(
+            cast(
+                ColumnElement[bool],
+                exists().where(
+                    and_(
+                        GenerationLoraModel.generation_id == GenerationModel.id,
+                        func.lower(GenerationLoraModel.lora_name).like(pattern, escape="\\"),
+                    )
+                ),
+            )
+        )
+        filters.append(or_(*text_match))
+    start_utc = query.date_from or query.start_utc
+    end_utc = query.date_to or query.end_utc
+    if start_utc is not None:
+        filters.append(GenerationModel.created_at >= _utc(start_utc))
+    if end_utc is not None:
+        filters.append(GenerationModel.created_at < _utc(end_utc))
     return filters
+
+
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _history_ordering(sort: GenerationHistorySort) -> tuple[ColumnElement[object], ...]:
+    if sort is GenerationHistorySort.OLDEST:
+        return cast(
+            tuple[ColumnElement[object], ...],
+            (GenerationModel.created_at.asc(), GenerationModel.id.asc()),
+        )
+    if sort is GenerationHistorySort.SEED_ASC:
+        return cast(
+            tuple[ColumnElement[object], ...],
+            (GenerationModel.seed.asc(), GenerationModel.id.asc()),
+        )
+    if sort is GenerationHistorySort.SEED_DESC:
+        return cast(
+            tuple[ColumnElement[object], ...],
+            (GenerationModel.seed.desc(), GenerationModel.id.desc()),
+        )
+    if sort is GenerationHistorySort.RESOLUTION_DESC:
+        return cast(
+            tuple[ColumnElement[object], ...],
+            ((GenerationModel.width * GenerationModel.height).desc(), GenerationModel.id.desc()),
+        )
+    if sort is GenerationHistorySort.RECENTLY_COMPLETED:
+        return cast(
+            tuple[ColumnElement[object], ...],
+            (GenerationModel.completed_at.desc(), GenerationModel.id.desc()),
+        )
+    return cast(
+        tuple[ColumnElement[object], ...],
+        (GenerationModel.created_at.desc(), GenerationModel.id.desc()),
+    )
+
+
+def _sort_value(generation: Generation, sort: GenerationHistorySort) -> str:
+    if sort is GenerationHistorySort.OLDEST or sort is GenerationHistorySort.NEWEST:
+        return generation.created_at.isoformat()
+    if sort in {GenerationHistorySort.SEED_ASC, GenerationHistorySort.SEED_DESC}:
+        return str(generation.settings_snapshot.seed)
+    if sort is GenerationHistorySort.RESOLUTION_DESC:
+        snapshot = generation.settings_snapshot
+        return str(snapshot.width * snapshot.height)
+    return (generation.completed_at or generation.created_at).isoformat()
+
+
+def _cursor_filter(sort: GenerationHistorySort, values: tuple[str, str]) -> ColumnElement[bool]:
+    sort_value, generation_id = values
+    if sort is GenerationHistorySort.OLDEST:
+        return or_(
+            GenerationModel.created_at > sort_value,
+            and_(GenerationModel.created_at == sort_value, GenerationModel.id > generation_id),
+        )
+    if sort is GenerationHistorySort.SEED_ASC:
+        return or_(
+            GenerationModel.seed > int(sort_value),
+            and_(GenerationModel.seed == int(sort_value), GenerationModel.id > generation_id),
+        )
+    if sort is GenerationHistorySort.SEED_DESC:
+        return or_(
+            GenerationModel.seed < int(sort_value),
+            and_(GenerationModel.seed == int(sort_value), GenerationModel.id < generation_id),
+        )
+    if sort is GenerationHistorySort.RESOLUTION_DESC:
+        resolution = int(sort_value)
+        return or_(
+            GenerationModel.width * GenerationModel.height < resolution,
+            and_(
+                GenerationModel.width * GenerationModel.height == resolution,
+                GenerationModel.id < generation_id,
+            ),
+        )
+    if sort is GenerationHistorySort.RECENTLY_COMPLETED:
+        return or_(
+            GenerationModel.completed_at < sort_value,
+            and_(GenerationModel.completed_at == sort_value, GenerationModel.id < generation_id),
+        )
+    return or_(
+        GenerationModel.created_at < sort_value,
+        and_(GenerationModel.created_at == sort_value, GenerationModel.id < generation_id),
+    )
 
 
 def _unsafe_relative_path(value: str) -> bool:

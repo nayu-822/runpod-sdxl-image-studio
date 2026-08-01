@@ -339,3 +339,34 @@ python -m runpod_sdxl_image_studio.app
 - 任意ワークフロー JSON、任意パス、任意コマンドを無検証で実行しない
 - モデル・LoRA・アップスケーラーの選択肢は許可されたディレクトリ内に限定する
 - 外部画像 metadata を信頼しない
+
+## Phase 3B: 履歴検索とPreset
+
+履歴タブでは、検索テキスト、checkpoint、VAE、LoRA、seed、解像度、status、Generation kind、
+お気に入り、error code、親Generation、日付範囲を組み合わせて検索できます。LoRAを複数指定した場合は
+「いずれかを含む（ANY）」または「すべてを含む（ALL）」を選べます。検索テキストはPositive/Negative
+Prompt、メモ、モデル名、LoRA名、エラー概要を対象にし、SQLのbind parameterとLIKE escapeを使用します。
+入力は大文字小文字を区別しない検索です。
+
+PresetにはGeneration、Prompt、LoRAの3種類があります。Payloadはschema version 1の型付きJSONとして
+保存し、Generation Presetはcheckpoint、VAE、解像度、サンプラー、seed mode、Prompt、LoRA強度を保持します。
+Prompt Presetは置換・先頭追加・末尾追加、LoRA Presetは置換・末尾追加を選べます。Presetを適用するだけでは
+生成は開始されません。checkpoint、VAE、LoRAが不足している場合は警告し、自動置換・自動削除は行いません。
+
+最近使ったcheckpoint、VAE、LoRA、PresetはDBへ件数制限付きで問い合わせます。履歴詳細ではsnapshotに保存された
+実使用seedをコピーでき、親Generationとの差分ではPromptの追加・削除・並び替えと、生成設定・LoRA強度を確認できます。
+PromptはHTMLとして解釈せず、差分表示時にescapeします。
+
+検索用のcheckpoint/VAE/seed/解像度カラムと`generation_loras`はsnapshotから同じトランザクションで作成される
+インデックスです。生成設定の復元には検索用データを使わず、常にsnapshotを使います。
+
+### Phase 3B DB migration
+
+```bash
+alembic upgrade head
+alembic downgrade -1
+alembic upgrade head
+```
+
+Presetと検索用インデックスはSQLiteの`data/database/image_studio.sqlite3`へ保存されます。Gradioは引き続き
+5系（`gradio>=5.0.0,<6.0.0`）を使用します。

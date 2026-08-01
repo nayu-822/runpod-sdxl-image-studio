@@ -49,6 +49,11 @@ class GenerationHistoryService:
     def to_item(self, generation: Generation) -> GenerationHistoryItem:
         return self._item(generation)
 
+    def get_generation(self, generation_id: UUID) -> Generation:
+        """Return a domain Generation for another application service."""
+
+        return self._get_generation(generation_id)
+
     def absolute_data_path(self, relative_path: str | None) -> Path | None:
         if relative_path is None:
             return None

@@ -89,6 +89,13 @@ class GenerationModel(Base):
     )
     settings_snapshot_json: Mapped[str] = mapped_column(Text, nullable=False)
     snapshot_schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    checkpoint_name: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    vae_name: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    seed: Mapped[int | None] = mapped_column(nullable=True)
+    width: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    height: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    positive_prompt_search: Mapped[str | None] = mapped_column(Text, nullable=True)
+    negative_prompt_search: Mapped[str | None] = mapped_column(Text, nullable=True)
     workflow_template_id: Mapped[str] = mapped_column(String(200), nullable=False)
     workflow_template_version: Mapped[str] = mapped_column(String(100), nullable=False)
     comfy_prompt_id: Mapped[str | None] = mapped_column(String(100), nullable=True, unique=True)
@@ -143,12 +150,53 @@ class GenerationJobModel(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class GenerationLoraModel(Base):
+    """検索用にsnapshotのLoRA指定を正規化した行。"""
+
+    __tablename__ = "generation_loras"
+    __table_args__ = (
+        UniqueConstraint("generation_id", "lora_name", name="uq_generation_lora_name"),
+    )
+
+    generation_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("generations.id", ondelete="CASCADE"), primary_key=True
+    )
+    lora_name: Mapped[str] = mapped_column(String(500), primary_key=True)
+    order_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    model_strength: Mapped[float] = mapped_column(nullable=False)
+    clip_strength: Mapped[float] = mapped_column(nullable=False)
+
+
+class PresetModel(Base):
+    """保存済みPresetのDB行。"""
+
+    __tablename__ = "presets"
+    __table_args__ = (UniqueConstraint("kind", "name", name="uq_preset_kind_name"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    description: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    favorite: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    usage_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 Index("ix_generations_created_at", GenerationModel.created_at)
 Index("ix_generations_status", GenerationModel.status)
 Index("ix_generations_kind", GenerationModel.kind)
 Index("ix_generations_favorite", GenerationModel.favorite)
 Index("ix_generations_parent", GenerationModel.parent_generation_id)
 Index("ix_generations_prompt", GenerationModel.comfy_prompt_id)
+Index("ix_generations_checkpoint", GenerationModel.checkpoint_name)
+Index("ix_generations_vae", GenerationModel.vae_name)
+Index("ix_generations_seed", GenerationModel.seed)
+Index("ix_generations_resolution", GenerationModel.width, GenerationModel.height)
+Index("ix_generation_loras_name", GenerationLoraModel.lora_name)
 Index("ix_generation_artifacts_generation", GenerationArtifactModel.generation_id)
 Index("ix_generation_jobs_generation", GenerationJobModel.generation_id)
 Index("ix_generation_jobs_prompt", GenerationJobModel.comfy_prompt_id)
@@ -157,6 +205,11 @@ Index("ix_lora_metadata_category", LoraMetadataModel.category)
 Index("ix_lora_metadata_favorite", LoraMetadataModel.is_favorite)
 Index("ix_lora_metadata_missing", LoraMetadataModel.is_missing)
 Index("ix_lora_metadata_last_used", LoraMetadataModel.last_used_at)
+Index("ix_presets_kind", PresetModel.kind)
+Index("ix_presets_name", PresetModel.name)
+Index("ix_presets_favorite", PresetModel.favorite)
+Index("ix_presets_last_used", PresetModel.last_used_at)
+Index("ix_presets_updated", PresetModel.updated_at)
 
 
 def _utc(value: datetime | None) -> datetime | None:

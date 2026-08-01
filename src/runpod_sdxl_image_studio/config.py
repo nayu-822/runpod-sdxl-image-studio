@@ -88,6 +88,23 @@ class Settings(BaseSettings):
         512, validation_alias="IMAGE_STUDIO_LORA_THUMBNAIL_MAX_EDGE"
     )
     history_page_size: int = Field(20, validation_alias="IMAGE_STUDIO_HISTORY_PAGE_SIZE")
+    history_search_page_size: int = Field(
+        20, validation_alias="IMAGE_STUDIO_HISTORY_SEARCH_PAGE_SIZE"
+    )
+    history_search_max_page_size: int = Field(
+        100, validation_alias="IMAGE_STUDIO_HISTORY_SEARCH_MAX_PAGE_SIZE"
+    )
+    history_search_max_text_length: int = Field(
+        500, validation_alias="IMAGE_STUDIO_HISTORY_SEARCH_MAX_TEXT_LENGTH"
+    )
+    preset_name_max_length: int = Field(100, validation_alias="IMAGE_STUDIO_PRESET_NAME_MAX_LENGTH")
+    preset_description_max_length: int = Field(
+        1000, validation_alias="IMAGE_STUDIO_PRESET_DESCRIPTION_MAX_LENGTH"
+    )
+    recent_settings_limit: int = Field(10, validation_alias="IMAGE_STUDIO_RECENT_SETTINGS_LIMIT")
+    prompt_diff_max_length: int = Field(
+        20_000, validation_alias="IMAGE_STUDIO_PROMPT_DIFF_MAX_LENGTH"
+    )
     history_thumbnail_max_edge: int = Field(
         384, validation_alias="IMAGE_STUDIO_HISTORY_THUMBNAIL_MAX_EDGE"
     )
@@ -135,6 +152,13 @@ class Settings(BaseSettings):
         "max_trigger_words",
         "max_compatible_models",
         "history_page_size",
+        "history_search_page_size",
+        "history_search_max_page_size",
+        "history_search_max_text_length",
+        "preset_name_max_length",
+        "preset_description_max_length",
+        "recent_settings_limit",
+        "prompt_diff_max_length",
         "history_thumbnail_max_edge",
         "stale_pending_seconds",
         "recovery_max_items",

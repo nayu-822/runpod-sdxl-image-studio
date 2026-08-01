@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from runpod_sdxl_image_studio.adapters.database.engine import session_scope
 from runpod_sdxl_image_studio.adapters.database.models import (
     GenerationJobModel,
+    GenerationLoraModel,
     GenerationModel,
 )
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_repository import (
@@ -26,7 +27,7 @@ from runpod_sdxl_image_studio.domain.job import GenerationJob
 
 
 class GenerationStartRepositoryProtocol(Protocol):
-    """契約 for atomically creating the pending pair."""
+    """GenerationとJobを原子的にpending作成する契約。"""
 
     def create_pending(
         self,
@@ -75,6 +76,13 @@ class GenerationStartRepository(GenerationStartRepositoryProtocol):
                     ),
                     settings_snapshot_json=validated_snapshot.to_json(),
                     snapshot_schema_version=validated_snapshot.schema_version,
+                    checkpoint_name=validated_snapshot.checkpoint_name,
+                    vae_name=validated_snapshot.vae_name,
+                    seed=validated_snapshot.seed,
+                    width=validated_snapshot.width,
+                    height=validated_snapshot.height,
+                    positive_prompt_search=validated_snapshot.positive_prompt,
+                    negative_prompt_search=validated_snapshot.negative_prompt,
                     workflow_template_id=validated_snapshot.workflow_template_id,
                     workflow_template_version=validated_snapshot.workflow_template_version,
                     favorite=False,
@@ -94,6 +102,7 @@ class GenerationStartRepository(GenerationStartRepositoryProtocol):
                 # 2回のflushは同じsession_scope内なので、後続失敗時は両方rollbackされる。
                 session.flush()
                 session.add(job_row)
+                session.add_all(_generation_lora_rows(validated_snapshot, generation_id))
                 session.flush()
                 return _generation_domain(generation_row), _job_domain(job_row)
         except GenerationRepositoryError:
@@ -104,6 +113,21 @@ class GenerationStartRepository(GenerationStartRepositoryProtocol):
 
 def _utc(value: datetime) -> datetime:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def _generation_lora_rows(
+    snapshot: GenerationSettingsSnapshot, generation_id: UUID
+) -> list[GenerationLoraModel]:
+    return [
+        GenerationLoraModel(
+            generation_id=str(generation_id),
+            lora_name=lora.name,
+            order_index=lora.order,
+            model_strength=lora.model_strength,
+            clip_strength=lora.clip_strength,
+        )
+        for lora in snapshot.loras
+    ]
 
 
 __all__ = [

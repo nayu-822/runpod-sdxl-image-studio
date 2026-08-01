@@ -28,6 +28,9 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_start_re
 from runpod_sdxl_image_studio.adapters.database.repositories.lora_metadata_repository import (
     LoraMetadataRepository,
 )
+from runpod_sdxl_image_studio.adapters.database.repositories.preset_repository import (
+    PresetRepository,
+)
 from runpod_sdxl_image_studio.adapters.storage.generation_metadata_storage import (
     GenerationMetadataStorage,
 )
@@ -39,8 +42,12 @@ from runpod_sdxl_image_studio.adapters.storage.lora_thumbnail_storage import Lor
 from runpod_sdxl_image_studio.config import Settings, get_settings
 from runpod_sdxl_image_studio.domain.lora_search import append_trigger_words
 from runpod_sdxl_image_studio.services.comfyui_service import ComfyUIService
+from runpod_sdxl_image_studio.services.generation_diff_service import GenerationDiffService
 from runpod_sdxl_image_studio.services.generation_history_service import (
     GenerationHistoryService,
+)
+from runpod_sdxl_image_studio.services.generation_persistence import (
+    GenerationPersistenceRepositories,
 )
 from runpod_sdxl_image_studio.services.generation_recovery_service import (
     GenerationRecoveryService,
@@ -50,6 +57,7 @@ from runpod_sdxl_image_studio.services.lora_catalog_service import (
     LoraCatalogError,
     LoraCatalogService,
 )
+from runpod_sdxl_image_studio.services.preset_service import PresetService
 from runpod_sdxl_image_studio.ui.components.lora_editor import (
     add_lora_row,
     component_outputs,
@@ -64,6 +72,7 @@ from runpod_sdxl_image_studio.ui.tabs.history_tab import (
     begin_regeneration,
     build_history_tab,
     enable_regeneration_button,
+    make_generation_diff_handler,
     make_history_detail_handler,
     make_history_refresh_handler,
     make_restore_handler,
@@ -85,6 +94,10 @@ from runpod_sdxl_image_studio.ui.tabs.lora_management_tab import (
     make_sync_handler,
     make_thumbnail_delete_handler,
     make_thumbnail_save_handler,
+)
+from runpod_sdxl_image_studio.ui.tabs.preset_tab import (
+    build_preset_tab,
+    make_preset_search_handler,
 )
 from runpod_sdxl_image_studio.ui.tabs.system_tab import (
     build_generation_tab,
@@ -147,14 +160,16 @@ def build_app(
         comfyui_service.refresh_capabilities,
         app_settings,
         lora_catalog_service=catalog_service,
-        generation_repository=generation_repository,
-        artifact_repository=artifact_repository,
-        completion_repository=completion_repository,
-        failure_repository=failure_repository,
-        job_repository=job_repository,
-        queue_repository=queue_repository,
-        start_repository=start_repository,
-        progress_repository=progress_repository,
+        persistence=GenerationPersistenceRepositories(
+            generation=generation_repository,
+            job=job_repository,
+            artifact=artifact_repository,
+            start=start_repository,
+            queue=queue_repository,
+            progress=progress_repository,
+            completion=completion_repository,
+            failure=failure_repository,
+        ),
         thumbnail_storage=HistoryThumbnailStorage(app_settings),
         metadata_storage=GenerationMetadataStorage(app_settings.data_dir),
     )
@@ -172,6 +187,8 @@ def build_app(
         completed_prompt_handler=generation_service.recover_prompt,
         failure_repository=failure_repository,
     )
+    preset_service = PresetService(PresetRepository(session_factory), app_settings)
+    generation_diff_service = GenerationDiffService()
     with gr.Blocks(title=APP_TITLE, css=APP_CSS) as demo:
         gr.Markdown(f"# {APP_TITLE}")
         with gr.Tab("生成"):
@@ -185,6 +202,8 @@ def build_app(
             lora_management = build_lora_management_tab(catalog_service)
         with gr.Tab("履歴"):
             history = build_history_tab()
+        with gr.Tab("プリセット"):
+            presets = build_preset_tab()
 
         capability_inputs = [
             generation.checkpoint,
@@ -216,6 +235,11 @@ def build_app(
             fn=lambda preset: size_preset_values(preset),
             inputs=[generation.size_preset],
             outputs=[generation.width, generation.height],
+        )
+        presets.refresh.click(
+            fn=make_preset_search_handler(preset_service),
+            inputs=[presets.search, presets.kind, presets.favorite_only],
+            outputs=[presets.results, presets.message],
         )
 
         def handle_lora_name_change(
@@ -485,6 +509,18 @@ def build_app(
                 history.status_filter,
                 history.kind_filter,
                 history.favorite_filter,
+                history.search_text,
+                history.date_from_search,
+                history.date_to_search,
+                history.checkpoint_search,
+                history.vae_search,
+                history.lora_search,
+                history.lora_search_mode,
+                history.seed_search,
+                history.width_search,
+                history.height_search,
+                history.error_code_search,
+                history.sort_search,
             ],
             outputs=[
                 history.page_state,
@@ -496,6 +532,11 @@ def build_app(
                 history.next_button,
                 history.message,
             ],
+        )
+        history.diff_button.click(
+            fn=make_generation_diff_handler(history_service, generation_diff_service),
+            inputs=[history.selected],
+            outputs=[history.diff_view],
         )
         history.previous_button.click(
             fn=previous_history_page,
@@ -509,6 +550,18 @@ def build_app(
                 history.status_filter,
                 history.kind_filter,
                 history.favorite_filter,
+                history.search_text,
+                history.date_from_search,
+                history.date_to_search,
+                history.checkpoint_search,
+                history.vae_search,
+                history.lora_search,
+                history.lora_search_mode,
+                history.seed_search,
+                history.width_search,
+                history.height_search,
+                history.error_code_search,
+                history.sort_search,
             ],
             outputs=[
                 history.page_state,
@@ -533,6 +586,18 @@ def build_app(
                 history.status_filter,
                 history.kind_filter,
                 history.favorite_filter,
+                history.search_text,
+                history.date_from_search,
+                history.date_to_search,
+                history.checkpoint_search,
+                history.vae_search,
+                history.lora_search,
+                history.lora_search_mode,
+                history.seed_search,
+                history.width_search,
+                history.height_search,
+                history.error_code_search,
+                history.sort_search,
             ],
             outputs=[
                 history.page_state,
