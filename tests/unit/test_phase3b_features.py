@@ -18,6 +18,7 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_reposito
 )
 from runpod_sdxl_image_studio.adapters.database.repositories.preset_repository import (
     PresetRepository,
+    PresetRepositoryError,
 )
 from runpod_sdxl_image_studio.domain.generation import GenerationKind, GenerationStatus
 from runpod_sdxl_image_studio.domain.generation_diff import ChangeType
@@ -29,6 +30,8 @@ from runpod_sdxl_image_studio.domain.generation_history import (
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
 from runpod_sdxl_image_studio.domain.lora import LoraSetting
+from runpod_sdxl_image_studio.domain.preset import Preset
+from runpod_sdxl_image_studio.domain.preset_payload import LoraPresetPayload, PresetKind
 from runpod_sdxl_image_studio.services.generation_diff_service import GenerationDiffService
 from runpod_sdxl_image_studio.services.preset_service import PresetService
 from runpod_sdxl_image_studio.services.recent_settings_service import RecentSettingsService
@@ -36,6 +39,10 @@ from runpod_sdxl_image_studio.ui.tabs.history_tab import seed_copy_value
 from runpod_sdxl_image_studio.ui.tabs.preset_tab import (
     make_preset_apply_handler,
     make_preset_save_handler,
+    make_recent_checkpoint_handler,
+    make_recent_lora_add_handler,
+    make_recent_vae_handler,
+    preset_apply_output_count,
 )
 
 
@@ -290,3 +297,141 @@ def test_phase3b_migration_backfills_and_preserves_phase2_tables(tmp_path: Path)
     assert inspect(downgraded).has_table("generations")
     downgraded.dispose()
     command.upgrade(config, "head")
+
+
+def test_preset_apply_success_and_all_error_paths_keep_exact_output_count() -> None:
+    engine, factory = _database()
+    service = PresetService(PresetRepository(factory))
+    generation = service.create_from_current_settings("apply", _settings("current"))
+    duplicate = Preset.create(
+        PresetKind.LORA,
+        "duplicate",
+        LoraPresetPayload(
+            loras=(
+                LoraSetting(name="same.safetensors", order=0),
+                LoraSetting(name="same.safetensors", order=1),
+            )
+        ),
+    )
+    too_many = Preset.create(
+        PresetKind.LORA,
+        "too-many",
+        LoraPresetPayload(
+            loras=(
+                LoraSetting(name="one.safetensors", order=0),
+                LoraSetting(name="two.safetensors", order=1),
+            )
+        ),
+    )
+    service._repository.create(duplicate)  # type: ignore[attr-defined]
+    service._repository.create(too_many)  # type: ignore[attr-defined]
+
+    def call(
+        handler: object,
+        selected: str | None,
+        *,
+        prompt_mode: str = "replace",
+        lora_mode: str = "replace",
+    ) -> tuple[object, ...]:
+        return handler(  # type: ignore[operator]
+            selected,
+            prompt_mode,
+            lora_mode,
+            "current",
+            "negative",
+            1024,
+            1024,
+            "Random",
+            -1,
+            28,
+            5.5,
+            "euler",
+            "normal",
+            "base.safetensors",
+            None,
+            [],
+            ("base.safetensors",),
+            (),
+            (),
+        )
+
+    for max_loras in (1, 2, 8, 12):
+        handler = make_preset_apply_handler(service, max_loras)
+        expected = 17 + 7 * max_loras
+        assert preset_apply_output_count(max_loras) == expected
+        assert len(call(handler, str(generation.id))) == expected
+        assert len(call(handler, None)) == expected
+        assert len(call(handler, "not-a-uuid")) == expected
+        assert len(call(handler, str(uuid4()))) == expected
+        assert len(call(handler, str(generation.id), prompt_mode="invalid")) == expected
+        assert len(call(handler, str(generation.id), lora_mode="invalid")) == expected
+        assert len(call(handler, str(duplicate.id))) == expected
+        assert len(call(handler, str(too_many.id))) == expected
+
+    class BrokenRepository:
+        def get_by_id(self, preset_id: object) -> None:
+            raise PresetRepositoryError("database unavailable")
+
+    broken_service = PresetService(BrokenRepository())  # type: ignore[arg-type]
+    broken_handler = make_preset_apply_handler(broken_service, 1)
+    assert len(call(broken_handler, str(generation.id))) == 24
+    engine.dispose()
+
+
+def test_recent_model_shortcuts_require_capability_and_preserve_other_state() -> None:
+    checkpoint_handler = make_recent_checkpoint_handler()
+    updated_checkpoint, message = checkpoint_handler("new.safetensors", ("new.safetensors",))
+    assert getattr(updated_checkpoint, "value", None) == "new.safetensors"
+    assert "反映" in message
+    preserved, warning = checkpoint_handler("missing.safetensors", ("new.safetensors",))
+    assert isinstance(preserved, dict)
+    assert "利用できません" in warning
+
+    vae_handler = make_recent_vae_handler()
+    updated_vae, _ = vae_handler("vae.safetensors", ("vae.safetensors",))
+    assert getattr(updated_vae, "value", None) == "vae.safetensors"
+    embedded, _ = vae_handler(None, None)
+    assert getattr(embedded, "value", "missing") is None
+    missing_vae, warning = vae_handler("missing.vae", ("vae.safetensors",))
+    assert isinstance(missing_vae, dict)
+    assert "利用できません" in warning
+
+
+def test_recent_lora_shortcut_appends_and_rejects_duplicate_limit_and_missing() -> None:
+    handler = make_recent_lora_add_handler(2)
+    choices = ("one.safetensors", "two.safetensors")
+    empty = [
+        {
+            "row_id": "empty",
+            "lora_name": None,
+            "model_strength": 1.0,
+            "clip_strength": 1.0,
+        }
+    ]
+    added = handler("one.safetensors", empty, choices)
+    assert added[-1] == "最近使ったLoRAを末尾へ追加しました。"
+    assert added[0][0]["lora_name"] == "one.safetensors"
+    one = added[0]
+    duplicate = handler("one.safetensors", one, choices)
+    assert "重複" in duplicate[-1]
+    full = [
+        {
+            "row_id": "one",
+            "lora_name": "one.safetensors",
+            "model_strength": 1.0,
+            "clip_strength": 1.0,
+        },
+        {
+            "row_id": "two",
+            "lora_name": "two.safetensors",
+            "model_strength": 0.8,
+            "clip_strength": 0.7,
+        },
+    ]
+    missing = handler("missing.safetensors", full, choices)
+    assert "利用できません" in missing[-1]
+    over_limit = handler("three.safetensors", full, choices + ("three.safetensors",))
+    assert "上限" in over_limit[-1]
+    duplicate_again = handler("one.safetensors", full, choices)
+    assert "重複" in duplicate_again[-1]
+    assert len(over_limit) == 3 + 7 * 2

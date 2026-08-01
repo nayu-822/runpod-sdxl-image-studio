@@ -357,6 +357,10 @@ Prompt Presetは置換・先頭追加・末尾追加、LoRA Presetは置換・�
 実使用seedをコピーでき、親Generationとの差分ではPromptの追加・削除・並び替えと、生成設定・LoRA強度を確認できます。
 PromptはHTMLとして解釈せず、差分表示時にescapeします。
 
+最近使ったcheckpoint/VAEは明示ボタンでcapability一覧に存在する値だけを反映します。最近使ったLoRAは
+「LoRAへ追加」ボタンで末尾へ追加し、重複・上限超過・missingは拒否します。最近LoRAにはCatalogの推奨強度を
+自動適用せず、現在のLoRA editorと同じmodel/CLIP strengthの初期値1.0を使用します。
+
 検索用のcheckpoint/VAE/seed/解像度カラムと`generation_loras`はsnapshotから同じトランザクションで作成される
 インデックスです。生成設定の復元には検索用データを使わず、常にsnapshotを使います。
 

@@ -23,8 +23,14 @@ from runpod_sdxl_image_studio.services.preset_service import (
 )
 from runpod_sdxl_image_studio.services.recent_settings_service import RecentSettingsService
 from runpod_sdxl_image_studio.ui.components.lora_editor import (
+    LoraEditorComponents,
+    add_lora_row,
+    component_output_count_for_rows,
     lora_settings_from_state,
+    normalize_lora_state,
+    preserve_component_updates,
     render_state_updates,
+    update_lora_row,
 )
 
 
@@ -54,8 +60,11 @@ class PresetTabComponents:
     apply_button: gr.Button
     clear_button: gr.Button
     recent_checkpoints: gr.Dropdown
+    recent_checkpoint_apply: gr.Button
     recent_vaes: gr.Dropdown
+    recent_vae_apply: gr.Button
     recent_loras: gr.Dropdown
+    recent_lora_add: gr.Button
     recent_generation_presets: gr.Dropdown
     recent_prompt_presets: gr.Dropdown
     recent_lora_presets: gr.Dropdown
@@ -115,8 +124,11 @@ def build_preset_tab() -> PresetTabComponents:
     with gr.Accordion("最近使った設定", open=False):
         recent_refresh = gr.Button("最近使った設定を更新")
         recent_checkpoints = gr.Dropdown([], label="最近使ったcheckpoint")
+        recent_checkpoint_apply = gr.Button("checkpointを生成画面へ反映")
         recent_vaes = gr.Dropdown([], label="最近使ったVAE")
+        recent_vae_apply = gr.Button("VAEを生成画面へ反映")
         recent_loras = gr.Dropdown([], label="最近使ったLoRA")
+        recent_lora_add = gr.Button("LoRAへ追加")
         recent_generation_presets = gr.Dropdown([], label="最近使ったGeneration Preset")
         recent_prompt_presets = gr.Dropdown([], label="最近使ったPrompt Preset")
         recent_lora_presets = gr.Dropdown([], label="最近使ったLoRA Preset")
@@ -144,8 +156,11 @@ def build_preset_tab() -> PresetTabComponents:
         apply_button,
         clear_button,
         recent_checkpoints,
+        recent_checkpoint_apply,
         recent_vaes,
+        recent_vae_apply,
         recent_loras,
+        recent_lora_add,
         recent_generation_presets,
         recent_prompt_presets,
         recent_lora_presets,
@@ -453,6 +468,7 @@ def make_preset_clear_handler() -> Callable[[], tuple[object, ...]]:
 def make_preset_apply_handler(
     service: PresetService,
     max_loras: int,
+    lora_editor: LoraEditorComponents | None = None,
 ) -> Callable[..., tuple[object, ...]]:
     """Presetを生成フォームへ反映する。ここでは生成処理を呼び出さない。"""
 
@@ -478,7 +494,7 @@ def make_preset_apply_handler(
         lora_choices: object,
     ) -> tuple[object, ...]:
         if not selected:
-            return _preserve_apply("適用するPresetを選択してください。", max_loras)
+            return _preserve_apply("適用するPresetを選択してください。", max_loras, lora_editor)
         try:
             current = _settings_from_form(
                 positive,
@@ -514,7 +530,7 @@ def make_preset_apply_handler(
                 max_loras,
             )
         except (PresetServiceError, ValueError) as exc:
-            return _preserve_apply(str(exc), max_loras)
+            return _preserve_apply(str(exc), max_loras, lora_editor)
 
     return handler
 
@@ -547,6 +563,85 @@ def make_recent_settings_handler(
             )
         except (PresetServiceError, ValueError, RuntimeError):
             return (gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip())
+
+    return handler
+
+
+def make_recent_checkpoint_handler() -> Callable[[str | None, object], tuple[object, str]]:
+    """能力一覧に存在する最近のcheckpointだけを生成フォームへ反映する。"""
+
+    def handler(selected: str | None, choices: object) -> tuple[object, str]:
+        if not selected:
+            return gr.skip(), "反映するcheckpointを選択してください。"
+        available = _string_choices(choices)
+        if available is None:
+            return gr.skip(), "checkpoint一覧が未取得のため反映できません。"
+        if selected not in available:
+            return gr.skip(), f"checkpointが現在利用できません: {selected}"
+        return gr.Dropdown(value=selected), "最近使ったcheckpointを反映しました。"
+
+    return handler
+
+
+def make_recent_vae_handler() -> Callable[[str | None, object], tuple[object, str]]:
+    """能力一覧に存在する最近のVAEだけを生成フォームへ反映する。"""
+
+    def handler(selected: str | None, choices: object) -> tuple[object, str]:
+        if not selected:
+            return gr.Dropdown(value=None), "内蔵VAEを選択しました。"
+        available = _string_choices(choices)
+        if available is None:
+            return gr.skip(), "VAE一覧が未取得のため反映できません。"
+        if selected not in available:
+            return gr.skip(), f"VAEが現在利用できません: {selected}"
+        return gr.Dropdown(value=selected), "最近使ったVAEを反映しました。"
+
+    return handler
+
+
+def make_recent_lora_add_handler(
+    max_loras: int,
+) -> Callable[[str | None, object, object], tuple[object, ...]]:
+    """選択済みの最近LoRAを明示操作で末尾へ追加する。"""
+
+    def handler(selected: str | None, state: object, choices: object) -> tuple[object, ...]:
+        if not selected:
+            return _preserve_recent_lora(
+                state, choices, max_loras, "追加するLoRAを選択してください。"
+            )
+        available = _string_choices(choices)
+        if available is None:
+            return _preserve_recent_lora(
+                state, choices, max_loras, "LoRA一覧が未取得のため追加できません。"
+            )
+        if selected not in available:
+            return _preserve_recent_lora(
+                state, choices, max_loras, f"LoRAが現在利用できません: {selected}"
+            )
+        try:
+            current = lora_settings_from_state(state, max_loras)
+            if selected in {item.name for item in current}:
+                return _preserve_recent_lora(
+                    state, choices, max_loras, "同じLoRAは重複追加できません。"
+                )
+            if len(current) >= max_loras:
+                return _preserve_recent_lora(
+                    state, choices, max_loras, "LoRA数が上限を超えています。"
+                )
+            rows = normalize_lora_state(state, max_loras)
+            if rows and not rows[-1].get("lora_name"):
+                row_index = len(rows) - 1
+                updated = update_lora_row(state, row_index, selected, 1.0, 1.0, max_loras)
+            else:
+                expanded = add_lora_row(state, max_loras)
+                updated = update_lora_row(
+                    expanded, len(expanded) - 1, selected, 1.0, 1.0, max_loras
+                )
+            return render_state_updates(updated, choices, max_loras) + (
+                "最近使ったLoRAを末尾へ追加しました。",
+            )
+        except ValueError:
+            return _preserve_recent_lora(state, choices, max_loras, "LoRAを追加できませんでした。")
 
     return handler
 
@@ -658,8 +753,52 @@ def _apply_outputs(
     )
 
 
-def _preserve_apply(message: str, max_loras: int) -> tuple[object, ...]:
-    return (message,) + (gr.skip(),) * (12 + 2 + 7 * max(1, max_loras))
+def _preserve_apply(
+    message: str,
+    max_loras: int,
+    lora_editor: LoraEditorComponents | None = None,
+) -> tuple[object, ...]:
+    """Preset適用の全出力を、正常系と同じ構造で保持する。"""
+
+    if lora_editor is not None:
+        lora_outputs = (
+            gr.skip(),
+            *preserve_component_updates(lora_editor),
+            gr.skip(),
+        )
+    else:
+        lora_outputs = tuple(
+            gr.skip() for _ in range(2 + component_output_count_for_rows(max_loras))
+        )
+    return (
+        message,
+        *(gr.skip() for _ in range(12)),
+        *lora_outputs,
+        gr.skip(),
+        gr.skip(),
+    )
+
+
+def _preserve_recent_lora(
+    state: object,
+    choices: object,
+    max_loras: int,
+    message: str,
+) -> tuple[object, ...]:
+    """最近LoRA追加の失敗時にStateと各行を変更しない。"""
+
+    del state, choices
+    return (
+        *(gr.skip() for _ in range(2 + component_output_count_for_rows(max_loras))),
+        message,
+    )
+
+
+def preset_apply_output_count(max_loras: int) -> int:
+    """Preset適用イベントの正常系・異常系で共有する出力数。"""
+
+    lora_output_count = 2 + component_output_count_for_rows(max_loras)
+    return 1 + 12 + lora_output_count + 2
 
 
 def _management_outputs(
@@ -795,6 +934,7 @@ __all__ = [
     "make_preset_select_handler",
     "make_preset_update_handler",
     "make_recent_settings_handler",
+    "preset_apply_output_count",
     "preset_id",
     "seed_copy_value",
 ]

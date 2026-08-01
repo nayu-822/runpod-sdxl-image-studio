@@ -108,7 +108,11 @@ from runpod_sdxl_image_studio.ui.tabs.preset_tab import (
     make_preset_search_handler,
     make_preset_select_handler,
     make_preset_update_handler,
+    make_recent_checkpoint_handler,
+    make_recent_lora_add_handler,
     make_recent_settings_handler,
+    make_recent_vae_handler,
+    preset_apply_output_count,
 )
 from runpod_sdxl_image_studio.ui.tabs.system_tab import (
     build_generation_tab,
@@ -387,8 +391,14 @@ def build_app(
             generation.restored_from_generation,
             generation.regeneration_valid,
         ]
+        if len(preset_apply_outputs) != preset_apply_output_count(app_settings.max_loras):
+            raise RuntimeError("Preset適用イベントのoutputs数が不一致です。")
         presets.apply_button.click(
-            fn=make_preset_apply_handler(preset_service, app_settings.max_loras),
+            fn=make_preset_apply_handler(
+                preset_service,
+                app_settings.max_loras,
+                generation.lora_editor,
+            ),
             inputs=[
                 presets.selected,
                 presets.prompt_apply_mode,
@@ -426,6 +436,30 @@ def build_app(
                 presets.recent_generation_presets,
                 presets.recent_prompt_presets,
                 presets.recent_lora_presets,
+            ],
+        )
+        presets.recent_checkpoint_apply.click(
+            fn=make_recent_checkpoint_handler(),
+            inputs=[presets.recent_checkpoints, generation.checkpoint_choices],
+            outputs=[generation.checkpoint, presets.message],
+        )
+        presets.recent_vae_apply.click(
+            fn=make_recent_vae_handler(),
+            inputs=[presets.recent_vaes, generation.vae_choices],
+            outputs=[generation.vae, presets.message],
+        )
+        presets.recent_lora_add.click(
+            fn=make_recent_lora_add_handler(app_settings.max_loras),
+            inputs=[
+                presets.recent_loras,
+                generation.lora_editor.state,
+                generation.lora_editor.choices,
+            ],
+            outputs=[
+                generation.lora_editor.state,
+                *component_outputs(generation.lora_editor),
+                generation.lora_editor.add_button,
+                presets.message,
             ],
         )
         for recent in (
