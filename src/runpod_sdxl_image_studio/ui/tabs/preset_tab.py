@@ -552,17 +552,32 @@ def make_recent_settings_handler(
             vae_values = _recent_choices(recent.vaes, _string_choices(vae_choices))
             lora_values = _recent_choices(recent.loras, _string_choices(lora_choices))
             return (
-                checkpoint_values,
-                vae_values,
-                lora_values,
-                _preset_id_choices(
-                    preset_service, recent.generation_presets, PresetKind.GENERATION
+                _recent_dropdown(checkpoint_values),
+                _recent_dropdown(vae_values),
+                _recent_dropdown(lora_values),
+                _recent_dropdown(
+                    _preset_id_choices(
+                        preset_service, recent.generation_presets, PresetKind.GENERATION
+                    )
                 ),
-                _preset_id_choices(preset_service, recent.prompt_presets, PresetKind.PROMPT),
-                _preset_id_choices(preset_service, recent.lora_presets, PresetKind.LORA),
+                _recent_dropdown(
+                    _preset_id_choices(preset_service, recent.prompt_presets, PresetKind.PROMPT)
+                ),
+                _recent_dropdown(
+                    _preset_id_choices(preset_service, recent.lora_presets, PresetKind.LORA)
+                ),
+                "最近使った設定を更新しました。",
             )
         except (PresetServiceError, ValueError, RuntimeError):
-            return (gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip())
+            return (
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                "最近使った設定を取得できませんでした。",
+            )
 
     return handler
 
@@ -587,8 +602,8 @@ def make_recent_vae_handler() -> Callable[[str | None, object], tuple[object, st
     """能力一覧に存在する最近のVAEだけを生成フォームへ反映する。"""
 
     def handler(selected: str | None, choices: object) -> tuple[object, str]:
-        if not selected:
-            return gr.Dropdown(value=None), "内蔵VAEを選択しました。"
+        if selected is None:
+            return gr.skip(), "反映するVAEを選択してください。"
         available = _string_choices(choices)
         if available is None:
             return gr.skip(), "VAE一覧が未取得のため反映できません。"
@@ -858,6 +873,12 @@ def _search_choices(
 
 def _dropdown(choices: Sequence[tuple[str, str]], value: str | None = None) -> gr.Dropdown:
     return gr.Dropdown(choices=list(choices), value=value)
+
+
+def _recent_dropdown(choices: Sequence[tuple[str, str]]) -> gr.Dropdown:
+    """最近設定のchoicesを選択値なしのDropdown更新へ変換する。"""
+
+    return gr.Dropdown(choices=list(choices), value=None)
 
 
 def _parse_id(value: str) -> UUID:

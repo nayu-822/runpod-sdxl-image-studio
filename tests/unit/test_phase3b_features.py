@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
+import gradio as gr
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, inspect, text
@@ -32,6 +33,7 @@ from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettin
 from runpod_sdxl_image_studio.domain.lora import LoraSetting
 from runpod_sdxl_image_studio.domain.preset import Preset
 from runpod_sdxl_image_studio.domain.preset_payload import LoraPresetPayload, PresetKind
+from runpod_sdxl_image_studio.domain.recent_settings import RecentSettings
 from runpod_sdxl_image_studio.services.generation_diff_service import GenerationDiffService
 from runpod_sdxl_image_studio.services.preset_service import PresetService
 from runpod_sdxl_image_studio.services.recent_settings_service import RecentSettingsService
@@ -41,6 +43,7 @@ from runpod_sdxl_image_studio.ui.tabs.preset_tab import (
     make_preset_save_handler,
     make_recent_checkpoint_handler,
     make_recent_lora_add_handler,
+    make_recent_settings_handler,
     make_recent_vae_handler,
     preset_apply_output_count,
 )
@@ -390,11 +393,97 @@ def test_recent_model_shortcuts_require_capability_and_preserve_other_state() ->
     vae_handler = make_recent_vae_handler()
     updated_vae, _ = vae_handler("vae.safetensors", ("vae.safetensors",))
     assert getattr(updated_vae, "value", None) == "vae.safetensors"
-    embedded, _ = vae_handler(None, None)
-    assert getattr(embedded, "value", "missing") is None
+    unselected, message = vae_handler(None, None)
+    assert isinstance(unselected, dict)
+    assert "選択してください" in message
+    unavailable_capability, _ = vae_handler("vae.safetensors", None)
+    assert isinstance(unavailable_capability, dict)
     missing_vae, warning = vae_handler("missing.vae", ("vae.safetensors",))
     assert isinstance(missing_vae, dict)
     assert "利用できません" in warning
+
+
+def test_recent_settings_handler_returns_dropdown_updates_and_clears_selection() -> None:
+    engine, factory = _database()
+    generation_repository = GenerationRepository(factory)
+    generation_repository.create_pending(
+        GenerationSettingsSnapshot.from_settings(
+            _settings("recent", (LoraSetting(name="style.safetensors", order=0),))
+        )
+    )
+    preset_service = PresetService(PresetRepository(factory))
+    generation_preset = preset_service.create_from_current_settings("generation", _settings("p"))
+    prompt_preset = preset_service.create_prompt_preset("prompt", "positive", "negative")
+    lora_preset = preset_service.create_lora_preset(
+        "lora", (LoraSetting(name="style.safetensors", order=0),)
+    )
+    handler = make_recent_settings_handler(
+        RecentSettingsService(generation_repository, PresetRepository(factory)), preset_service
+    )
+
+    result = handler(
+        ("other.safetensors",),
+        ("vae.safetensors",),
+        ("style.safetensors",),
+    )
+    assert len(result) == 7
+    dropdowns = result[:6]
+    assert all(isinstance(item, gr.Dropdown) for item in dropdowns)
+    assert all(getattr(item, "value", "not-none") is None for item in dropdowns)
+    assert getattr(dropdowns[0], "choices", None) == [
+        ("base.safetensors（現在利用不可）", "base.safetensors")
+    ]
+    assert getattr(dropdowns[1], "choices", None) == [("vae.safetensors", "vae.safetensors")]
+    assert getattr(dropdowns[2], "choices", None) == [("style.safetensors", "style.safetensors")]
+    assert getattr(dropdowns[3], "choices", None) == [("generation", str(generation_preset.id))]
+    assert getattr(dropdowns[4], "choices", None) == [("prompt", str(prompt_preset.id))]
+    assert getattr(dropdowns[5], "choices", None) == [("lora", str(lora_preset.id))]
+    assert result[6] == "最近使った設定を更新しました。"
+
+    class EmptyRecentSettingsService:
+        def get_recent(self) -> RecentSettings:
+            return RecentSettings()
+
+    empty = make_recent_settings_handler(
+        EmptyRecentSettingsService(),
+        preset_service,  # type: ignore[arg-type]
+    )(("old",), ("old.vae",), ("old.lora",))
+    assert len(empty) == 7
+    assert all(getattr(item, "choices", None) == [] for item in empty[:6])
+    assert all(getattr(item, "value", "not-none") is None for item in empty[:6])
+    engine.dispose()
+
+
+def test_recent_settings_handler_capabilities_and_errors() -> None:
+    engine, factory = _database()
+    generation_repository = GenerationRepository(factory)
+    generation_repository.create_pending(
+        GenerationSettingsSnapshot.from_settings(_settings("recent"))
+    )
+    preset_repository = PresetRepository(factory)
+    preset_service = PresetService(preset_repository)
+    handler = make_recent_settings_handler(
+        RecentSettingsService(generation_repository, preset_repository), preset_service
+    )
+    result = handler(None, None, None)
+    assert len(result) == 7
+    assert getattr(result[0], "choices", None) == [("base.safetensors", "base.safetensors")]
+    assert getattr(result[1], "choices", None) == [("vae.safetensors", "vae.safetensors")]
+    assert "現在利用不可" not in getattr(result[0], "choices", [])[0][0]
+
+    class BrokenRecentSettingsService:
+        def get_recent(self) -> None:
+            raise RuntimeError("database password leaked")
+
+    failed = make_recent_settings_handler(
+        BrokenRecentSettingsService(),
+        preset_service,  # type: ignore[arg-type]
+    )(("old",), ("old.vae",), ("old.lora",))
+    assert len(failed) == 7
+    assert all(isinstance(item, dict) for item in failed[:6])
+    assert failed[6] == "最近使った設定を取得できませんでした。"
+    assert "password" not in failed[6]
+    engine.dispose()
 
 
 def test_recent_lora_shortcut_appends_and_rejects_duplicate_limit_and_missing() -> None:

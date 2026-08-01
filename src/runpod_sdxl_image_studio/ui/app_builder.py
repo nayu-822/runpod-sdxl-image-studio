@@ -436,6 +436,7 @@ def build_app(
                 presets.recent_generation_presets,
                 presets.recent_prompt_presets,
                 presets.recent_lora_presets,
+                presets.message,
             ],
         )
         presets.recent_checkpoint_apply.click(
