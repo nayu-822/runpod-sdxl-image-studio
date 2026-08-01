@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import sqlalchemy as sa
 from alembic import op
@@ -11,6 +12,8 @@ revision = "0003_phase3b_search_and_presets"
 down_revision = "0002_generation_history"
 branch_labels = None
 depends_on = None
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def upgrade() -> None:
@@ -78,7 +81,21 @@ def _backfill_generation_search_data() -> None:
     for row in rows:
         try:
             snapshot = json.loads(row["settings_snapshot_json"])
+            if not isinstance(snapshot, dict):
+                raise ValueError("snapshot must be an object")
+            required = (
+                "checkpoint_name",
+                "seed",
+                "width",
+                "height",
+                "positive_prompt",
+                "negative_prompt",
+            )
+            if any(field not in snapshot for field in required):
+                raise KeyError("required snapshot field is missing")
             loras = snapshot.get("loras", ())
+            if not isinstance(loras, list):
+                raise TypeError("loras must be a list")
             bind.execute(
                 sa.text(
                     """UPDATE generations SET checkpoint_name=:checkpoint, vae_name=:vae,
@@ -98,6 +115,10 @@ def _backfill_generation_search_data() -> None:
                 },
             )
             for index, lora in enumerate(loras):
+                if not isinstance(lora, dict):
+                    raise TypeError("lora must be an object")
+                if any(field not in lora for field in ("name", "model_strength", "clip_strength")):
+                    raise KeyError("required lora field is missing")
                 bind.execute(
                     sa.text(
                         """INSERT OR IGNORE INTO generation_loras
@@ -113,7 +134,8 @@ def _backfill_generation_search_data() -> None:
                         "clip_strength": lora["clip_strength"],
                     },
                 )
-        except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            _LOGGER.warning("Phase 3B backfill skipped generation %s: %s", row["id"], exc)
             continue
 
 

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from uuid import UUID
 
 from runpod_sdxl_image_studio.adapters.database.repositories.preset_repository import (
@@ -22,6 +23,7 @@ from runpod_sdxl_image_studio.domain.preset_payload import (
     PresetPayloadValue,
     PromptApplyMode,
     PromptPresetPayload,
+    SeedMode,
 )
 
 
@@ -36,6 +38,7 @@ class PresetApplyResult:
     preset: Preset
     settings: GenerationSettings
     warnings: tuple[str, ...] = ()
+    seed_mode: SeedMode | None = None
 
 
 class PresetService:
@@ -56,11 +59,12 @@ class PresetService:
         *,
         description: str | None = None,
         favorite: bool = False,
+        seed_mode: SeedMode | str | None = None,
     ) -> Preset:
         return self._create(
             PresetKind.GENERATION,
             name,
-            GenerationPresetPayload.from_settings(settings),
+            GenerationPresetPayload.from_settings(settings, seed_mode=seed_mode),
             description,
             favorite,
         )
@@ -101,6 +105,51 @@ class PresetService:
             return self._repository.update(preset)
         except (PresetRepositoryError, PresetPayloadError, ValueError) as exc:
             raise PresetServiceError("Presetを更新できませんでした。") from exc
+
+    def get(self, preset_id: UUID) -> Preset:
+        """選択中PresetをUIへ公開する。永続化実装は露出させない。"""
+
+        return self._get(preset_id)
+
+    def update_from_current_settings(
+        self,
+        preset_id: UUID,
+        settings: GenerationSettings,
+        *,
+        name: str,
+        description: str | None,
+        favorite: bool,
+        seed_mode: SeedMode | str | None = None,
+        positive_mode: PromptApplyMode = PromptApplyMode.REPLACE,
+        negative_mode: PromptApplyMode = PromptApplyMode.REPLACE,
+    ) -> Preset:
+        """選択中IDを維持したまま、現在のフォーム値でPayloadを更新する。"""
+
+        current = self._get(preset_id)
+        if current.kind is PresetKind.GENERATION:
+            payload: PresetPayloadValue = GenerationPresetPayload.from_settings(
+                settings, seed_mode=seed_mode
+            )
+        elif current.kind is PresetKind.PROMPT:
+            payload = PromptPresetPayload(
+                positive_prompt=settings.positive_prompt,
+                negative_prompt=settings.negative_prompt,
+                positive_mode=positive_mode,
+                negative_mode=negative_mode,
+            )
+        else:
+            payload = LoraPresetPayload(loras=settings.loras)
+        return self.update(
+            replace(
+                current,
+                name=name,
+                description=description,
+                favorite=favorite,
+                payload=payload,
+                schema_version=payload.schema_version,
+                updated_at=datetime.now(UTC),
+            )
+        )
 
     def duplicate(self, preset_id: UUID, name: str | None = None) -> Preset:
         source = self._get(preset_id)
@@ -159,7 +208,14 @@ class PresetService:
             if preset.kind is PresetKind.GENERATION:
                 payload = preset.payload
                 assert isinstance(payload, GenerationPresetPayload)
-                settings = payload.to_settings()
+                if max_loras is not None and len(payload.loras) > max_loras:
+                    raise PresetServiceError("Generation PresetのLoRA数が上限を超えています。")
+                previous_seed = (
+                    current_settings.seed
+                    if current_settings is not None and current_settings.seed >= 0
+                    else None
+                )
+                settings = payload.to_settings(previous_seed=previous_seed)
                 if (
                     available_checkpoints is not None
                     and settings.checkpoint_name not in available_checkpoints
@@ -210,7 +266,16 @@ class PresetService:
                 settings = current_settings.model_copy(update={"loras": loras})
             with suppress(PresetRepositoryError):
                 self._repository.record_usage(preset.id)
-            return PresetApplyResult(preset=preset, settings=settings, warnings=tuple(warnings))
+            return PresetApplyResult(
+                preset=preset,
+                settings=settings,
+                warnings=tuple(warnings),
+                seed_mode=(
+                    preset.payload.seed_mode
+                    if isinstance(preset.payload, GenerationPresetPayload)
+                    else None
+                ),
+            )
         except PresetServiceError:
             raise
         except (PresetPayloadError, ValueError) as exc:

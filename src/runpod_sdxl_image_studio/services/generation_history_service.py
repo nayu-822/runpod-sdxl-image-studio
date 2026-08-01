@@ -232,6 +232,23 @@ class GenerationHistoryService:
         start_local = datetime.combine(query.date, time.min, self._timezone)
         end_local = start_local + timedelta(days=1)
         return GenerationHistoryFilter(
+            text=query.text,
+            checkpoint_names=query.checkpoint_names,
+            vae_names=query.vae_names,
+            lora_names=query.lora_names,
+            lora_search_mode=query.lora_search_mode,
+            seed=query.seed,
+            width=query.width,
+            height=query.height,
+            statuses=query.statuses,
+            kinds=query.kinds,
+            favorite_only=query.favorite_only,
+            error_codes=query.error_codes,
+            parent_generation_id=query.parent_generation_id,
+            date_from=query.date_from,
+            date_to=query.date_to,
+            sort=query.sort,
+            page_size=query.page_size,
             date=query.date,
             status=query.status,
             favorite=query.favorite,

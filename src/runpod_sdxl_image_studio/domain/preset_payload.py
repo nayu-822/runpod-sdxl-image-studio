@@ -68,8 +68,17 @@ class GenerationPresetPayload(PresetPayload):
     loras: tuple[LoraSetting, ...] = ()
 
     @classmethod
-    def from_settings(cls, settings: GenerationSettings) -> GenerationPresetPayload:
-        mode = SeedMode.FIXED if settings.seed >= 0 else SeedMode.RANDOM
+    def from_settings(
+        cls,
+        settings: GenerationSettings,
+        *,
+        seed_mode: SeedMode | str | None = None,
+    ) -> GenerationPresetPayload:
+        mode = (
+            SeedMode(seed_mode)
+            if seed_mode is not None
+            else (SeedMode.FIXED if settings.seed >= 0 else SeedMode.RANDOM)
+        )
         return cls(
             checkpoint_name=settings.checkpoint_name,
             vae_name=settings.vae_name,

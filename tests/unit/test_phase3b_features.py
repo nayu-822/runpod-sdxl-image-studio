@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from sqlalchemy import create_engine
+import json
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from uuid import uuid4
+
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import create_engine, inspect, text
 
 from runpod_sdxl_image_studio.adapters.database.engine import create_session_factory
 from runpod_sdxl_image_studio.adapters.database.models import Base
@@ -12,9 +19,11 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_reposito
 from runpod_sdxl_image_studio.adapters.database.repositories.preset_repository import (
     PresetRepository,
 )
+from runpod_sdxl_image_studio.domain.generation import GenerationKind, GenerationStatus
 from runpod_sdxl_image_studio.domain.generation_diff import ChangeType
 from runpod_sdxl_image_studio.domain.generation_history import (
     GenerationHistoryQuery,
+    GenerationHistorySort,
     LoraSearchMode,
 )
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
@@ -22,6 +31,12 @@ from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettin
 from runpod_sdxl_image_studio.domain.lora import LoraSetting
 from runpod_sdxl_image_studio.services.generation_diff_service import GenerationDiffService
 from runpod_sdxl_image_studio.services.preset_service import PresetService
+from runpod_sdxl_image_studio.services.recent_settings_service import RecentSettingsService
+from runpod_sdxl_image_studio.ui.tabs.history_tab import seed_copy_value
+from runpod_sdxl_image_studio.ui.tabs.preset_tab import (
+    make_preset_apply_handler,
+    make_preset_save_handler,
+)
 
 
 def _database():
@@ -89,3 +104,189 @@ def test_prompt_diff_marks_reorder_and_setting_change() -> None:
     )
     assert any(item.change_type is ChangeType.REORDERED for item in diff.positive_prompt_changes)
     assert any(item.field_name == "seed" for item in diff.setting_changes)
+
+
+def test_history_search_supports_special_text_parent_and_multiple_filters() -> None:
+    engine, factory = _database()
+    repository = GenerationRepository(factory)
+    now = datetime.now(UTC)
+    parent = repository.create_pending(
+        GenerationSettingsSnapshot.from_settings(_settings("Unicode 猫 100% _ \\")),
+        created_at=now - timedelta(days=1),
+    )
+    repository.update_note(parent.id, "note 100% _ \\")
+    repository.set_favorite(parent.id, True)
+    child = repository.create_pending(
+        GenerationSettingsSnapshot.from_settings(
+            _settings(
+                "child",
+                (LoraSetting(name="cat.safetensors", order=0),),
+            )
+        ),
+        parent_generation_id=parent.id,
+        kind=GenerationKind.DERIVED,
+    )
+    assert repository.list_history(GenerationHistoryQuery(text="100%")).total_count == 1
+    assert repository.list_history(GenerationHistoryQuery(text="_")).total_count == 1
+    assert repository.list_history(GenerationHistoryQuery(text="\\")).total_count == 1
+    assert repository.list_history(
+        GenerationHistoryQuery(
+            parent_generation_id=parent.id,
+            statuses=(GenerationStatus.PENDING,),
+            kinds=(GenerationKind.DERIVED,),
+            favorite_only=False,
+            sort=GenerationHistorySort.OLDEST,
+        )
+    ).generations == (child,)
+    engine.dispose()
+
+
+def test_preset_repository_service_crud_apply_and_ui_handlers() -> None:
+    engine, factory = _database()
+    service = PresetService(PresetRepository(factory))
+    settings = _settings("cat")
+    generation = service.create_from_current_settings("generation", settings)
+    prompt = service.create_prompt_preset("prompt", "blue", "bad")
+    result = service.apply(prompt.id, current_settings=settings, prompt_mode="append")
+    assert result.settings.positive_prompt == "cat, blue"
+    assert service.set_favorite(generation.id, True).favorite is True
+    assert service.duplicate(generation.id).name.startswith("generation (copy)")
+    assert service.apply(generation.id, current_settings=settings).settings == settings
+
+    save = make_preset_save_handler(service, 2)
+    saved = save(
+        "prompt",
+        "ui prompt",
+        "description",
+        False,
+        "positive",
+        "negative",
+        1024,
+        1024,
+        "Fixed",
+        123,
+        28,
+        5.5,
+        "euler",
+        "normal",
+        "base.safetensors",
+        None,
+        [],
+        "replace",
+        "replace",
+        "",
+        "",
+        False,
+    )
+    assert len(saved) == 10
+    selected_id = str(service.search("ui prompt")[0].id)
+    apply = make_preset_apply_handler(service, 2)
+    applied = apply(
+        selected_id,
+        "append",
+        "replace",
+        "current",
+        "negative",
+        1024,
+        1024,
+        "Random",
+        -1,
+        28,
+        5.5,
+        "euler",
+        "normal",
+        "base.safetensors",
+        None,
+        [],
+        None,
+        None,
+        None,
+    )
+    assert len(applied) == 17 + 7 * 2
+    assert applied[3] == "current, positive"
+    engine.dispose()
+
+
+def test_recent_settings_are_bounded_and_seed_copy_uses_resolved_integer() -> None:
+    engine, factory = _database()
+    repository = GenerationRepository(factory)
+    for index in range(3):
+        repository.create_pending(
+            GenerationSettingsSnapshot.from_settings(
+                _settings(f"prompt-{index}").model_copy(update={"seed": index + 1})
+            )
+        )
+    service = RecentSettingsService(repository, PresetRepository(factory), limit=2)
+    recent = service.get_recent()
+    assert len(recent.checkpoints) <= 2
+    assert len(recent.recent_generation_ids) <= 2
+    assert seed_copy_value(987654321) == "987654321"
+    engine.dispose()
+
+
+def test_phase3b_migration_backfills_and_preserves_phase2_tables(tmp_path: Path) -> None:
+    database = tmp_path / "migration.sqlite3"
+    config = Config(str(Path(__file__).parents[2] / "alembic.ini"))
+    config.set_main_option("script_location", str(Path(__file__).parents[2] / "alembic"))
+    config.set_main_option("sqlalchemy.url", f"sqlite:///{database.as_posix()}")
+    command.upgrade(config, "0002_generation_history")
+    engine = create_engine(f"sqlite:///{database.as_posix()}")
+    valid_id = str(uuid4())
+    broken_id = str(uuid4())
+    valid_snapshot = {
+        "schema_version": 1,
+        "positive_prompt": "Unicode 猫",
+        "negative_prompt": "bad",
+        "seed": 42,
+        "width": 1024,
+        "height": 1024,
+        "steps": 28,
+        "cfg_scale": 5.5,
+        "sampler_name": "euler",
+        "scheduler_name": "normal",
+        "checkpoint_name": "base.safetensors",
+        "vae_name": None,
+        "loras": [
+            {"name": "style.safetensors", "order": 0, "model_strength": 0.8, "clip_strength": 0.7}
+        ],
+        "workflow_template_id": "sdxl_txt2img",
+        "workflow_template_version": "1.0",
+    }
+    with engine.begin() as connection:
+        for generation_id, payload in (
+            (valid_id, json.dumps(valid_snapshot)),
+            (broken_id, "not-json"),
+        ):
+            connection.execute(
+                text(
+                    """INSERT INTO generations
+                    (id, kind, status, parent_generation_id, settings_snapshot_json,
+                     snapshot_schema_version, workflow_template_id, workflow_template_version,
+                     favorite, created_at, updated_at)
+                    VALUES (:id, 'standard', 'pending', NULL, :payload, 1,
+                            'sdxl_txt2img', '1.0', 0, :created, :created)"""
+                ),
+                {"id": generation_id, "payload": payload, "created": datetime.now(UTC)},
+            )
+    engine.dispose()
+    command.upgrade(config, "head")
+    upgraded = create_engine(f"sqlite:///{database.as_posix()}")
+    inspector = inspect(upgraded)
+    assert inspector.has_table("generation_loras")
+    assert inspector.has_table("presets")
+    assert "ix_generations_checkpoint" in {
+        item["name"] for item in inspector.get_indexes("generations")
+    }
+    with upgraded.connect() as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM generation_loras")).scalar_one() == 1
+        assert connection.execute(
+            text("SELECT checkpoint_name, positive_prompt_search FROM generations WHERE id=:id"),
+            {"id": valid_id},
+        ).one() == ("base.safetensors", "Unicode 猫")
+    upgraded.dispose()
+    command.downgrade(config, "0002_generation_history")
+    downgraded = create_engine(f"sqlite:///{database.as_posix()}")
+    assert not inspect(downgraded).has_table("presets")
+    assert inspect(downgraded).has_table("generations")
+    downgraded.dispose()
+    command.upgrade(config, "head")

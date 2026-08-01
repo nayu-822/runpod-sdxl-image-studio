@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import base64
-import json
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
@@ -56,7 +54,6 @@ class GenerationHistoryQuery:
     date_to: datetime | None = None
     sort: GenerationHistorySort = GenerationHistorySort.NEWEST
     page_size: int = 20
-    cursor: str | None = None
     # Phase 3A compatibility fields. New callers should use the fields above.
     date: date | None = None
     status: GenerationStatus | None = None
@@ -106,8 +103,6 @@ class GenerationHistoryPage:
     page_size: int
     total_count: int
     has_next: bool
-    next_cursor: str | None = None
-    previous_cursor: str | None = None
 
 
 @dataclass(frozen=True)
@@ -159,31 +154,3 @@ class RegenerationPlan:
     settings: GenerationSettings
     parent_generation_id: UUID
     kind: GenerationKind = GenerationKind.DERIVED
-
-
-def encode_history_cursor(sort: GenerationHistorySort, sort_value: str, generation_id: str) -> str:
-    """Encode cursor data without exposing it as SQL text."""
-
-    payload = json.dumps({"sort": sort.value, "value": sort_value, "id": generation_id})
-    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
-
-
-def decode_history_cursor(cursor: str | None) -> tuple[str, str] | None:
-    """Safely parse a cursor; malformed cursors start from the first page."""
-
-    if not cursor:
-        return None
-    try:
-        padded = cursor + "=" * (-len(cursor) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
-        if (
-            not isinstance(payload, dict)
-            or not isinstance(payload.get("value"), str)
-            or not isinstance(payload.get("id"), str)
-        ):
-            return None
-        if not UUID(payload["id"]):
-            return None
-        return payload["value"], payload["id"]
-    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
-        return None

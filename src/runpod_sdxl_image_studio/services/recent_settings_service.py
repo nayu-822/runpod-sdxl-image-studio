@@ -8,7 +8,10 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_reposito
 from runpod_sdxl_image_studio.adapters.database.repositories.preset_repository import (
     PresetRepositoryProtocol,
 )
-from runpod_sdxl_image_studio.domain.generation_history import GenerationHistoryQuery
+from runpod_sdxl_image_studio.domain.generation_history import (
+    GenerationHistoryQuery,
+    GenerationHistorySort,
+)
 from runpod_sdxl_image_studio.domain.preset_payload import PresetKind
 from runpod_sdxl_image_studio.domain.recent_settings import RecentSettings
 
@@ -29,7 +32,11 @@ class RecentSettingsService:
 
     def get_recent(self) -> RecentSettings:
         page = self._generation_repository.list_history(
-            GenerationHistoryQuery(page_size=self._limit, limit=self._limit)
+            GenerationHistoryQuery(
+                page_size=self._limit,
+                limit=self._limit,
+                sort=GenerationHistorySort.NEWEST,
+            )
         )
         checkpoints: list[str] = []
         vaes: list[str] = []

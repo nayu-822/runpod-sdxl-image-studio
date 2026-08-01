@@ -360,6 +360,11 @@ PromptはHTMLとして解釈せず、差分表示時にescapeします。
 検索用のcheckpoint/VAE/seed/解像度カラムと`generation_loras`はsnapshotから同じトランザクションで作成される
 インデックスです。生成設定の復元には検索用データを使わず、常にsnapshotを使います。
 
+Phase 3Bの履歴UIはoffsetページングに統一しています。検索実行時はpage=1へ戻り、前へ・次へでは
+現在の検索条件を維持したままoffsetだけを変更します。Phase 3Bではcursor入力とcursor生成を持たず、
+offsetだけを適用する設計です。checkpointとVAEはUIでは単一指定、statusとkindは複数指定に対応します。
+Migration backfillで壊れたsnapshot行を検出した場合は、その行をskipしてwarningを出し、他の正常行のbackfillを継続します。
+
 ### Phase 3B DB migration
 
 ```bash

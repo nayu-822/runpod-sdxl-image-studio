@@ -6,6 +6,8 @@ import html
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
+from enum import StrEnum
+from typing import TypeVar
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -35,10 +37,13 @@ from runpod_sdxl_image_studio.ui.components.lora_editor import (
     render_state_updates,
 )
 
+_HistoryEnum = TypeVar("_HistoryEnum", bound=StrEnum)
+
 
 @dataclass(frozen=True)
 class HistoryTabComponents:
     refresh_button: gr.Button
+    clear_button: gr.Button
     page_state: gr.State
     date_filter: gr.Textbox
     status_filter: gr.Dropdown
@@ -59,6 +64,9 @@ class HistoryTabComponents:
     regenerate_button: gr.Button
     message: gr.Markdown
     search_text: gr.Textbox
+    status_search: gr.Dropdown
+    kind_search: gr.Dropdown
+    parent_search: gr.Textbox
     date_from_search: gr.Textbox
     date_to_search: gr.Textbox
     checkpoint_search: gr.Textbox
@@ -70,6 +78,8 @@ class HistoryTabComponents:
     height_search: gr.Number
     error_code_search: gr.Textbox
     sort_search: gr.Dropdown
+    query_summary: gr.Markdown
+    seed_copy: gr.Textbox
     diff_button: gr.Button
     diff_view: gr.Markdown
 
@@ -94,8 +104,21 @@ def build_history_tab() -> HistoryTabComponents:
             date_from_search = gr.Textbox(label="開始日（YYYY-MM-DD）")
             date_to_search = gr.Textbox(label="終了日（YYYY-MM-DD）")
         with gr.Row():
-            checkpoint_search = gr.Textbox(label="checkpoint")
-            vae_search = gr.Textbox(label="VAE")
+            status_search = gr.Dropdown(
+                [(status.value, status.value) for status in GenerationStatus],
+                value=[],
+                multiselect=True,
+                label="status（複数可）",
+            )
+            kind_search = gr.Dropdown(
+                [(kind.value, kind.value) for kind in GenerationKind],
+                value=[],
+                multiselect=True,
+                label="kind（複数可）",
+            )
+        with gr.Row():
+            checkpoint_search = gr.Textbox(label="checkpoint（単一指定）")
+            vae_search = gr.Textbox(label="VAE（単一指定）")
         with gr.Row():
             lora_search = gr.Textbox(label="LoRA（カンマ区切り）")
             lora_search_mode = gr.Dropdown(
@@ -110,7 +133,8 @@ def build_history_tab() -> HistoryTabComponents:
             seed_search = gr.Number(label="seed", precision=0)
             width_search = gr.Number(label="幅", precision=0)
             height_search = gr.Number(label="高さ", precision=0)
-        error_code_search = gr.Textbox(label="error code")
+        parent_search = gr.Textbox(label="親Generation ID")
+        error_code_search = gr.Textbox(label="error code（カンマ区切り）")
         sort_search = gr.Dropdown(
             [
                 ("新しい順", GenerationHistorySort.NEWEST.value),
@@ -140,7 +164,9 @@ def build_history_tab() -> HistoryTabComponents:
             value="",
             label="favorite",
         )
-    refresh_button = gr.Button("履歴を更新", min_width=140)
+    with gr.Row():
+        refresh_button = gr.Button("履歴を検索", min_width=140)
+        clear_button = gr.Button("検索条件をクリア")
     page_state = gr.State(1)
     cards = gr.Markdown("履歴を読み込んでください。")
     thumbnail_gallery = gr.Gallery(
@@ -157,6 +183,11 @@ def build_history_tab() -> HistoryTabComponents:
     selected = gr.Dropdown([], label="Generation", allow_custom_value=False)
     detail = gr.Markdown("")
     image = gr.Image(label="履歴画像", type="filepath")
+    seed_copy = gr.Textbox(
+        label="実使用seed（選択してコピー）",
+        interactive=False,
+        max_length=20,
+    )
     favorite = gr.Checkbox(label="お気に入り")
     note = gr.Textbox(label="メモ", lines=3, max_lines=8, max_length=2000)
     with gr.Row():
@@ -167,8 +198,10 @@ def build_history_tab() -> HistoryTabComponents:
     with gr.Row():
         diff_button = gr.Button("親Generationとの差分")
         diff_view = gr.Markdown("")
+    query_summary = gr.Markdown("検索条件: 全件")
     return HistoryTabComponents(
         refresh_button,
+        clear_button,
         page_state,
         date_filter,
         status_filter,
@@ -189,6 +222,9 @@ def build_history_tab() -> HistoryTabComponents:
         regenerate_button,
         message,
         search_text,
+        status_search,
+        kind_search,
+        parent_search,
         date_from_search,
         date_to_search,
         checkpoint_search,
@@ -200,6 +236,8 @@ def build_history_tab() -> HistoryTabComponents:
         height_search,
         error_code_search,
         sort_search,
+        query_summary,
+        seed_copy,
         diff_button,
         diff_view,
     )
@@ -218,12 +256,22 @@ def build_advanced_history_query(
     height: float | int | None = None,
     error_code: str | None = None,
     sort: str | None = None,
+    statuses: object = None,
+    kinds: object = None,
+    parent_generation_id: str | None = None,
 ) -> GenerationHistoryQuery:
     """UI入力を型付き検索条件へ変換する。"""
 
     def integer(value: float | int | None) -> int | None:
         return int(value) if value is not None else None
 
+    status_values = _enum_values(statuses, GenerationStatus)
+    kind_values = _enum_values(kinds, GenerationKind)
+    parent = (
+        UUID(parent_generation_id.strip())
+        if parent_generation_id and parent_generation_id.strip()
+        else None
+    )
     return GenerationHistoryQuery(
         text=text,
         date_from=_tokyo_date_start(date_from_text),
@@ -235,9 +283,20 @@ def build_advanced_history_query(
         seed=integer(seed),
         width=integer(width),
         height=integer(height),
-        error_codes=(error_code,) if error_code else (),
+        error_codes=tuple(
+            value.strip() for value in (error_code or "").split(",") if value.strip()
+        ),
+        statuses=status_values,
+        kinds=kind_values,
+        parent_generation_id=parent,
         sort=GenerationHistorySort(sort or GenerationHistorySort.NEWEST.value),
     )
+
+
+def _enum_values(value: object, enum_type: type[_HistoryEnum]) -> tuple[_HistoryEnum, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(enum_type(item) for item in value if isinstance(item, str) and item)
 
 
 def _tokyo_date_start(value: str | None) -> datetime | None:
@@ -257,6 +316,8 @@ def _tokyo_date_end(value: str | None) -> datetime | None:
 def make_history_refresh_handler(
     service: GenerationHistoryService,
     recovery_service: GenerationRecoveryService | None = None,
+    *,
+    reset_page: bool = False,
 ) -> Callable[..., Awaitable[tuple[object, ...]]]:
     async def handler(
         page: int = 1,
@@ -265,6 +326,9 @@ def make_history_refresh_handler(
         kind: str | None = None,
         favorite: str | None = None,
         search_text: str | None = None,
+        statuses: object = None,
+        kinds: object = None,
+        parent_generation_id: str | None = None,
         date_from_text: str | None = None,
         date_to_text: str | None = None,
         checkpoint: str | None = None,
@@ -280,7 +344,7 @@ def make_history_refresh_handler(
         if recovery_service is not None:
             await recovery_service.recover()
         try:
-            normalized_page = max(1, int(page))
+            normalized_page = 1 if reset_page else max(1, int(page))
             selected_date = date.fromisoformat(date_text) if date_text.strip() else None
             advanced_query = build_advanced_history_query(
                 search_text,
@@ -295,7 +359,14 @@ def make_history_refresh_handler(
                 height,
                 error_code,
                 sort,
+                statuses,
+                kinds,
+                parent_generation_id,
             )
+            if not advanced_query.statuses and status:
+                advanced_query = replace(advanced_query, statuses=(GenerationStatus(status),))
+            if not advanced_query.kinds and kind:
+                advanced_query = replace(advanced_query, kinds=(GenerationKind(kind),))
             result = service.list_history(
                 replace(
                     advanced_query,
@@ -316,6 +387,7 @@ def make_history_refresh_handler(
                 f"{result.page}ページ目 / 全{result.total_count}件",
                 gr.Button(interactive=result.page > 1),
                 gr.Button(interactive=result.has_next),
+                render_query_summary(advanced_query),
                 "履歴を更新しました。",
             )
         except GenerationHistoryError as exc:
@@ -327,6 +399,7 @@ def make_history_refresh_handler(
                 gr.skip(),
                 gr.skip(),
                 gr.skip(),
+                gr.skip(),
                 str(exc),
             )
         except ValueError:
@@ -334,6 +407,7 @@ def make_history_refresh_handler(
                 gr.skip(),
                 gr.skip(),
                 "履歴フィルターの日付またはstatusを確認してください。",
+                gr.skip(),
                 gr.skip(),
                 gr.skip(),
                 gr.skip(),
@@ -374,24 +448,56 @@ def next_history_page(page: int) -> int:
     return max(1, int(page) + 1)
 
 
+def clear_history_filters() -> tuple[object, ...]:
+    """高度検索・基本検索・選択状態をまとめて初期化する。"""
+
+    return (
+        1,
+        "",
+        "",
+        "",
+        "",
+        "",
+        [],
+        [],
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        [],
+        None,
+        None,
+        "",
+        GenerationHistorySort.NEWEST.value,
+        "検索条件: 全件",
+        gr.Dropdown(value=None),
+        "",
+        "",
+    )
+
+
 def make_history_detail_handler(
     service: GenerationHistoryService,
 ) -> Callable[[str | None], tuple[object, ...]]:
     def handler(selected: str | None) -> tuple[object, ...]:
         if not selected:
-            return "", None, gr.skip(), gr.skip(), "履歴を選択してください。"
+            return "", None, "", gr.skip(), gr.skip(), "履歴を選択してください。"
         try:
             detail = service.get_detail(UUID(selected))
             image_path = service.absolute_data_path(detail.image_path)
             return (
                 render_generation_detail(detail),
                 str(image_path) if image_path else None,
+                seed_copy_value(detail.snapshot.seed),
                 detail.favorite,
                 detail.user_note or "",
                 "",
             )
         except (GenerationHistoryError, ValueError) as exc:
-            return "", None, gr.skip(), gr.skip(), str(exc)
+            return "", None, "", gr.skip(), gr.skip(), str(exc)
 
     return handler
 
@@ -547,6 +653,29 @@ def render_history_items(items: tuple[GenerationHistoryItem, ...]) -> str:
             f"{html.escape(item.resolution_text)} / {thumbnail}{error}"
         )
     return "\n".join(lines)
+
+
+def seed_copy_value(seed: int) -> str:
+    """履歴snapshotの実使用seedを整数文字列として返す。"""
+
+    return str(int(seed))
+
+
+def render_query_summary(query: GenerationHistoryQuery) -> str:
+    """現在の検索条件をUIへ安全に要約する。"""
+
+    values = [f"sort={query.sort.value}"]
+    if query.text:
+        values.append(f"text={query.text}")
+    if query.statuses:
+        values.append("status=" + ",".join(value.value for value in query.statuses))
+    if query.kinds:
+        values.append("kind=" + ",".join(value.value for value in query.kinds))
+    if query.parent_generation_id:
+        values.append(f"parent={query.parent_generation_id}")
+    if query.lora_names:
+        values.append(f"LoRA({query.lora_search_mode.value})=" + ",".join(query.lora_names))
+    return "検索条件: " + html.escape(" / ".join(values))
 
 
 def render_history_thumbnails(

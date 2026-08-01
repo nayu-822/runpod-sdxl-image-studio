@@ -34,8 +34,6 @@ from runpod_sdxl_image_studio.domain.generation_history import (
     GenerationHistoryPage,
     GenerationHistoryQuery,
     GenerationHistorySort,
-    decode_history_cursor,
-    encode_history_cursor,
 )
 from runpod_sdxl_image_studio.domain.generation_snapshot import (
     GenerationSettingsSnapshot,
@@ -211,33 +209,18 @@ class GenerationRepository(GenerationRepositoryProtocol):
                 if filters:
                     statement = statement.where(*filters)
                     count_statement = count_statement.where(*filters)
-                cursor_values = decode_history_cursor(normalized.cursor)
-                if cursor_values is not None:
-                    try:
-                        cursor_filter = _cursor_filter(normalized.sort, cursor_values)
-                    except (TypeError, ValueError):
-                        cursor_filter = None
-                    if cursor_filter is not None:
-                        statement = statement.where(cursor_filter)
                 ordering = _history_ordering(normalized.sort)
                 rows = session.scalars(
                     statement.order_by(*ordering).offset(offset).limit(limit)
                 ).all()
                 total = int(session.scalar(count_statement) or 0)
                 generations = tuple(_generation_domain(row) for row in rows)
-                next_cursor = None
-                if len(generations) == limit and generations:
-                    last = generations[-1]
-                    next_cursor = encode_history_cursor(
-                        normalized.sort, _sort_value(last, normalized.sort), str(last.id)
-                    )
                 return GenerationHistoryPage(
                     generations=generations,
                     page=offset // limit + 1,
                     page_size=limit,
                     total_count=total,
                     has_next=offset + len(generations) < total,
-                    next_cursor=next_cursor,
                 )
         except (SQLAlchemyError, SnapshotError) as exc:
             raise GenerationRepositoryError("generation history could not be read") from exc
@@ -1079,54 +1062,6 @@ def _history_ordering(sort: GenerationHistorySort) -> tuple[ColumnElement[object
     return cast(
         tuple[ColumnElement[object], ...],
         (GenerationModel.created_at.desc(), GenerationModel.id.desc()),
-    )
-
-
-def _sort_value(generation: Generation, sort: GenerationHistorySort) -> str:
-    if sort is GenerationHistorySort.OLDEST or sort is GenerationHistorySort.NEWEST:
-        return generation.created_at.isoformat()
-    if sort in {GenerationHistorySort.SEED_ASC, GenerationHistorySort.SEED_DESC}:
-        return str(generation.settings_snapshot.seed)
-    if sort is GenerationHistorySort.RESOLUTION_DESC:
-        snapshot = generation.settings_snapshot
-        return str(snapshot.width * snapshot.height)
-    return (generation.completed_at or generation.created_at).isoformat()
-
-
-def _cursor_filter(sort: GenerationHistorySort, values: tuple[str, str]) -> ColumnElement[bool]:
-    sort_value, generation_id = values
-    if sort is GenerationHistorySort.OLDEST:
-        return or_(
-            GenerationModel.created_at > sort_value,
-            and_(GenerationModel.created_at == sort_value, GenerationModel.id > generation_id),
-        )
-    if sort is GenerationHistorySort.SEED_ASC:
-        return or_(
-            GenerationModel.seed > int(sort_value),
-            and_(GenerationModel.seed == int(sort_value), GenerationModel.id > generation_id),
-        )
-    if sort is GenerationHistorySort.SEED_DESC:
-        return or_(
-            GenerationModel.seed < int(sort_value),
-            and_(GenerationModel.seed == int(sort_value), GenerationModel.id < generation_id),
-        )
-    if sort is GenerationHistorySort.RESOLUTION_DESC:
-        resolution = int(sort_value)
-        return or_(
-            GenerationModel.width * GenerationModel.height < resolution,
-            and_(
-                GenerationModel.width * GenerationModel.height == resolution,
-                GenerationModel.id < generation_id,
-            ),
-        )
-    if sort is GenerationHistorySort.RECENTLY_COMPLETED:
-        return or_(
-            GenerationModel.completed_at < sort_value,
-            and_(GenerationModel.completed_at == sort_value, GenerationModel.id < generation_id),
-        )
-    return or_(
-        GenerationModel.created_at < sort_value,
-        and_(GenerationModel.created_at == sort_value, GenerationModel.id < generation_id),
     )
 
 

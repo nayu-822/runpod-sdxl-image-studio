@@ -58,6 +58,7 @@ from runpod_sdxl_image_studio.services.lora_catalog_service import (
     LoraCatalogService,
 )
 from runpod_sdxl_image_studio.services.preset_service import PresetService
+from runpod_sdxl_image_studio.services.recent_settings_service import RecentSettingsService
 from runpod_sdxl_image_studio.ui.components.lora_editor import (
     add_lora_row,
     component_outputs,
@@ -71,6 +72,7 @@ from runpod_sdxl_image_studio.ui.components.lora_editor import (
 from runpod_sdxl_image_studio.ui.tabs.history_tab import (
     begin_regeneration,
     build_history_tab,
+    clear_history_filters,
     enable_regeneration_button,
     make_generation_diff_handler,
     make_history_detail_handler,
@@ -97,7 +99,16 @@ from runpod_sdxl_image_studio.ui.tabs.lora_management_tab import (
 )
 from runpod_sdxl_image_studio.ui.tabs.preset_tab import (
     build_preset_tab,
+    make_preset_apply_handler,
+    make_preset_clear_handler,
+    make_preset_delete_handler,
+    make_preset_duplicate_handler,
+    make_preset_favorite_handler,
+    make_preset_save_handler,
     make_preset_search_handler,
+    make_preset_select_handler,
+    make_preset_update_handler,
+    make_recent_settings_handler,
 )
 from runpod_sdxl_image_studio.ui.tabs.system_tab import (
     build_generation_tab,
@@ -187,7 +198,13 @@ def build_app(
         completed_prompt_handler=generation_service.recover_prompt,
         failure_repository=failure_repository,
     )
-    preset_service = PresetService(PresetRepository(session_factory), app_settings)
+    preset_repository = PresetRepository(session_factory)
+    preset_service = PresetService(preset_repository, app_settings)
+    recent_settings_service = RecentSettingsService(
+        generation_repository,
+        preset_repository,
+        limit=app_settings.recent_settings_limit,
+    )
     generation_diff_service = GenerationDiffService()
     with gr.Blocks(title=APP_TITLE, css=APP_CSS) as demo:
         gr.Markdown(f"# {APP_TITLE}")
@@ -241,6 +258,182 @@ def build_app(
             inputs=[presets.search, presets.kind, presets.favorite_only],
             outputs=[presets.results, presets.message],
         )
+        preset_form_outputs = [
+            presets.results,
+            presets.selected,
+            presets.preset_kind,
+            presets.name,
+            presets.description,
+            presets.favorite,
+            presets.payload_summary,
+            presets.prompt_apply_mode,
+            presets.lora_apply_mode,
+            presets.message,
+        ]
+        preset_selection_outputs = [
+            presets.preset_kind,
+            presets.name,
+            presets.description,
+            presets.favorite,
+            presets.payload_summary,
+            presets.prompt_apply_mode,
+            presets.lora_apply_mode,
+            presets.message,
+        ]
+        preset_save_inputs = [
+            presets.preset_kind,
+            presets.name,
+            presets.description,
+            presets.favorite,
+            generation.positive_prompt,
+            generation.negative_prompt,
+            generation.width,
+            generation.height,
+            generation.seed_mode,
+            generation.seed,
+            generation.steps,
+            generation.cfg_scale,
+            generation.sampler,
+            generation.scheduler,
+            generation.checkpoint,
+            generation.vae,
+            generation.lora_editor.state,
+            presets.prompt_apply_mode,
+            presets.prompt_apply_mode,
+            presets.search,
+            presets.kind,
+            presets.favorite_only,
+        ]
+        presets.results.change(
+            fn=lambda selected: selected,
+            inputs=[presets.results],
+            outputs=[presets.selected],
+        ).then(
+            fn=make_preset_select_handler(preset_service),
+            inputs=[presets.results],
+            outputs=preset_selection_outputs,
+        )
+        presets.selected.change(
+            fn=make_preset_select_handler(preset_service),
+            inputs=[presets.selected],
+            outputs=preset_selection_outputs,
+        )
+        presets.save_button.click(
+            fn=make_preset_save_handler(preset_service, app_settings.max_loras),
+            inputs=preset_save_inputs,
+            outputs=preset_form_outputs,
+        )
+        presets.update_button.click(
+            fn=make_preset_update_handler(preset_service, app_settings.max_loras),
+            inputs=[presets.selected, *preset_save_inputs[1:]],
+            outputs=preset_form_outputs,
+        )
+        presets.duplicate_button.click(
+            fn=make_preset_duplicate_handler(preset_service),
+            inputs=[presets.selected, presets.search, presets.kind, presets.favorite_only],
+            outputs=preset_form_outputs,
+        )
+        presets.delete_button.click(
+            fn=make_preset_delete_handler(preset_service),
+            inputs=[
+                presets.selected,
+                presets.delete_confirmation,
+                presets.search,
+                presets.kind,
+                presets.favorite_only,
+            ],
+            outputs=preset_form_outputs,
+        )
+        presets.favorite.change(
+            fn=make_preset_favorite_handler(preset_service),
+            inputs=[presets.selected, presets.favorite],
+            outputs=[presets.favorite, presets.message],
+        )
+        presets.clear_button.click(
+            fn=make_preset_clear_handler(),
+            outputs=[
+                presets.search,
+                presets.kind,
+                presets.favorite_only,
+                presets.results,
+                presets.selected,
+                presets.preset_kind,
+                presets.name,
+                presets.description,
+                presets.favorite,
+                presets.payload_summary,
+                presets.prompt_apply_mode,
+                presets.lora_apply_mode,
+                presets.message,
+            ],
+        )
+        preset_apply_outputs = [
+            presets.message,
+            generation.checkpoint,
+            generation.vae,
+            generation.positive_prompt,
+            generation.negative_prompt,
+            generation.width,
+            generation.height,
+            generation.seed_mode,
+            generation.seed,
+            generation.steps,
+            generation.cfg_scale,
+            generation.sampler,
+            generation.scheduler,
+            generation.lora_editor.state,
+            *component_outputs(generation.lora_editor),
+            generation.lora_editor.add_button,
+            generation.restored_from_generation,
+            generation.regeneration_valid,
+        ]
+        presets.apply_button.click(
+            fn=make_preset_apply_handler(preset_service, app_settings.max_loras),
+            inputs=[
+                presets.selected,
+                presets.prompt_apply_mode,
+                presets.lora_apply_mode,
+                generation.positive_prompt,
+                generation.negative_prompt,
+                generation.width,
+                generation.height,
+                generation.seed_mode,
+                generation.seed,
+                generation.steps,
+                generation.cfg_scale,
+                generation.sampler,
+                generation.scheduler,
+                generation.checkpoint,
+                generation.vae,
+                generation.lora_editor.state,
+                generation.checkpoint_choices,
+                generation.vae_choices,
+                generation.lora_editor.choices,
+            ],
+            outputs=preset_apply_outputs,
+        )
+        presets.recent_refresh.click(
+            fn=make_recent_settings_handler(recent_settings_service, preset_service),
+            inputs=[
+                generation.checkpoint_choices,
+                generation.vae_choices,
+                generation.lora_editor.choices,
+            ],
+            outputs=[
+                presets.recent_checkpoints,
+                presets.recent_vaes,
+                presets.recent_loras,
+                presets.recent_generation_presets,
+                presets.recent_prompt_presets,
+                presets.recent_lora_presets,
+            ],
+        )
+        for recent in (
+            presets.recent_generation_presets,
+            presets.recent_prompt_presets,
+            presets.recent_lora_presets,
+        ):
+            recent.change(fn=lambda selected: selected, inputs=[recent], outputs=[presets.selected])
 
         def handle_lora_name_change(
             state: object,
@@ -502,7 +695,7 @@ def build_app(
             outputs=[lora_management.message, lora_management.thumbnail_preview],
         )
         history.refresh_button.click(
-            fn=make_history_refresh_handler(history_service, recovery_service),
+            fn=make_history_refresh_handler(history_service, recovery_service, reset_page=True),
             inputs=[
                 history.page_state,
                 history.date_filter,
@@ -510,6 +703,9 @@ def build_app(
                 history.kind_filter,
                 history.favorite_filter,
                 history.search_text,
+                history.status_search,
+                history.kind_search,
+                history.parent_search,
                 history.date_from_search,
                 history.date_to_search,
                 history.checkpoint_search,
@@ -530,6 +726,71 @@ def build_app(
                 history.page,
                 history.previous_button,
                 history.next_button,
+                history.query_summary,
+                history.message,
+            ],
+        )
+        history.clear_button.click(
+            fn=clear_history_filters,
+            outputs=[
+                history.page_state,
+                history.date_filter,
+                history.status_filter,
+                history.kind_filter,
+                history.favorite_filter,
+                history.search_text,
+                history.status_search,
+                history.kind_search,
+                history.parent_search,
+                history.date_from_search,
+                history.date_to_search,
+                history.checkpoint_search,
+                history.vae_search,
+                history.lora_search,
+                history.lora_search_mode,
+                history.seed_search,
+                history.width_search,
+                history.height_search,
+                history.error_code_search,
+                history.sort_search,
+                history.query_summary,
+                history.selected,
+                history.seed_copy,
+                history.diff_view,
+            ],
+        ).then(
+            fn=make_history_refresh_handler(history_service, recovery_service, reset_page=True),
+            inputs=[
+                history.page_state,
+                history.date_filter,
+                history.status_filter,
+                history.kind_filter,
+                history.favorite_filter,
+                history.search_text,
+                history.status_search,
+                history.kind_search,
+                history.parent_search,
+                history.date_from_search,
+                history.date_to_search,
+                history.checkpoint_search,
+                history.vae_search,
+                history.lora_search,
+                history.lora_search_mode,
+                history.seed_search,
+                history.width_search,
+                history.height_search,
+                history.error_code_search,
+                history.sort_search,
+            ],
+            outputs=[
+                history.page_state,
+                history.thumbnail_gallery,
+                history.cards,
+                history.selected,
+                history.page,
+                history.previous_button,
+                history.next_button,
+                history.query_summary,
                 history.message,
             ],
         )
@@ -551,6 +812,9 @@ def build_app(
                 history.kind_filter,
                 history.favorite_filter,
                 history.search_text,
+                history.status_search,
+                history.kind_search,
+                history.parent_search,
                 history.date_from_search,
                 history.date_to_search,
                 history.checkpoint_search,
@@ -571,6 +835,7 @@ def build_app(
                 history.page,
                 history.previous_button,
                 history.next_button,
+                history.query_summary,
                 history.message,
             ],
         )
@@ -587,6 +852,9 @@ def build_app(
                 history.kind_filter,
                 history.favorite_filter,
                 history.search_text,
+                history.status_search,
+                history.kind_search,
+                history.parent_search,
                 history.date_from_search,
                 history.date_to_search,
                 history.checkpoint_search,
@@ -607,6 +875,7 @@ def build_app(
                 history.page,
                 history.previous_button,
                 history.next_button,
+                history.query_summary,
                 history.message,
             ],
         )
@@ -616,6 +885,7 @@ def build_app(
             outputs=[
                 history.detail,
                 history.image,
+                history.seed_copy,
                 history.favorite,
                 history.note,
                 history.message,
