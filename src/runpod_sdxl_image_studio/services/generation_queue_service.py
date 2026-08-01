@@ -173,6 +173,28 @@ class GenerationQueueService:
         except Exception as exc:  # noqa: BLE001 - hide adapter details at the UI boundary
             raise GenerationQueueServiceError("キャンセルに失敗しました。") from exc
 
+    def link_ambiguous_prompt(self, generation_id: UUID, prompt_id: str) -> GenerationQueueItem:
+        """Manually attach a prompt ID after an ambiguous submission."""
+
+        try:
+            item = self._repository.link_ambiguous_prompt(generation_id, prompt_id)
+            self._wake()
+            return item
+        except (GenerationDispatchQueueRepositoryError, ValueError) as exc:
+            raise GenerationQueueServiceError("曖昧なprompt状態を手動解決できませんでした") from exc
+
+    def fail_ambiguous_prompt(self, generation_id: UUID) -> GenerationQueueItem:
+        """Explicitly mark an ambiguous submission failed when prompt is absent."""
+
+        try:
+            item = self._repository.fail_ambiguous_prompt(generation_id)
+            self._wake()
+            return item
+        except (GenerationDispatchQueueRepositoryError, ValueError) as exc:
+            raise GenerationQueueServiceError(
+                "曖昧なprompt状態をfailedへ確定できませんでした"
+            ) from exc
+
     def retry(self, generation_id: UUID) -> QueueEnqueueResult:
         try:
             item = self._repository.get_queue_item(generation_id)

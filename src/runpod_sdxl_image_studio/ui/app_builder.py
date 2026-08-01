@@ -134,6 +134,8 @@ from runpod_sdxl_image_studio.ui.tabs.preset_tab import (
 )
 from runpod_sdxl_image_studio.ui.tabs.queue_tab import (
     build_queue_tab,
+    make_queue_ambiguous_fail_handler,
+    make_queue_ambiguous_link_handler,
     make_queue_cancel_handler,
     make_queue_detail_handler,
     make_queue_refresh_handler,
@@ -304,6 +306,9 @@ def build_app(
                 queue_retry,
                 queue_retry_batch,
                 queue_message,
+                queue_ambiguous_prompt_id,
+                queue_ambiguous_link,
+                queue_ambiguous_fail,
             ) = build_queue_tab()
         with gr.Tab("LoRA管理"):
             lora_management = build_lora_management_tab(catalog_service)
@@ -390,7 +395,12 @@ def build_app(
         queue_jobs.change(
             fn=make_queue_detail_handler(queue_service),
             inputs=[queue_jobs],
-            outputs=[queue_detail],
+            outputs=[
+                queue_detail,
+                queue_ambiguous_prompt_id,
+                queue_ambiguous_link,
+                queue_ambiguous_fail,
+            ],
         )
         queue_cancel_event = queue_cancel.click(
             fn=lambda: gr.Button(interactive=False),
@@ -406,6 +416,64 @@ def build_app(
             fn=make_queue_refresh_handler(queue_service),
             inputs=[queue_status, queue_batch_filter],
             outputs=[queue_jobs, queue_message],
+        )
+        ambiguous_link_event = queue_ambiguous_link.click(
+            fn=lambda: (gr.Button(interactive=False), gr.Button(interactive=False)),
+            outputs=[queue_ambiguous_link, queue_ambiguous_fail],
+            queue=False,
+        )
+        ambiguous_link_event.then(
+            fn=make_queue_ambiguous_link_handler(queue_service),
+            inputs=[queue_jobs, queue_ambiguous_prompt_id],
+            outputs=[
+                queue_ambiguous_prompt_id,
+                queue_ambiguous_link,
+                queue_ambiguous_fail,
+                queue_message,
+            ],
+            concurrency_limit=1,
+        ).then(
+            fn=make_queue_refresh_handler(queue_service),
+            inputs=[queue_status, queue_batch_filter],
+            outputs=[queue_jobs, queue_message],
+        ).then(
+            fn=make_queue_detail_handler(queue_service),
+            inputs=[queue_jobs],
+            outputs=[
+                queue_detail,
+                queue_ambiguous_prompt_id,
+                queue_ambiguous_link,
+                queue_ambiguous_fail,
+            ],
+        )
+        ambiguous_fail_event = queue_ambiguous_fail.click(
+            fn=lambda: (gr.Button(interactive=False), gr.Button(interactive=False)),
+            outputs=[queue_ambiguous_link, queue_ambiguous_fail],
+            queue=False,
+        )
+        ambiguous_fail_event.then(
+            fn=make_queue_ambiguous_fail_handler(queue_service),
+            inputs=[queue_jobs],
+            outputs=[
+                queue_ambiguous_prompt_id,
+                queue_ambiguous_link,
+                queue_ambiguous_fail,
+                queue_message,
+            ],
+            concurrency_limit=1,
+        ).then(
+            fn=make_queue_refresh_handler(queue_service),
+            inputs=[queue_status, queue_batch_filter],
+            outputs=[queue_jobs, queue_message],
+        ).then(
+            fn=make_queue_detail_handler(queue_service),
+            inputs=[queue_jobs],
+            outputs=[
+                queue_detail,
+                queue_ambiguous_prompt_id,
+                queue_ambiguous_link,
+                queue_ambiguous_fail,
+            ],
         )
         queue_retry_event = queue_retry.click(
             fn=lambda: gr.Button(interactive=False),

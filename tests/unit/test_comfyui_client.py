@@ -125,3 +125,54 @@ async def test_check_connection_propagates_connection_error() -> None:
 
     with pytest.raises(ComfyUIConnectionError):
         await client.check_connection()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [True, False])
+@respx.mock
+async def test_cancel_job_requires_boolean_cancelled_response(cancelled: bool) -> None:
+    route = respx.post("http://comfy.test:8188/api/jobs/prompt-1/cancel").mock(
+        return_value=httpx.Response(200, json={"cancelled": cancelled})
+    )
+    client = ComfyUIClient(base_url="http://comfy.test:8188")
+
+    assert await client.cancel_job("prompt-1") is cancelled
+    assert route.called
+    await client.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_cancel_job_rejects_missing_boolean_response() -> None:
+    respx.post("http://comfy.test:8188/api/jobs/prompt-1/cancel").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    client = ComfyUIClient(base_url="http://comfy.test:8188")
+
+    with pytest.raises(ComfyUIResponseError):
+        await client.cancel_job("prompt-1")
+    await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/queue", {"delete": ["prompt-1"]}),
+        ("/interrupt", {"prompt_id": "prompt-1"}),
+    ],
+)
+@respx.mock
+async def test_legacy_cancel_operations_accept_empty_success_body(
+    path: str, payload: dict[str, object]
+) -> None:
+    route = respx.post(f"http://comfy.test:8188{path}").mock(return_value=httpx.Response(204))
+    client = ComfyUIClient(base_url="http://comfy.test:8188")
+
+    if path == "/queue":
+        await client.delete_queued_prompt("prompt-1")
+    else:
+        await client.interrupt_prompt("prompt-1")
+    assert route.called
+    assert json.loads(route.calls[0].request.content) == payload
+    await client.close()

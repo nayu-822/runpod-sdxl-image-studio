@@ -116,6 +116,21 @@ class GenerationDispatchQueueRepositoryProtocol(Protocol):
         self, generation_id: UUID, *, now: datetime | None = None
     ) -> GenerationQueueItem: ...
 
+    def link_ambiguous_prompt(
+        self,
+        generation_id: UUID,
+        prompt_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> GenerationQueueItem: ...
+
+    def fail_ambiguous_prompt(
+        self,
+        generation_id: UUID,
+        *,
+        now: datetime | None = None,
+    ) -> GenerationQueueItem: ...
+
     def list_queue(
         self,
         *,
@@ -686,6 +701,81 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
         except (SQLAlchemyError, ValueError) as exc:
             raise GenerationDispatchQueueRepositoryError("job could not be cancelled") from exc
 
+    def link_ambiguous_prompt(
+        self,
+        generation_id: UUID,
+        prompt_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> GenerationQueueItem:
+        timestamp = _utc(now or datetime.now(UTC))
+        prompt = _prompt_identifier(prompt_id)
+        try:
+            with session_scope(self._session_factory) as session:
+                _begin_immediate_if_sqlite(session)
+                entry, generation, job = _load_queue_rows(session, generation_id)
+                _require_ambiguous_prompt_resolution(entry, generation, job)
+                summary = "ambiguous prompt manually linked: prompt id was supplied by an operator"
+                generation.comfy_prompt_id = prompt
+                generation.status = GenerationStatus.QUEUED.value
+                generation.error_code = "prompt_submission_ambiguous_resolved"
+                generation.error_summary = summary
+                generation.updated_at = timestamp
+                job.comfy_prompt_id = prompt
+                job.status = GenerationStatus.QUEUED.value
+                job.error_code = "prompt_submission_ambiguous_resolved"
+                job.error_summary = summary
+                job.updated_at = timestamp
+                entry.submission_state = SubmissionState.SUBMITTED.value
+                entry.worker_id = None
+                entry.claimed_at = None
+                entry.lease_expires_at = None
+                entry.updated_at = timestamp
+                session.flush()
+                return _queue_item(session, entry, generation, job)
+        except GenerationDispatchQueueRepositoryError:
+            raise
+        except (IntegrityError, SQLAlchemyError, ValueError) as exc:
+            raise GenerationDispatchQueueRepositoryError(
+                "ambiguous prompt could not be linked"
+            ) from exc
+
+    def fail_ambiguous_prompt(
+        self,
+        generation_id: UUID,
+        *,
+        now: datetime | None = None,
+    ) -> GenerationQueueItem:
+        timestamp = _utc(now or datetime.now(UTC))
+        try:
+            with session_scope(self._session_factory) as session:
+                _begin_immediate_if_sqlite(session)
+                entry, generation, job = _load_queue_rows(session, generation_id)
+                _require_ambiguous_prompt_resolution(entry, generation, job)
+                summary = "prompt absence was manually confirmed by an operator"
+                generation.status = GenerationStatus.FAILED.value
+                generation.error_code = "prompt_submission_ambiguous_resolved"
+                generation.error_summary = summary
+                generation.completed_at = timestamp
+                generation.updated_at = timestamp
+                job.status = GenerationStatus.FAILED.value
+                job.error_code = "prompt_submission_ambiguous_resolved"
+                job.error_summary = summary
+                job.completed_at = timestamp
+                job.updated_at = timestamp
+                entry.worker_id = None
+                entry.claimed_at = None
+                entry.lease_expires_at = None
+                entry.updated_at = timestamp
+                session.flush()
+                return _queue_item(session, entry, generation, job)
+        except GenerationDispatchQueueRepositoryError:
+            raise
+        except (SQLAlchemyError, ValueError) as exc:
+            raise GenerationDispatchQueueRepositoryError(
+                "ambiguous prompt could not be marked failed"
+            ) from exc
+
     def list_queue(
         self,
         *,
@@ -731,8 +821,19 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
             with session_scope(self._session_factory) as session:
                 entries = session.scalars(
                     select(GenerationQueueEntryModel).where(
-                        GenerationQueueEntryModel.lease_expires_at.is_not(None),
-                        GenerationQueueEntryModel.lease_expires_at <= timestamp,
+                        or_(
+                            (
+                                GenerationQueueEntryModel.lease_expires_at.is_not(None)
+                                & (GenerationQueueEntryModel.lease_expires_at <= timestamp)
+                            ),
+                            (
+                                GenerationQueueEntryModel.cancel_requested_at.is_not(None)
+                                & (
+                                    GenerationQueueEntryModel.submission_state
+                                    == SubmissionState.READY.value
+                                )
+                            ),
+                        )
                     )
                 ).all()
                 for entry in entries:
@@ -745,6 +846,8 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
                         and job is not None
                         and GenerationStatus(generation.status) is GenerationStatus.PENDING
                         and GenerationStatus(job.status) is GenerationStatus.PENDING
+                        and generation.comfy_prompt_id is None
+                        and job.comfy_prompt_id is None
                     ):
                         generation.status = GenerationStatus.CANCELLED.value
                         generation.completed_at = timestamp
@@ -901,6 +1004,51 @@ def _load_item_by_generation(session: Session, generation_id: UUID) -> Generatio
         )
     )
     return _queue_item_from_entry(session, entry) if entry is not None else None
+
+
+def _load_queue_rows(
+    session: Session, generation_id: UUID
+) -> tuple[GenerationQueueEntryModel, GenerationModel, GenerationJobModel]:
+    entry = session.scalar(
+        select(GenerationQueueEntryModel).where(
+            GenerationQueueEntryModel.generation_id == str(generation_id)
+        )
+    )
+    generation = session.get(GenerationModel, str(generation_id))
+    job = session.get(GenerationJobModel, entry.job_id) if entry is not None else None
+    if entry is None or generation is None or job is None:
+        raise GenerationDispatchQueueRepositoryError("queue entry was not found")
+    if job.generation_id != entry.generation_id:
+        raise GenerationDispatchQueueRepositoryError("queue entry is orphaned")
+    return entry, generation, job
+
+
+def _require_ambiguous_prompt_resolution(
+    entry: GenerationQueueEntryModel,
+    generation: GenerationModel,
+    job: GenerationJobModel,
+) -> None:
+    terminal = {GenerationStatus.COMPLETED, GenerationStatus.FAILED, GenerationStatus.CANCELLED}
+    if entry.submission_state != SubmissionState.AMBIGUOUS.value:
+        raise GenerationDispatchQueueRepositoryError("queue entry is not ambiguous")
+    if generation.comfy_prompt_id is not None or job.comfy_prompt_id is not None:
+        raise GenerationDispatchQueueRepositoryError("prompt id is already present")
+    if GenerationStatus(generation.status) in terminal or GenerationStatus(job.status) in terminal:
+        raise GenerationDispatchQueueRepositoryError("terminal queue item cannot be resolved")
+
+
+def _prompt_identifier(value: str) -> str:
+    prompt = value.strip()
+    if (
+        not prompt
+        or len(prompt) > 100
+        or "/" in prompt
+        or "\\" in prompt
+        or prompt in {".", ".."}
+        or ".." in prompt
+    ):
+        raise GenerationDispatchQueueRepositoryError("prompt id is invalid")
+    return prompt
 
 
 def _queue_item_from_entry(

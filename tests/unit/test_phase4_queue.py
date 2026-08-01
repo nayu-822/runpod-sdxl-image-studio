@@ -13,7 +13,11 @@ from alembic.config import Config
 from sqlalchemy import create_engine, inspect, text
 
 from runpod_sdxl_image_studio.adapters.comfyui.cancellation import ComfyUICancellationAdapter
-from runpod_sdxl_image_studio.adapters.comfyui.exceptions import ComfyUIConnectionError
+from runpod_sdxl_image_studio.adapters.comfyui.exceptions import (
+    ComfyUIConnectionError,
+    ComfyUIResponseError,
+    ComfyUITimeoutError,
+)
 from runpod_sdxl_image_studio.adapters.comfyui.models import (
     ComfyUIOutputImage,
     ComfyUIQueueStatus,
@@ -357,6 +361,68 @@ def test_running_cancel_requires_adapter_confirmation() -> None:
     engine.dispose()
 
 
+def test_worker_retries_persistent_cancel_until_comfyui_confirms() -> None:
+    engine, factory = _database()
+    repository = GenerationDispatchQueueRepository(factory)
+    item = repository.enqueue_single(GenerationSettingsSnapshot.from_settings(_settings()))
+    GenerationQueueRepository(factory).mark_queued(item.generation.id, item.job.id, "prompt-1")
+    repository.request_cancel(item.generation.id)
+
+    class Adapter:
+        calls = 0
+
+        async def cancel_prompt(self, prompt_id: str) -> CancellationResult:
+            self.calls += 1
+            return CancellationResult(requested=True, confirmed=self.calls > 1)
+
+    adapter = Adapter()
+    worker = GenerationQueueWorker(
+        repository,
+        object(),
+        Settings(_env_file=None),
+        cancellation_adapter=adapter,
+    )
+
+    asyncio.run(worker.reconcile())
+    first = repository.get_queue_item(item.generation.id)
+    assert first is not None and first.generation.status is GenerationStatus.QUEUED
+    asyncio.run(worker.reconcile())
+    second = repository.get_queue_item(item.generation.id)
+    assert second is not None and second.generation.status is GenerationStatus.CANCELLED
+    assert adapter.calls == 2
+    engine.dispose()
+
+
+def test_ambiguous_prompt_can_be_linked_or_explicitly_failed() -> None:
+    engine, factory = _database()
+    repository = GenerationDispatchQueueRepository(factory)
+    item = repository.enqueue_single(GenerationSettingsSnapshot.from_settings(_settings()))
+    claimed = repository.claim_next("worker-a", lease_seconds=30)
+    assert claimed is not None
+    repository.begin_submission(claimed.entry.sequence, "worker-a")
+    repository.mark_submission_ambiguous(
+        item.entry.sequence, "worker-a", "network outcome was unknown"
+    )
+
+    linked = repository.link_ambiguous_prompt(item.generation.id, "prompt-manual")
+    assert linked.entry.submission_state is SubmissionState.SUBMITTED
+    assert linked.generation.status is GenerationStatus.QUEUED
+    assert linked.job.prompt_id == "prompt-manual"
+    with pytest.raises(GenerationDispatchQueueRepositoryError):
+        repository.link_ambiguous_prompt(item.generation.id, "prompt-again")
+
+    second = repository.enqueue_single(GenerationSettingsSnapshot.from_settings(_settings(456)))
+    claimed_second = repository.claim_next("worker-a", lease_seconds=30)
+    assert claimed_second is not None
+    repository.begin_submission(claimed_second.entry.sequence, "worker-a")
+    repository.mark_submission_ambiguous(second.entry.sequence, "worker-a", "unknown")
+    failed = repository.fail_ambiguous_prompt(second.generation.id)
+    assert failed.generation.status is GenerationStatus.FAILED
+    assert failed.job.status is GenerationStatus.FAILED
+    assert failed.generation.error_code == "prompt_submission_ambiguous_resolved"
+    engine.dispose()
+
+
 def test_batch_enqueue_rolls_back_all_rows_on_mid_batch_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -511,7 +577,7 @@ def test_comfyui_cancellation_does_not_confirm_prompt_still_in_history() -> None
             return ComfyUIQueueStatus((), ())
 
         async def get_prompt_history(self, prompt_id: str) -> PromptHistory:
-            return PromptHistory(prompt_id, False, False, (), None)
+            return PromptHistory(prompt_id, False, False, (), None, False)
 
     adapter = ComfyUICancellationAdapter(FakeClient())
     result = asyncio.run(adapter.cancel_prompt("prompt-1"))
@@ -529,6 +595,87 @@ def test_comfyui_cancellation_keeps_request_only_when_confirmation_unavailable()
     result = asyncio.run(adapter.cancel_prompt("prompt-1"))
 
     assert result.requested is True
+    assert result.confirmed is False
+
+
+def test_comfyui_modern_cancellation_is_confirmed_without_legacy_fallback() -> None:
+    class FakeClient:
+        modern_calls = 0
+        legacy_calls = 0
+
+        async def cancel_job(self, prompt_id: str) -> bool:
+            assert prompt_id == "prompt-1"
+            self.modern_calls += 1
+            return True
+
+        async def get_queue_status(self) -> ComfyUIQueueStatus:
+            return ComfyUIQueueStatus((), ())
+
+        async def get_prompt_history(self, prompt_id: str) -> PromptHistory:
+            return PromptHistory(prompt_id, False, False, (), None, False)
+
+        async def delete_queued_prompt(self, prompt_id: str) -> None:
+            self.legacy_calls += 1
+
+        async def interrupt_prompt(self, prompt_id: str) -> None:
+            self.legacy_calls += 1
+
+    client = FakeClient()
+    result = asyncio.run(ComfyUICancellationAdapter(client).cancel_prompt("prompt-1"))
+
+    assert result.confirmed is True
+    assert client.modern_calls == 1
+    assert client.legacy_calls == 0
+
+
+def test_comfyui_modern_false_does_not_try_legacy_or_confirm() -> None:
+    class FakeClient:
+        async def cancel_job(self, prompt_id: str) -> bool:
+            return False
+
+        async def get_queue_status(self) -> ComfyUIQueueStatus:
+            raise AssertionError("modern false must not fall back")
+
+    result = asyncio.run(ComfyUICancellationAdapter(FakeClient()).cancel_prompt("prompt-1"))
+
+    assert result.requested is True
+    assert result.confirmed is False
+
+
+@pytest.mark.parametrize("status_code", [404, 405])
+def test_comfyui_modern_404_or_405_uses_legacy_fallback(status_code: int) -> None:
+    class FakeClient:
+        deleted = False
+
+        async def cancel_job(self, prompt_id: str) -> bool:
+            raise ComfyUIResponseError("not supported", status_code=status_code)
+
+        async def get_queue_status(self) -> ComfyUIQueueStatus:
+            return ComfyUIQueueStatus(("prompt-1",) if not self.deleted else (), ())
+
+        async def delete_queued_prompt(self, prompt_id: str) -> None:
+            self.deleted = True
+
+        async def get_prompt_history(self, prompt_id: str) -> PromptHistory:
+            return PromptHistory(prompt_id, False, False, (), None, False)
+
+    client = FakeClient()
+    result = asyncio.run(ComfyUICancellationAdapter(client).cancel_prompt("prompt-1"))
+
+    assert result.confirmed is True
+    assert client.deleted is True
+
+
+def test_comfyui_modern_timeout_does_not_try_legacy() -> None:
+    class FakeClient:
+        async def cancel_job(self, prompt_id: str) -> bool:
+            raise ComfyUITimeoutError("timed out")
+
+        async def get_queue_status(self) -> ComfyUIQueueStatus:
+            raise AssertionError("timeout must not fall back")
+
+    result = asyncio.run(ComfyUICancellationAdapter(FakeClient()).cancel_prompt("prompt-1"))
+
     assert result.confirmed is False
 
 
@@ -709,4 +856,89 @@ def test_phase4_migration_backfills_prompt_and_marks_status_mismatch(tmp_path: P
     assert mismatch.status == "failed"
     assert mismatch.error_code == "migration_status_mismatch"
     assert prompt_entry.submission_state == "submitted"
+    engine.dispose()
+
+
+def test_phase4_migration_deduplicates_retry_links_before_unique_indexes(tmp_path: Path) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'phase4-duplicates.sqlite3').as_posix()}"
+    root = Path(__file__).parents[2]
+    config = Config(str(root / "alembic.ini"))
+    config.set_main_option("script_location", str(root / "alembic"))
+    config.set_main_option("sqlalchemy.url", database_url)
+    command.upgrade(config, "0004_phase4_persistent_generation_queue")
+    engine = create_engine(database_url)
+    snapshot = GenerationSettingsSnapshot.from_settings(_settings()).to_json()
+    timestamp = "2026-01-01 00:00:00"
+    source_generation = "00000000-0000-0000-0000-000000000101"
+    retry_generation_a = "00000000-0000-0000-0000-000000000102"
+    retry_generation_b = "00000000-0000-0000-0000-000000000103"
+    source_batch = "00000000-0000-0000-0000-000000000201"
+    retry_batch_a = "00000000-0000-0000-0000-000000000202"
+    retry_batch_b = "00000000-0000-0000-0000-000000000203"
+    with engine.begin() as connection:
+        for generation_id, retry_of in (
+            (source_generation, None),
+            (retry_generation_a, source_generation),
+            (retry_generation_b, source_generation),
+        ):
+            connection.execute(
+                text(
+                    """INSERT INTO generations
+                    (id, kind, status, parent_generation_id, retry_of_generation_id,
+                     retry_attempt, settings_snapshot_json, snapshot_schema_version,
+                     checkpoint_name, vae_name, seed, width, height,
+                     positive_prompt_search, negative_prompt_search,
+                     workflow_template_id, workflow_template_version, comfy_prompt_id,
+                     favorite, user_note, error_code, error_summary, created_at,
+                     started_at, completed_at, updated_at)
+                    VALUES (:id, 'standard', 'failed', NULL, :retry_of, 0, :snapshot, 1,
+                     'sdxl.safetensors', NULL, 123, 1024, 1024, 'a cat', '',
+                     'sdxl_txt2img', '1.0', NULL, 0, NULL, NULL, NULL,
+                     :timestamp, NULL, :timestamp, :timestamp)"""
+                ),
+                {
+                    "id": generation_id,
+                    "retry_of": retry_of,
+                    "snapshot": snapshot,
+                    "timestamp": timestamp,
+                },
+            )
+        for batch_id, retry_of in (
+            (source_batch, None),
+            (retry_batch_a, source_batch),
+            (retry_batch_b, source_batch),
+        ):
+            connection.execute(
+                text(
+                    """INSERT INTO generation_batches
+                    (id, name, item_count, seed_strategy, start_seed, seed_step,
+                     retry_of_batch_id, created_at, updated_at)
+                    VALUES (:id, 'batch', 1, 'random', NULL, 1, :retry_of,
+                            :timestamp, :timestamp)"""
+                ),
+                {"id": batch_id, "retry_of": retry_of, "timestamp": timestamp},
+            )
+    engine.dispose()
+
+    command.upgrade(config, "head")
+    engine = create_engine(database_url)
+    with engine.connect() as connection:
+        generation_links = connection.execute(
+            text(
+                "SELECT id, retry_of_generation_id FROM generations "
+                "WHERE id IN (:a, :b) ORDER BY id"
+            ),
+            {"a": retry_generation_a, "b": retry_generation_b},
+        ).all()
+        batch_links = connection.execute(
+            text(
+                "SELECT id, retry_of_batch_id FROM generation_batches "
+                "WHERE id IN (:a, :b) ORDER BY id"
+            ),
+            {"a": retry_batch_a, "b": retry_batch_b},
+        ).all()
+    assert generation_links[0].retry_of_generation_id == source_generation
+    assert generation_links[1].retry_of_generation_id is None
+    assert batch_links[0].retry_of_batch_id == source_batch
+    assert batch_links[1].retry_of_batch_id is None
     engine.dispose()

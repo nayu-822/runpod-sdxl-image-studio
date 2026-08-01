@@ -18,6 +18,10 @@ class ComfyUITimeoutError(ComfyUIError):
 class ComfyUIResponseError(ComfyUIError):
     """ComfyUI returned an HTTP or JSON response that cannot be used."""
 
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class ComfyUIParseError(ComfyUIError):
     """A valid response did not contain an interpretable structure."""

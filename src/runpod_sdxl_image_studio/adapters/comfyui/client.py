@@ -126,7 +126,19 @@ class ComfyUIClient:
         """Request interruption of the single active ComfyUI prompt."""
 
         safe_prompt_id = _validate_identifier(prompt_id, "prompt id")
-        await self._post_json("/interrupt", {"prompt_id": safe_prompt_id})
+        await self._post_empty("/interrupt", {"prompt_id": safe_prompt_id})
+
+    async def cancel_job(self, prompt_id: str) -> bool:
+        """Cancel one prompt through ComfyUI's current job API."""
+
+        safe_prompt_id = _validate_identifier(prompt_id, "prompt id")
+        payload = await self._post_json(f"/api/jobs/{quote(safe_prompt_id, safe='')}/cancel", {})
+        cancelled = payload.get("cancelled")
+        if not isinstance(cancelled, bool):
+            raise ComfyUIResponseError(
+                "ComfyUI cancel response did not contain a boolean cancelled"
+            )
+        return cancelled
 
     async def get_queue_status(self) -> ComfyUIQueueStatus:
         """Fetch the prompt IDs in ComfyUI's pending and running queues."""
@@ -141,7 +153,7 @@ class ComfyUIClient:
         """Remove exactly one prompt from ComfyUI's pending queue."""
 
         safe_prompt_id = _validate_identifier(prompt_id, "prompt id")
-        await self._post_json("/queue", {"delete": [safe_prompt_id]})
+        await self._post_empty("/queue", {"delete": [safe_prompt_id]})
 
     async def get_prompt_history(self, prompt_id: str) -> PromptHistory:
         """Fetch and parse one prompt's history entry."""
@@ -223,6 +235,11 @@ class ComfyUIClient:
             raise ComfyUIResponseError("ComfyUI returned a non-object JSON payload")
         return response_payload
 
+    async def _post_empty(self, path: str, payload: Mapping[str, object]) -> None:
+        """POST an operation whose successful response may have no body."""
+
+        await self._request("POST", path, json=dict(payload))
+
     async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         if self._closed:
             raise ComfyUIConnectionError("ComfyUI client is closed")
@@ -244,7 +261,10 @@ class ComfyUIClient:
         except httpx.RequestError as exc:
             raise ComfyUIConnectionError("ComfyUI request failed") from exc
         if not 200 <= response.status_code < 300:
-            raise ComfyUIResponseError(f"ComfyUI returned HTTP status {response.status_code}")
+            raise ComfyUIResponseError(
+                f"ComfyUI returned HTTP status {response.status_code}",
+                status_code=response.status_code,
+            )
         return response
 
     def _join_url(self, path: str) -> str:

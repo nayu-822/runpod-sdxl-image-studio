@@ -277,6 +277,26 @@ class GenerationQueueWorker:
                 limit=500,
             )
             for item in items:
+                if item.generation.status in {
+                    GenerationStatus.COMPLETED,
+                    GenerationStatus.FAILED,
+                    GenerationStatus.CANCELLED,
+                } or item.job.status in {
+                    GenerationStatus.COMPLETED,
+                    GenerationStatus.FAILED,
+                    GenerationStatus.CANCELLED,
+                }:
+                    continue
+                if item.entry.cancel_requested_at is not None:
+                    try:
+                        await self._cancel_item(item)
+                    except Exception:  # noqa: BLE001 - transient adapter failures are retried
+                        logger.warning(
+                            "queue cancellation reconciliation failed generation_id=%s",
+                            item.generation.id,
+                            exc_info=True,
+                        )
+                    continue
                 prompt_id = item.job.prompt_id or item.generation.comfy_prompt_id
                 if not prompt_id:
                     # A submitting/ambiguous item is deliberately isolated. It must not be
