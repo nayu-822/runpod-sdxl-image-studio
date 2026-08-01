@@ -138,7 +138,7 @@ def parse_prompt_history(payload: Mapping[str, object], prompt_id: str) -> Promp
 
     prompt_entry = payload.get(prompt_id)
     if not isinstance(prompt_entry, Mapping):
-        return PromptHistory(prompt_id, False, False, (), None)
+        return PromptHistory(prompt_id, False, False, (), None, False)
 
     status_payload = _mapping_value(prompt_entry, "status") or {}
     status_string = _optional_string(status_payload.get("status_str"))

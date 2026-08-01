@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 from uuid import UUID, uuid4
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -29,6 +29,7 @@ from runpod_sdxl_image_studio.domain.generation_queue import (
     GenerationBatch,
     GenerationQueueEntry,
     GenerationQueueItem,
+    SubmissionState,
 )
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
 
@@ -50,6 +51,7 @@ class GenerationDispatchQueueRepositoryProtocol(Protocol):
         batch_index: int = 0,
         retry_of_generation_id: UUID | None = None,
         retry_attempt: int = 0,
+        pending_limit: int | None = None,
         enqueued_at: datetime | None = None,
     ) -> GenerationQueueItem: ...
 
@@ -62,6 +64,7 @@ class GenerationDispatchQueueRepositoryProtocol(Protocol):
         start_seed: int | None,
         seed_step: int,
         retry_of_batch_id: UUID | None = None,
+        pending_limit: int | None = None,
         enqueued_at: datetime | None = None,
         retry_of_generations: Sequence[UUID | None] | None = None,
         retry_attempts: Sequence[int] | None = None,
@@ -70,6 +73,29 @@ class GenerationDispatchQueueRepositoryProtocol(Protocol):
     def claim_next(
         self, worker_id: str, *, lease_seconds: float, now: datetime | None = None
     ) -> GenerationQueueItem | None: ...
+
+    def begin_submission(
+        self, sequence: int, worker_id: str, *, now: datetime | None = None
+    ) -> GenerationQueueItem: ...
+
+    def mark_submitted(
+        self,
+        sequence: int,
+        worker_id: str,
+        submission_token: str,
+        prompt_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> GenerationQueueItem: ...
+
+    def mark_submission_ambiguous(
+        self,
+        sequence: int,
+        worker_id: str,
+        reason: str,
+        *,
+        now: datetime | None = None,
+    ) -> GenerationQueueItem: ...
 
     def renew_lease(
         self,
@@ -131,6 +157,7 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
         batch_index: int = 0,
         retry_of_generation_id: UUID | None = None,
         retry_attempt: int = 0,
+        pending_limit: int | None = None,
         enqueued_at: datetime | None = None,
     ) -> GenerationQueueItem:
         if batch_index < 0 or retry_attempt < 0:
@@ -140,6 +167,21 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
         job_id = job_id or uuid4()
         try:
             with session_scope(self._session_factory) as session:
+                _begin_immediate_if_sqlite(session)
+                if retry_of_generation_id is not None:
+                    existing = session.scalar(
+                        select(GenerationQueueEntryModel)
+                        .join(
+                            GenerationModel,
+                            GenerationModel.id == GenerationQueueEntryModel.generation_id,
+                        )
+                        .where(
+                            GenerationModel.retry_of_generation_id == str(retry_of_generation_id)
+                        )
+                    )
+                    if existing is not None:
+                        return _queue_item_from_entry(session, existing)
+                _check_pending_capacity(session, pending_limit, 1)
                 generation_row, job_row = _insert_generation_and_job(
                     session,
                     snapshot,
@@ -161,6 +203,7 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
                     job_id=str(job_id),
                     batch_id=str(batch_id) if batch_id is not None else None,
                     batch_index=batch_index,
+                    submission_state=SubmissionState.READY.value,
                     enqueued_at=timestamp,
                     updated_at=timestamp,
                 )
@@ -183,6 +226,7 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
         start_seed: int | None,
         seed_step: int,
         retry_of_batch_id: UUID | None = None,
+        pending_limit: int | None = None,
         enqueued_at: datetime | None = None,
         retry_of_generations: Sequence[UUID | None] | None = None,
         retry_attempts: Sequence[int] | None = None,
@@ -203,11 +247,29 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
         batch_id = uuid4()
         try:
             with session_scope(self._session_factory) as session:
+                _begin_immediate_if_sqlite(session)
                 if (
                     retry_of_batch_id is not None
                     and session.get(GenerationBatchModel, str(retry_of_batch_id)) is None
                 ):
                     raise GenerationDispatchQueueRepositoryError("retry batch was not found")
+                if retry_of_batch_id is not None:
+                    existing_batch = session.scalar(
+                        select(GenerationBatchModel).where(
+                            GenerationBatchModel.retry_of_batch_id == str(retry_of_batch_id)
+                        )
+                    )
+                    if existing_batch is not None:
+                        existing_items = tuple(
+                            _queue_item_from_entry(session, entry)
+                            for entry in session.scalars(
+                                select(GenerationQueueEntryModel)
+                                .where(GenerationQueueEntryModel.batch_id == existing_batch.id)
+                                .order_by(GenerationQueueEntryModel.batch_index.asc())
+                            ).all()
+                        )
+                        return _batch_domain(existing_batch), existing_items
+                _check_pending_capacity(session, pending_limit, len(snapshots))
                 batch_row = GenerationBatchModel(
                     id=str(batch_id),
                     name=name.strip(),
@@ -245,6 +307,7 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
                         job_id=job_row.id,
                         batch_id=str(batch_id),
                         batch_index=index,
+                        submission_state=SubmissionState.READY.value,
                         enqueued_at=timestamp,
                         updated_at=timestamp,
                     )
@@ -279,7 +342,10 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
                         GenerationModel.status == GenerationStatus.PENDING.value,
                         GenerationJobModel.status == GenerationStatus.PENDING.value,
                         GenerationQueueEntryModel.cancel_requested_at.is_(None),
+                        GenerationQueueEntryModel.submission_state == SubmissionState.READY.value,
                         GenerationJobModel.cancel_requested_at.is_(None),
+                        GenerationModel.comfy_prompt_id.is_(None),
+                        GenerationJobModel.comfy_prompt_id.is_(None),
                         or_(
                             GenerationQueueEntryModel.lease_expires_at.is_(None),
                             GenerationQueueEntryModel.lease_expires_at <= timestamp,
@@ -294,6 +360,8 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
                         .where(
                             GenerationQueueEntryModel.sequence == candidate.sequence,
                             GenerationQueueEntryModel.cancel_requested_at.is_(None),
+                            GenerationQueueEntryModel.submission_state
+                            == SubmissionState.READY.value,
                             or_(
                                 GenerationQueueEntryModel.lease_expires_at.is_(None),
                                 GenerationQueueEntryModel.lease_expires_at <= timestamp,
@@ -323,6 +391,160 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
             raise
         except (SQLAlchemyError, ValueError) as exc:
             raise GenerationDispatchQueueRepositoryError("queue claim failed") from exc
+
+    def begin_submission(
+        self, sequence: int, worker_id: str, *, now: datetime | None = None
+    ) -> GenerationQueueItem:
+        timestamp = _utc(now or datetime.now(UTC))
+        normalized_worker = _worker_id(worker_id)
+        try:
+            with session_scope(self._session_factory) as session:
+                entry = session.scalar(
+                    select(GenerationQueueEntryModel).where(
+                        GenerationQueueEntryModel.sequence == sequence,
+                        GenerationQueueEntryModel.worker_id == normalized_worker,
+                        GenerationQueueEntryModel.submission_state == SubmissionState.READY.value,
+                        GenerationQueueEntryModel.cancel_requested_at.is_(None),
+                    )
+                )
+                if entry is None:
+                    raise GenerationDispatchQueueRepositoryError(
+                        "queue entry is not ready for submission"
+                    )
+                generation = session.get(GenerationModel, entry.generation_id)
+                job = session.get(GenerationJobModel, entry.job_id)
+                if generation is None or job is None:
+                    raise GenerationDispatchQueueRepositoryError("queue entry is orphaned")
+                if GenerationStatus(generation.status) is not GenerationStatus.PENDING or (
+                    GenerationStatus(job.status) is not GenerationStatus.PENDING
+                ):
+                    raise GenerationDispatchQueueRepositoryError(
+                        "queue entry is not pending for submission"
+                    )
+                token = str(uuid4())
+                entry.submission_state = SubmissionState.SUBMITTING.value
+                entry.submission_token = token
+                entry.submission_started_at = timestamp
+                entry.updated_at = timestamp
+                session.flush()
+                return _queue_item(session, entry, generation, job)
+        except GenerationDispatchQueueRepositoryError:
+            raise
+        except (SQLAlchemyError, ValueError) as exc:
+            raise GenerationDispatchQueueRepositoryError(
+                "prompt submission state could not be started"
+            ) from exc
+
+    def mark_submitted(
+        self,
+        sequence: int,
+        worker_id: str,
+        submission_token: str,
+        prompt_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> GenerationQueueItem:
+        timestamp = _utc(now or datetime.now(UTC))
+        normalized_worker = _worker_id(worker_id)
+        token = submission_token.strip()
+        prompt = prompt_id.strip()
+        if not token or not prompt or len(prompt) > 100:
+            raise GenerationDispatchQueueRepositoryError(
+                "prompt submission identifiers are invalid"
+            )
+        try:
+            with session_scope(self._session_factory) as session:
+                entry = session.scalar(
+                    select(GenerationQueueEntryModel).where(
+                        GenerationQueueEntryModel.sequence == sequence,
+                        GenerationQueueEntryModel.worker_id == normalized_worker,
+                    )
+                )
+                if entry is None:
+                    raise GenerationDispatchQueueRepositoryError("queue lease was not found")
+                generation = session.get(GenerationModel, entry.generation_id)
+                job = session.get(GenerationJobModel, entry.job_id)
+                if generation is None or job is None:
+                    raise GenerationDispatchQueueRepositoryError("queue entry is orphaned")
+                if entry.submission_state == SubmissionState.SUBMITTED.value:
+                    if job.comfy_prompt_id == prompt and generation.comfy_prompt_id == prompt:
+                        return _queue_item(session, entry, generation, job)
+                    raise GenerationDispatchQueueRepositoryError(
+                        "queue entry has already been submitted"
+                    )
+                if (
+                    entry.submission_state != SubmissionState.SUBMITTING.value
+                    or entry.submission_token != token
+                ):
+                    raise GenerationDispatchQueueRepositoryError(
+                        "prompt submission token does not match"
+                    )
+                generation.comfy_prompt_id = prompt
+                generation.status = GenerationStatus.QUEUED.value
+                generation.updated_at = timestamp
+                job.comfy_prompt_id = prompt
+                job.status = GenerationStatus.QUEUED.value
+                job.updated_at = timestamp
+                entry.submission_state = SubmissionState.SUBMITTED.value
+                entry.updated_at = timestamp
+                session.flush()
+                return _queue_item(session, entry, generation, job)
+        except GenerationDispatchQueueRepositoryError:
+            raise
+        except (IntegrityError, SQLAlchemyError, ValueError) as exc:
+            raise GenerationDispatchQueueRepositoryError(
+                "prompt submission result could not be persisted"
+            ) from exc
+
+    def mark_submission_ambiguous(
+        self,
+        sequence: int,
+        worker_id: str,
+        reason: str,
+        *,
+        now: datetime | None = None,
+    ) -> GenerationQueueItem:
+        timestamp = _utc(now or datetime.now(UTC))
+        normalized_worker = _worker_id(worker_id)
+        summary = reason.strip()[:1000] or "prompt submission outcome could not be determined"
+        try:
+            with session_scope(self._session_factory) as session:
+                entry = session.scalar(
+                    select(GenerationQueueEntryModel).where(
+                        GenerationQueueEntryModel.sequence == sequence,
+                        GenerationQueueEntryModel.worker_id == normalized_worker,
+                    )
+                )
+                if entry is None:
+                    raise GenerationDispatchQueueRepositoryError("queue lease was not found")
+                generation = session.get(GenerationModel, entry.generation_id)
+                job = session.get(GenerationJobModel, entry.job_id)
+                if generation is None or job is None:
+                    raise GenerationDispatchQueueRepositoryError("queue entry is orphaned")
+                if entry.submission_state == SubmissionState.SUBMITTED.value:
+                    return _queue_item(session, entry, generation, job)
+                entry.submission_state = SubmissionState.AMBIGUOUS.value
+                generation.error_code = "prompt_submission_ambiguous"
+                generation.error_summary = summary
+                generation.updated_at = timestamp
+                job.error_code = "prompt_submission_ambiguous"
+                job.error_summary = summary
+                entry.worker_id = None
+                entry.claimed_at = None
+                entry.lease_expires_at = None
+                entry.updated_at = timestamp
+                job.worker_id = None
+                job.claimed_at = None
+                job.lease_expires_at = None
+                job.updated_at = timestamp
+                session.flush()
+                return _queue_item(session, entry, generation, job)
+        except GenerationDispatchQueueRepositoryError:
+            raise
+        except (SQLAlchemyError, ValueError) as exc:
+            raise GenerationDispatchQueueRepositoryError(
+                "ambiguous prompt submission could not be persisted"
+            ) from exc
 
     def renew_lease(
         self,
@@ -402,8 +624,12 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
                 if generation is None or job is None:
                     raise GenerationDispatchQueueRepositoryError("queue entry is orphaned")
                 status = GenerationStatus(generation.status)
-                if status in {GenerationStatus.COMPLETED, GenerationStatus.FAILED}:
-                    raise GenerationDispatchQueueRepositoryError("terminal job cannot be cancelled")
+                if status in {
+                    GenerationStatus.COMPLETED,
+                    GenerationStatus.FAILED,
+                    GenerationStatus.CANCELLED,
+                }:
+                    return _queue_item(session, entry, generation, job)
                 entry.cancel_requested_at = entry.cancel_requested_at or timestamp
                 entry.updated_at = timestamp
                 job.cancel_requested_at = job.cancel_requested_at or timestamp
@@ -436,7 +662,9 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
                     raise GenerationDispatchQueueRepositoryError("queue entry is orphaned")
                 status = GenerationStatus(generation.status)
                 if status in {GenerationStatus.COMPLETED, GenerationStatus.FAILED}:
-                    raise GenerationDispatchQueueRepositoryError("terminal job cannot be cancelled")
+                    return _queue_item(session, entry, generation, job)
+                if status is GenerationStatus.CANCELLED:
+                    return _queue_item(session, entry, generation, job)
                 if status is not GenerationStatus.CANCELLED:
                     generation.status = GenerationStatus.CANCELLED.value
                     generation.completed_at = timestamp
@@ -505,15 +733,32 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
                     select(GenerationQueueEntryModel).where(
                         GenerationQueueEntryModel.lease_expires_at.is_not(None),
                         GenerationQueueEntryModel.lease_expires_at <= timestamp,
-                        GenerationQueueEntryModel.cancel_requested_at.is_(None),
                     )
                 ).all()
                 for entry in entries:
+                    generation = session.get(GenerationModel, entry.generation_id)
+                    job = session.get(GenerationJobModel, entry.job_id)
+                    if (
+                        entry.cancel_requested_at is not None
+                        and entry.submission_state == SubmissionState.READY.value
+                        and generation is not None
+                        and job is not None
+                        and GenerationStatus(generation.status) is GenerationStatus.PENDING
+                        and GenerationStatus(job.status) is GenerationStatus.PENDING
+                    ):
+                        generation.status = GenerationStatus.CANCELLED.value
+                        generation.completed_at = timestamp
+                        generation.updated_at = timestamp
+                        job.status = GenerationStatus.CANCELLED.value
+                        job.cancelled_at = timestamp
+                        job.completed_at = timestamp
+                        job.updated_at = timestamp
+                    if entry.submission_state == SubmissionState.SUBMITTING.value:
+                        entry.submission_state = SubmissionState.AMBIGUOUS.value
                     entry.worker_id = None
                     entry.claimed_at = None
                     entry.lease_expires_at = None
                     entry.updated_at = timestamp
-                    job = session.get(GenerationJobModel, entry.job_id)
                     if job is not None:
                         job.worker_id = None
                         job.claimed_at = None
@@ -686,6 +931,9 @@ def _queue_item(
             claimed_at=_utc_optional(entry.claimed_at),
             lease_expires_at=_utc_optional(entry.lease_expires_at),
             cancel_requested_at=_utc_optional(entry.cancel_requested_at),
+            submission_state=SubmissionState(entry.submission_state),
+            submission_token=entry.submission_token,
+            submission_started_at=_utc_optional(entry.submission_started_at),
             enqueued_at=_utc(entry.enqueued_at),
             updated_at=_utc(entry.updated_at),
         ),
@@ -715,6 +963,29 @@ def _utc(value: datetime) -> datetime:
 
 def _utc_optional(value: datetime | None) -> datetime | None:
     return _utc(value) if value is not None else None
+
+
+def _begin_immediate_if_sqlite(session: Session) -> None:
+    bind = session.get_bind()
+    if bind.dialect.name == "sqlite":
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+
+
+def _check_pending_capacity(session: Session, limit: int | None, additional: int) -> None:
+    if limit is None:
+        return
+    if limit <= 0 or additional < 1:
+        raise GenerationDispatchQueueRepositoryError("queue capacity values are invalid")
+    pending_count = int(
+        session.scalar(
+            select(func.count())
+            .select_from(GenerationModel)
+            .where(GenerationModel.status == GenerationStatus.PENDING.value)
+        )
+        or 0
+    )
+    if pending_count > limit - additional:
+        raise GenerationDispatchQueueRepositoryError("queue pending capacity exceeded")
 
 
 def _lease_delta(seconds: float) -> timedelta:

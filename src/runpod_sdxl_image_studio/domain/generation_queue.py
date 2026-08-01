@@ -18,6 +18,25 @@ class BatchSeedStrategy(StrEnum):
     SEQUENTIAL = "sequential"
 
 
+class SubmissionState(StrEnum):
+    """Durable state machine for the non-idempotent ``/prompt`` call."""
+
+    READY = "ready"
+    SUBMITTING = "submitting"
+    SUBMITTED = "submitted"
+    AMBIGUOUS = "ambiguous"
+
+
+class ReconciliationOutcome(StrEnum):
+    """Outcome of checking a prompt that may have survived a restart."""
+
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    NOT_FOUND = "not_found"
+    UNAVAILABLE = "unavailable"
+
+
 @dataclass(frozen=True)
 class GenerationBatch:
     """Persisted batch metadata; child Generation snapshots remain authoritative."""
@@ -46,6 +65,9 @@ class GenerationQueueEntry:
     claimed_at: datetime | None
     lease_expires_at: datetime | None
     cancel_requested_at: datetime | None
+    submission_state: SubmissionState
+    submission_token: str | None
+    submission_started_at: datetime | None
     enqueued_at: datetime
     updated_at: datetime
 
@@ -65,4 +87,6 @@ __all__ = [
     "GenerationBatch",
     "GenerationQueueEntry",
     "GenerationQueueItem",
+    "ReconciliationOutcome",
+    "SubmissionState",
 ]

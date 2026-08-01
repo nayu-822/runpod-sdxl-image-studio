@@ -9,6 +9,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from runpod_sdxl_image_studio.domain.lora import LoraSetting
 
+RANDOM_SEED = -1
+MAX_SEED = 2**63 - 1
+
 
 class GenerationSettings(BaseModel):
     """Settings accepted by the fixed SDXL txt2img workflow."""
@@ -17,7 +20,7 @@ class GenerationSettings(BaseModel):
 
     positive_prompt: str = Field(default="", max_length=10_000)
     negative_prompt: str = Field(default="", max_length=10_000)
-    seed: int = Field(default=-1, ge=-1, le=2**64 - 1)
+    seed: int = Field(default=RANDOM_SEED, ge=RANDOM_SEED, le=MAX_SEED)
     width: int = Field(default=1024, gt=0)
     height: int = Field(default=1024, gt=0)
     steps: int = Field(default=28, ge=1, le=150)
@@ -65,3 +68,6 @@ class GenerationSettings(BaseModel):
         if len(orders) != len(set(orders)):
             raise ValueError("LoRA order values must be unique")
         return self
+
+
+__all__ = ["MAX_SEED", "RANDOM_SEED", "GenerationSettings"]

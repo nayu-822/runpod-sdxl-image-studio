@@ -7,7 +7,7 @@ import logging
 import ntpath
 import posixpath
 import warnings
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from io import BytesIO
 from types import TracebackType
@@ -27,6 +27,7 @@ from runpod_sdxl_image_studio.adapters.comfyui.models import (
     ComfyUIConnectionResult,
     ComfyUIObjectInfo,
     ComfyUIOutputImage,
+    ComfyUIQueueStatus,
     ComfyUISystemStats,
     PromptHistory,
     QueuedPrompt,
@@ -127,11 +128,31 @@ class ComfyUIClient:
         safe_prompt_id = _validate_identifier(prompt_id, "prompt id")
         await self._post_json("/interrupt", {"prompt_id": safe_prompt_id})
 
+    async def get_queue_status(self) -> ComfyUIQueueStatus:
+        """Fetch the prompt IDs in ComfyUI's pending and running queues."""
+
+        payload = await self._get_json("/queue")
+        return ComfyUIQueueStatus(
+            pending_prompt_ids=_queue_prompt_ids(payload.get("queue_pending")),
+            running_prompt_ids=_queue_prompt_ids(payload.get("queue_running")),
+        )
+
+    async def delete_queued_prompt(self, prompt_id: str) -> None:
+        """Remove exactly one prompt from ComfyUI's pending queue."""
+
+        safe_prompt_id = _validate_identifier(prompt_id, "prompt id")
+        await self._post_json("/queue", {"delete": [safe_prompt_id]})
+
     async def get_prompt_history(self, prompt_id: str) -> PromptHistory:
         """Fetch and parse one prompt's history entry."""
 
         safe_prompt_id = _validate_identifier(prompt_id, "prompt id")
-        payload = await self._get_json(f"/history/{quote(safe_prompt_id, safe='')}")
+        try:
+            payload = await self._get_json(f"/history/{quote(safe_prompt_id, safe='')}")
+        except ComfyUIResponseError as exc:
+            if str(exc) == "ComfyUI returned HTTP status 404":
+                return PromptHistory(safe_prompt_id, False, False, (), None, False)
+            raise
         return parse_prompt_history(payload, safe_prompt_id)
 
     async def get_output_image(self, image: ComfyUIOutputImage) -> bytes:
@@ -237,6 +258,22 @@ def _validate_identifier(value: str, label: str) -> str:
     if value in {".", ".."} or ".." in value:
         raise ComfyUIResponseError(f"ComfyUI {label} is invalid")
     return value
+
+
+def _queue_prompt_ids(value: object) -> tuple[str, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return ()
+    prompt_ids: list[str] = []
+    for entry in value:
+        if isinstance(entry, Sequence) and not isinstance(entry, (str, bytes, bytearray)):
+            candidates = entry[1:2] or entry
+        else:
+            candidates = (entry,)
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate.strip():
+                prompt_ids.append(candidate.strip())
+                break
+    return tuple(prompt_ids)
 
 
 def _validate_filename(value: str) -> str:

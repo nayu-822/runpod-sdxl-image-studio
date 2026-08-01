@@ -13,6 +13,7 @@ from runpod_sdxl_image_studio.services.generation_service import (
     CancelCheck,
     GenerationService,
     ProgressCallback,
+    PromptSubmissionCoordinator,
 )
 
 
@@ -33,6 +34,7 @@ class GenerationExecutionService:
         job_id: UUID,
         progress_callback: ProgressCallback | None = None,
         cancel_check: CancelCheck | None = None,
+        submission_coordinator: PromptSubmissionCoordinator | None = None,
     ) -> GenerationResult:
         if self._queue_repository is not None:
             item = self._queue_repository.get_queue_item(generation_id)
@@ -43,6 +45,7 @@ class GenerationExecutionService:
             job_id,
             progress_callback,
             cancel_check,
+            submission_coordinator,
         )
 
 

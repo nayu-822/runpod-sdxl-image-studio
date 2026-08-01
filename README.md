@@ -1,23 +1,28 @@
 # RunPod SDXL Image Studio
 
-## Phase 4: Persistent generation queue
+## フェーズ4: 永続キュー・復旧・キャンセル
 
-Phase 4 adds a SQLite-backed FIFO dispatch queue and a single process worker. The generation form
-only persists a validated `Generation`/`GenerationJob` pair and queue entry; the worker performs
-the ComfyUI call independently of the browser session.
+SQLite の FIFO キューへ検証済みの `Generation`、`GenerationJob`、Queue entry を同一トランザクションで保存し、アプリケーションプロセス内の単一 worker が ComfyUI への送信と実行を担当します。ブラウザを閉じてもキューと実行状態は DB に残ります。
 
-- One-item enqueue and atomic batch enqueue are supported.
-- Batch seeds support random and sequential strategies with explicit `start_seed` and `seed_step`.
-- Pending, queued, and running jobs can be cancelled; failed or cancelled jobs retry as new
-  generations linked by `retry_of_generation_id` and `retry_attempt`.
-- Failed-only batch retry creates a new batch and preserves each source snapshot.
-- Queue rows include FIFO sequence, worker lease, heartbeat, cancellation request, status filter,
-  and optional Batch ID filter.
-- Startup reconciliation never resubmits a persisted ComfyUI prompt. Missing or unrecoverable
-  prompt state is marked failed after `reconciliation_grace_seconds`.
+### 送信状態と再送信防止
 
-Queue reorder, multi-worker or multi-GPU execution, automatic retry, upscale, image import, and
-cloud synchronization are intentionally outside Phase 4.
+Queue entry は `ready → submitting → submitted` または `ambiguous` の状態を持ちます。`submitting` へ遷移するときに UUID の `submission_token` と UTC の `submission_started_at` を永続化し、その token を ComfyUI の `client_id` に使用します。`/prompt` 成功後は prompt ID、Generation、Job、Queue entry を同一 DB トランザクションで `submitted` にします。
+
+prompt ID の保存に失敗した場合は `ready` に戻しません。結果不明の `submitting` は `ambiguous` として隔離し、自動再送信しません。ambiguous の手動確認後にのみ運用者が判断します。DB障害で ambiguous も保存できない場合、worker は fail-closed で停止します。
+
+### 復旧と状態
+
+起動時および稼働中に prompt ID を持つ `queued` / `running` / `submitting` / `ambiguous` を reconciliation します。結果は `IN_PROGRESS`、`COMPLETED`、`FAILED`、`NOT_FOUND`、`UNAVAILABLE` に区別します。prompt ID がある Job は、どの結果でも `/prompt` へ再送信しません。`NOT_FOUND` のみ grace 期間経過後に監査用エラーコードで失敗扱いにします。`UNAVAILABLE` や `IN_PROGRESS` は状態を維持します。完了時は既存 Artifact を確認して冪等に主 Artifact と完了状態を更新します。
+
+0004適用済み DB に残る prompt ID なしの queued/running 状態不一致は、0005 migration で `migration_status_mismatch` として Generation と Job を原子的に failed にします。既存画像、Artifact、履歴、Preset は削除しません。
+
+### キャンセルと再試行
+
+未claimの pending は `cancel_requested` 保存後に cancelled へ遷移できます。claim済み、submitting、queued、running は即時に terminal へせず、ComfyUI の対象 prompt の queue削除または interrupt 後、queue/history で停止を確認できた場合だけ cancelled にします。確認不能・接続失敗時は元の状態と `cancel_requested` を保持します。completed/failed/cancelled へのキャンセルは冪等です。
+
+単体 retry と failed-only batch retry は元 Generation/Batch との関連を持つ新規キュー項目です。同じ retry 要求を複数回受けても、0005 の NULL許容 partial unique index により既存結果を返し、新規項目を重複作成しません。Random seed、連番 seed、SQLite保存値の上限は `MAX_SEED = 2**63 - 1` に統一しています。
+
+Queue 並べ替え、複数 worker/GPU、自動 retry、Phase 5アップスケール、外部画像metadata、Google Drive同期、汎用workflow editor、LoRA学習は今回の対象外です。
 
 ## フェーズ3A: 生成履歴・スナップショット・再生成
 

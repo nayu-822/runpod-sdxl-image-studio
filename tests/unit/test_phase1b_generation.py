@@ -40,7 +40,7 @@ from runpod_sdxl_image_studio.domain.generation import (
     GenerationResult,
     GenerationStatus,
 )
-from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
+from runpod_sdxl_image_studio.domain.generation_settings import MAX_SEED, GenerationSettings
 from runpod_sdxl_image_studio.domain.system_status import CapabilityRefreshResult
 from runpod_sdxl_image_studio.services.generation_service import GenerationService
 from runpod_sdxl_image_studio.ui.app_builder import build_app
@@ -247,7 +247,7 @@ def test_generation_settings_accepts_inclusive_boundaries() -> None:
             "height": 2048,
             "steps": 150,
             "cfg_scale": 30,
-            "seed": 2**64 - 1,
+            "seed": MAX_SEED,
         }
     )
 

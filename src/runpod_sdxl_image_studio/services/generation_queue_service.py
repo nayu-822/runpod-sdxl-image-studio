@@ -18,11 +18,14 @@ from runpod_sdxl_image_studio.domain.generation_queue import (
     BatchSeedStrategy,
     GenerationBatch,
     GenerationQueueItem,
+    SubmissionState,
 )
-from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
+from runpod_sdxl_image_studio.domain.generation_settings import (
+    MAX_SEED,
+    RANDOM_SEED,
+    GenerationSettings,
+)
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
-
-MAX_SEED = 2**64 - 1
 
 
 class GenerationCancellationAdapterProtocol(Protocol):
@@ -77,18 +80,18 @@ class GenerationQueueService:
         *,
         parent_generation_id: UUID | None = None,
     ) -> QueueEnqueueResult:
-        self._ensure_pending_capacity(1)
         resolved = settings.model_copy(update={"seed": _resolve_seed(settings.seed)})
         try:
             snapshot = GenerationSettingsSnapshot.from_settings(resolved)
             item = self._repository.enqueue_single(
                 snapshot,
                 parent_generation_id=parent_generation_id,
+                pending_limit=self._settings.queue_max_pending_jobs,
             )
             self._wake()
             return QueueEnqueueResult(item=item, queue_position=item.entry.sequence)
         except (GenerationDispatchQueueRepositoryError, ValueError) as exc:
-            raise GenerationQueueServiceError("生成をキューへ追加できませんでした。") from exc
+            raise GenerationQueueServiceError(_enqueue_error_message(exc, "生成")) from exc
 
     def enqueue_batch(
         self,
@@ -102,7 +105,6 @@ class GenerationQueueService:
     ) -> BatchEnqueueResult:
         strategy = _seed_strategy(seed_strategy)
         self._validate_batch(count, strategy, start_seed, seed_step, name)
-        self._ensure_pending_capacity(count)
         seeds = _batch_seeds(count, strategy, start_seed, seed_step)
         try:
             snapshots = tuple(
@@ -115,11 +117,12 @@ class GenerationQueueService:
                 seed_strategy=strategy,
                 start_seed=start_seed,
                 seed_step=seed_step,
+                pending_limit=self._settings.queue_max_pending_jobs,
             )
             self._wake()
             return BatchEnqueueResult(batch=batch, items=items)
         except (GenerationDispatchQueueRepositoryError, ValueError) as exc:
-            raise GenerationQueueServiceError("バッチをキューへ追加できませんでした。") from exc
+            raise GenerationQueueServiceError(_enqueue_error_message(exc, "バッチ")) from exc
 
     def list_jobs(
         self,
@@ -141,14 +144,24 @@ class GenerationQueueService:
     async def cancel(self, generation_id: UUID) -> GenerationQueueItem:
         try:
             requested = self._repository.request_cancel(generation_id)
+            if requested.generation.status in {
+                GenerationStatus.COMPLETED,
+                GenerationStatus.FAILED,
+                GenerationStatus.CANCELLED,
+            }:
+                return requested
             if (
                 requested.generation.status is GenerationStatus.PENDING
-                or not requested.job.prompt_id
+                and requested.entry.worker_id is None
+                and requested.entry.submission_state is SubmissionState.READY
             ):
                 return self._repository.mark_cancelled(generation_id)
+            prompt_id = requested.job.prompt_id or requested.generation.comfy_prompt_id
+            if not prompt_id:
+                return requested
             if self._cancellation_adapter is None:
                 raise GenerationQueueServiceError("実行中ジョブのキャンセルAdapterが未設定です。")
-            result = await self._cancellation_adapter.cancel_prompt(requested.job.prompt_id)
+            result = await self._cancellation_adapter.cancel_prompt(prompt_id)
             if not result.confirmed:
                 raise GenerationQueueServiceError("ComfyUIのキャンセル確認を取得できませんでした。")
             return self._repository.mark_cancelled(generation_id)
@@ -169,20 +182,22 @@ class GenerationQueueService:
                 raise GenerationQueueServiceError(
                     "失敗またはキャンセル済みジョブだけ再試行できます。"
                 )
-            self._ensure_pending_capacity(1)
             new_item = self._repository.enqueue_single(
                 item.generation.settings_snapshot,
                 kind=item.generation.kind,
                 parent_generation_id=item.generation.parent_generation_id,
                 retry_of_generation_id=item.generation.id,
                 retry_attempt=item.generation.retry_attempt + 1,
+                pending_limit=self._settings.queue_max_pending_jobs,
             )
             self._wake()
             return QueueEnqueueResult(new_item, new_item.entry.sequence)
         except GenerationQueueServiceError:
             raise
         except (GenerationDispatchQueueRepositoryError, ValueError) as exc:
-            raise GenerationQueueServiceError("ジョブを再試行できませんでした。") from exc
+            raise GenerationQueueServiceError(
+                _enqueue_error_message(exc, "ジョブの再試行")
+            ) from exc
 
     def retry_failed_batch(self, batch_id: UUID) -> BatchEnqueueResult | None:
         try:
@@ -197,7 +212,6 @@ class GenerationQueueService:
             )
             if source_batch is None:
                 raise GenerationQueueServiceError("対象バッチが見つかりません。")
-            self._ensure_pending_capacity(len(failed))
             snapshots = tuple(item.generation.settings_snapshot for item in failed)
             batch, items = self._repository.enqueue_batch(
                 snapshots,
@@ -208,13 +222,16 @@ class GenerationQueueService:
                 retry_of_batch_id=source_batch.id,
                 retry_of_generations=tuple(item.generation.id for item in failed),
                 retry_attempts=tuple(item.generation.retry_attempt + 1 for item in failed),
+                pending_limit=self._settings.queue_max_pending_jobs,
             )
             self._wake()
             return BatchEnqueueResult(batch, items)
         except GenerationQueueServiceError:
             raise
         except (GenerationDispatchQueueRepositoryError, ValueError) as exc:
-            raise GenerationQueueServiceError("失敗ジョブを再実行できませんでした。") from exc
+            raise GenerationQueueServiceError(
+                _enqueue_error_message(exc, "失敗ジョブの再試行")
+            ) from exc
 
     def _ensure_pending_capacity(self, additional: int) -> None:
         if additional < 1:
@@ -258,7 +275,13 @@ class GenerationQueueService:
 
 
 def _resolve_seed(seed: int) -> int:
-    return secrets.randbelow(MAX_SEED + 1) if seed == -1 else seed
+    return secrets.randbelow(MAX_SEED + 1) if seed == RANDOM_SEED else seed
+
+
+def _enqueue_error_message(error: Exception, subject: str) -> str:
+    if "capacity" in str(error):
+        return "キュー待ち件数の上限に達しています。"
+    return f"{subject}をキューへ追加できませんでした。"
 
 
 def _batch_seeds(
@@ -268,7 +291,7 @@ def _batch_seeds(
     seed_step: int,
 ) -> tuple[int, ...]:
     if strategy is BatchSeedStrategy.RANDOM:
-        return tuple(_resolve_seed(-1) for _ in range(count))
+        return tuple(_resolve_seed(RANDOM_SEED) for _ in range(count))
     if start_seed is None:
         raise GenerationQueueServiceError("連番seedには開始seedが必要です。")
     return tuple(start_seed + index * seed_step for index in range(count))

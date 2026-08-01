@@ -259,10 +259,21 @@ class GenerationQueueEntryModel(Base):
     cancel_requested_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    submission_state: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="ready", server_default="ready"
+    )
+    submission_token: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    submission_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     enqueued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     __table_args__ = (
         CheckConstraint("batch_index >= 0", name="ck_generation_queue_batch_index_nonnegative"),
+        CheckConstraint(
+            "submission_state IN ('ready', 'submitting', 'submitted', 'ambiguous')",
+            name="ck_generation_queue_submission_state",
+        ),
         UniqueConstraint("batch_id", "batch_index", name="uq_generation_queue_batch_index"),
     )
 
@@ -294,6 +305,18 @@ Index("ix_presets_updated", PresetModel.updated_at)
 Index("ix_generation_batches_created", GenerationBatchModel.created_at)
 Index("ix_generation_queue_batch", GenerationQueueEntryModel.batch_id)
 Index("ix_generation_queue_lease", GenerationQueueEntryModel.lease_expires_at)
+Index(
+    "uq_generations_retry_of_generation",
+    GenerationModel.retry_of_generation_id,
+    unique=True,
+    sqlite_where=GenerationModel.retry_of_generation_id.is_not(None),
+)
+Index(
+    "uq_generation_batches_retry_of_batch",
+    GenerationBatchModel.retry_of_batch_id,
+    unique=True,
+    sqlite_where=GenerationBatchModel.retry_of_batch_id.is_not(None),
+)
 
 
 def _utc(value: datetime | None) -> datetime | None:

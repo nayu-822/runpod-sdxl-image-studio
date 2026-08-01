@@ -8,7 +8,7 @@ from typing import Any, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
+from runpod_sdxl_image_studio.domain.generation_settings import MAX_SEED, GenerationSettings
 from runpod_sdxl_image_studio.domain.lora import LoraSetting
 
 CURRENT_PRESET_SCHEMA_VERSION = 1
@@ -62,7 +62,7 @@ class GenerationPresetPayload(PresetPayload):
     sampler_name: str = Field(min_length=1)
     scheduler_name: str = Field(min_length=1)
     seed_mode: SeedMode = SeedMode.RANDOM
-    fixed_seed: int | None = Field(default=None, ge=0, le=2**64 - 1)
+    fixed_seed: int | None = Field(default=None, ge=0, le=MAX_SEED)
     positive_prompt: str = Field(default="", max_length=10_000)
     negative_prompt: str = Field(default="", max_length=10_000)
     loras: tuple[LoraSetting, ...] = ()

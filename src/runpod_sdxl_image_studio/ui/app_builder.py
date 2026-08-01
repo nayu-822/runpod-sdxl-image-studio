@@ -46,7 +46,10 @@ from runpod_sdxl_image_studio.adapters.storage.history_thumbnail_storage import 
 from runpod_sdxl_image_studio.adapters.storage.local_storage import LocalStorageAdapter
 from runpod_sdxl_image_studio.adapters.storage.lora_thumbnail_storage import LoraThumbnailStorage
 from runpod_sdxl_image_studio.config import Settings, get_settings
-from runpod_sdxl_image_studio.domain.generation_queue import GenerationQueueItem
+from runpod_sdxl_image_studio.domain.generation_queue import (
+    GenerationQueueItem,
+    ReconciliationOutcome,
+)
 from runpod_sdxl_image_studio.domain.lora_search import append_trigger_words
 from runpod_sdxl_image_studio.jobs.generation_queue_worker import (
     GenerationQueueRuntime,
@@ -141,6 +144,7 @@ from runpod_sdxl_image_studio.ui.tabs.system_tab import (
     build_generation_tab,
     build_system_tab,
     capability_refresh_outputs,
+    disable_batch_enqueue_button,
     disable_generate_button,
     make_batch_enqueue_handler,
     make_check_connection_handler,
@@ -231,10 +235,11 @@ def build_app(
         thumbnail_storage=HistoryThumbnailStorage(app_settings),
         metadata_storage=GenerationMetadataStorage(app_settings.data_dir),
     )
+    cancellation_adapter = ComfyUICancellationAdapter(client, app_settings)
     queue_service = GenerationQueueService(
         dispatch_queue_repository,
         app_settings,
-        ComfyUICancellationAdapter(client),
+        cancellation_adapter,
     )
     execution_service = GenerationExecutionService(
         generation_service,
@@ -255,18 +260,19 @@ def build_app(
         failure_repository=failure_repository,
     )
 
-    async def reconcile_queue_item(item: GenerationQueueItem) -> bool:
+    async def reconcile_queue_item(item: GenerationQueueItem) -> ReconciliationOutcome:
         queue_item = item
         prompt_id = queue_item.job.prompt_id or queue_item.generation.comfy_prompt_id
         if not prompt_id:
-            return False
-        return await generation_service.recover_prompt(queue_item.generation.id, prompt_id)
+            return ReconciliationOutcome.UNAVAILABLE
+        return await generation_service.reconcile_prompt(queue_item.generation.id, prompt_id)
 
     queue_worker = GenerationQueueWorker(
         dispatch_queue_repository,
         execution_service,
         app_settings,
         reconcile_handler=reconcile_queue_item,
+        cancellation_adapter=cancellation_adapter,
     )
     queue_runtime = GenerationQueueRuntime(queue_worker)
     queue_service.set_wake_callback(queue_runtime.wake)
@@ -337,7 +343,12 @@ def build_app(
             inputs=[generation.size_preset],
             outputs=[generation.width, generation.height],
         )
-        generation.batch_enqueue_button.click(
+        batch_enqueue_event = generation.batch_enqueue_button.click(
+            fn=disable_batch_enqueue_button,
+            outputs=[generation.batch_enqueue_button],
+            queue=False,
+        )
+        batch_enqueue_event.then(
             fn=make_batch_enqueue_handler(queue_service, app_settings.max_loras),
             inputs=[
                 generation.checkpoint,
@@ -364,6 +375,7 @@ def build_app(
                 generation.progress,
                 generation.batch_message,
             ],
+            concurrency_limit=1,
         )
         queue_refresh.click(
             fn=make_queue_refresh_handler(queue_service),
@@ -380,28 +392,46 @@ def build_app(
             inputs=[queue_jobs],
             outputs=[queue_detail],
         )
-        queue_cancel.click(
+        queue_cancel_event = queue_cancel.click(
+            fn=lambda: gr.Button(interactive=False),
+            outputs=[queue_cancel],
+            queue=False,
+        )
+        queue_cancel_event.then(
             fn=make_queue_cancel_handler(queue_service),
             inputs=[queue_jobs],
-            outputs=[queue_message],
+            outputs=[queue_cancel, queue_message],
+            concurrency_limit=1,
         ).then(
             fn=make_queue_refresh_handler(queue_service),
             inputs=[queue_status, queue_batch_filter],
             outputs=[queue_jobs, queue_message],
         )
-        queue_retry.click(
+        queue_retry_event = queue_retry.click(
+            fn=lambda: gr.Button(interactive=False),
+            outputs=[queue_retry],
+            queue=False,
+        )
+        queue_retry_event.then(
             fn=make_queue_retry_handler(queue_service),
             inputs=[queue_jobs],
-            outputs=[queue_message],
+            outputs=[queue_retry, queue_message],
+            concurrency_limit=1,
         ).then(
             fn=make_queue_refresh_handler(queue_service),
             inputs=[queue_status, queue_batch_filter],
             outputs=[queue_jobs, queue_message],
         )
-        queue_retry_batch.click(
+        queue_retry_batch_event = queue_retry_batch.click(
+            fn=lambda: gr.Button(interactive=False),
+            outputs=[queue_retry_batch],
+            queue=False,
+        )
+        queue_retry_batch_event.then(
             fn=make_queue_retry_batch_handler(queue_service),
             inputs=[queue_jobs],
-            outputs=[queue_message],
+            outputs=[queue_retry_batch, queue_message],
+            concurrency_limit=1,
         ).then(
             fn=make_queue_refresh_handler(queue_service),
             inputs=[queue_status, queue_batch_filter],

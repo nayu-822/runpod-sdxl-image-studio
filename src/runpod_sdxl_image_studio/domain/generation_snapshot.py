@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
+from runpod_sdxl_image_studio.domain.generation_settings import MAX_SEED, GenerationSettings
 
 CURRENT_SNAPSHOT_SCHEMA_VERSION = 1
 
@@ -33,7 +33,7 @@ class GenerationSettingsSnapshot(BaseModel):
     schema_version: int = Field(default=CURRENT_SNAPSHOT_SCHEMA_VERSION, ge=1)
     positive_prompt: str = Field(default="", max_length=10_000)
     negative_prompt: str = Field(default="", max_length=10_000)
-    seed: int = Field(ge=0, le=2**64 - 1)
+    seed: int = Field(ge=0, le=MAX_SEED)
     width: int = Field(gt=0)
     height: int = Field(gt=0)
     steps: int = Field(ge=1, le=150)

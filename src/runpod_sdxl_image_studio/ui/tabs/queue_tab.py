@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from uuid import UUID
 
 import gradio as gr
@@ -78,48 +78,60 @@ def make_queue_detail_handler(service: GenerationQueueService) -> Callable[[str 
 
 def make_queue_cancel_handler(
     service: GenerationQueueService,
-) -> Callable[[str | None], object]:
-    async def handler(selected: str | None) -> object:
+) -> Callable[[str | None], Awaitable[tuple[object, str]]]:
+    async def handler(selected: str | None) -> tuple[object, str]:
         if not selected:
-            return "キャンセルするジョブを選択してください。"
+            return gr.Button(interactive=True), "キャンセルするジョブを選択してください。"
         try:
-            await service.cancel(UUID(selected))
-            return "キャンセル処理を受け付けました。"
+            item = await service.cancel(UUID(selected))
+            message = (
+                "キャンセルしました。"
+                if item.generation.status is GenerationStatus.CANCELLED
+                else "キャンセル要求を保存しました。ComfyUI側の確認後に状態を更新します。"
+            )
+            return gr.Button(interactive=True), message
         except (GenerationQueueServiceError, ValueError) as exc:
-            return str(exc)
+            return gr.Button(interactive=True), str(exc)
 
     return handler
 
 
-def make_queue_retry_handler(service: GenerationQueueService) -> Callable[[str | None], str]:
-    def handler(selected: str | None) -> str:
+def make_queue_retry_handler(
+    service: GenerationQueueService,
+) -> Callable[[str | None], tuple[object, str]]:
+    def handler(selected: str | None) -> tuple[object, str]:
         if not selected:
-            return "再試行するジョブを選択してください。"
+            return gr.Button(interactive=True), "再試行するジョブを選択してください。"
         try:
             result = service.retry(UUID(selected))
-            return f"再試行をキューへ追加しました。sequence={result.queue_position}"
+            return gr.Button(interactive=True), (
+                f"再試行をキューへ追加しました。sequence={result.queue_position}"
+            )
         except (GenerationQueueServiceError, ValueError) as exc:
-            return str(exc)
+            return gr.Button(interactive=True), str(exc)
 
     return handler
 
 
-def make_queue_retry_batch_handler(service: GenerationQueueService) -> Callable[[str | None], str]:
-    def handler(selected: str | None) -> str:
+def make_queue_retry_batch_handler(
+    service: GenerationQueueService,
+) -> Callable[[str | None], tuple[object, str]]:
+    def handler(selected: str | None) -> tuple[object, str]:
         if not selected:
-            return "対象バッチのジョブを選択してください。"
+            return gr.Button(interactive=True), "対象バッチのジョブを選択してください。"
         try:
             item = service.get_job_detail(UUID(selected))
             if item is None or item.entry.batch_id is None:
-                return "バッチジョブを選択してください。"
+                return gr.Button(interactive=True), "バッチジョブを選択してください。"
             result = service.retry_failed_batch(item.entry.batch_id)
-            return (
+            message = (
                 "失敗ジョブはありません。"
                 if result is None
                 else f"{len(result.items)}件を再実行キューへ追加しました。"
             )
+            return gr.Button(interactive=True), message
         except (GenerationQueueServiceError, ValueError) as exc:
-            return str(exc)
+            return gr.Button(interactive=True), str(exc)
 
     return handler
 

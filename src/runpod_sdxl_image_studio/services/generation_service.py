@@ -53,7 +53,12 @@ from runpod_sdxl_image_studio.domain.generation import (
     StoredImage,
 )
 from runpod_sdxl_image_studio.domain.generation_artifact import ArtifactType, GenerationArtifact
-from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
+from runpod_sdxl_image_studio.domain.generation_queue import ReconciliationOutcome
+from runpod_sdxl_image_studio.domain.generation_settings import (
+    MAX_SEED,
+    RANDOM_SEED,
+    GenerationSettings,
+)
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
 from runpod_sdxl_image_studio.domain.job import GenerationJob
 from runpod_sdxl_image_studio.domain.system_status import CapabilityRefreshResult
@@ -90,6 +95,17 @@ class CapabilitiesProvider(Protocol):
 
 class LoraUsageRecorder(Protocol):
     def record_usage(self, file_names: tuple[str, ...], completed_at: datetime) -> None: ...
+
+
+class PromptSubmissionCoordinator(Protocol):
+    """Coordinates durable state around the non-idempotent prompt request."""
+
+    started: bool
+    submitted: bool
+
+    def begin(self) -> str: ...
+
+    def mark_submitted(self, prompt_id: str, submission_token: str) -> None: ...
 
 
 class GenerationService:
@@ -185,38 +201,40 @@ class GenerationService:
 
         return self._results.get(generation_id)
 
-    async def recover_prompt(self, generation_id: UUID, prompt_id: str) -> bool:
-        """Complete one existing prompt from history without submitting it again."""
+    async def reconcile_prompt(self, generation_id: UUID, prompt_id: str) -> ReconciliationOutcome:
+        """Reconcile one existing prompt without ever submitting it again."""
 
         if (
             self._generation_repository is None
             or self._job_repository is None
             or self._artifact_repository is None
         ):
-            return False
+            return ReconciliationOutcome.UNAVAILABLE
         try:
             generation = self._generation_repository.get_by_id(generation_id)
             job = self._job_repository.get_by_generation(generation_id)
             if generation is None or job is None:
-                return False
+                return ReconciliationOutcome.UNAVAILABLE
             if generation.status is GenerationStatus.COMPLETED:
-                return True
+                return ReconciliationOutcome.COMPLETED
             if generation.status in {GenerationStatus.FAILED, GenerationStatus.CANCELLED}:
-                return False
+                return ReconciliationOutcome.FAILED
             existing_image = self._artifact_repository.get_primary_image(generation_id)
             if existing_image is not None:
                 self._complete_existing_generation(generation_id, job.id)
-                return True
+                return ReconciliationOutcome.COMPLETED
             history = await self._client.get_prompt_history(prompt_id)
+            if not history.exists:
+                return ReconciliationOutcome.NOT_FOUND
             if history.is_failed:
                 self._mark_failed_pair(
                     job,
                     GenerationErrorCode.COMFYUI_EXECUTION.value,
                     "ComfyUIで生成が失敗しました。",
                 )
-                return False
+                return ReconciliationOutcome.FAILED
             if not history.is_completed or not history.outputs:
-                return False
+                return ReconciliationOutcome.IN_PROGRESS
             image_bytes = await self._client.get_output_image(history.outputs[0])
             stored_image = self._storage.store_image(
                 image_bytes, generation_id, generation.created_at
@@ -237,7 +255,7 @@ class GenerationService:
                 generation.parent_generation_id,
                 is_recovery=True,
             )
-            return True
+            return ReconciliationOutcome.COMPLETED
         except (ComfyUIError, GenerationRepositoryError, StorageError, ValueError) as exc:
             logger.error(
                 "Generation recovery failed generation=%s prompt_id=%s error=%s",
@@ -246,7 +264,14 @@ class GenerationService:
                 type(exc).__name__,
                 exc_info=True,
             )
-            return False
+            return ReconciliationOutcome.UNAVAILABLE
+
+    async def recover_prompt(self, generation_id: UUID, prompt_id: str) -> bool:
+        """Compatibility wrapper for the pre-Phase 4 recovery service."""
+
+        return (
+            await self.reconcile_prompt(generation_id, prompt_id)
+        ) is ReconciliationOutcome.COMPLETED
 
     async def generate(
         self,
@@ -269,6 +294,7 @@ class GenerationService:
         job_id: UUID,
         progress_callback: ProgressCallback | None = None,
         cancel_check: CancelCheck | None = None,
+        submission_coordinator: PromptSubmissionCoordinator | None = None,
     ) -> GenerationResult:
         """Execute an already persisted pending queue item without creating records."""
 
@@ -338,6 +364,7 @@ class GenerationService:
                         generation.kind,
                         generation.parent_generation_id,
                         cancel_check=cancel_check,
+                        submission_coordinator=submission_coordinator,
                     ),
                     timeout=self._settings.generation_timeout_seconds,
                 )
@@ -356,6 +383,12 @@ class GenerationService:
             except GenerationCancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - execution boundary persists safe failures
+                if (
+                    submission_coordinator is not None
+                    and submission_coordinator.started
+                    and not submission_coordinator.submitted
+                ):
+                    raise
                 error_code = _generation_error_code(exc)
                 error_summary = _safe_generation_error(exc)
                 job.status = GenerationStatus.FAILED
@@ -576,6 +609,7 @@ class GenerationService:
         kind: GenerationKind,
         parent_generation_id: UUID | None,
         cancel_check: CancelCheck | None = None,
+        submission_coordinator: PromptSubmissionCoordinator | None = None,
     ) -> None:
         capabilities_result = await self._capabilities_provider()
         capabilities = capabilities_result.capabilities
@@ -587,14 +621,21 @@ class GenerationService:
             raise GenerationCancelledError("generation was cancelled before prompt submission")
 
         workflow = self._workflow_adapter.build_txt2img_workflow(settings)
-        client_id = str(self._id_factory())
+        submission_token = (
+            submission_coordinator.begin()
+            if submission_coordinator is not None
+            else str(self._id_factory())
+        )
+        client_id = submission_token
         queued = await self._client.queue_prompt(workflow, client_id)
         if queued.node_errors:
             raise ComfyUIPromptError("ComfyUI rejected workflow nodes")
         job.prompt_id = queued.prompt_id
         job.status = GenerationStatus.QUEUED
         try:
-            if self._queue_repository is not None:
+            if submission_coordinator is not None:
+                submission_coordinator.mark_submitted(queued.prompt_id, submission_token)
+            elif self._queue_repository is not None:
                 self._queue_repository.mark_queued(
                     generation_id=job.generation_id,
                     job_id=job.id,
@@ -951,7 +992,7 @@ class GenerationService:
 
 
 def _resolve_seed(seed: int) -> int:
-    return secrets.randbelow(2**64) if seed == -1 else seed
+    return secrets.randbelow(MAX_SEED + 1) if seed == RANDOM_SEED else seed
 
 
 def _validate_generation(

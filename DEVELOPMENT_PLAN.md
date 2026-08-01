@@ -1,11 +1,14 @@
 # RunPod SDXL Image Studio 開発計画
 
-## Phase 4 status
+## フェーズ4の実装状況
 
-Phase 4 persistent FIFO queue, single-worker lease runtime, batch seed strategies, cancellation,
-retry, failed-only batch retry, startup reconciliation, queue filters, settings, migration 0004,
-and automated tests are implemented. Queue reorder, multiple workers/GPUs, automatic retry,
-upscale, image metadata import, and cloud synchronization remain outside this phase.
+永続 FIFO Queue、単一 worker の lease、Random/連番 batch seed、キャンセル確認、単体 retry、failed-only batch retry、起動時・定期 reconciliation、Queue filter、0004/0005 migration、Gradio二重操作防止、Fake/Mockによる自動テストを実装済みです。
+
+送信状態は `ready → submitting → submitted` または `ambiguous` です。`cancel_requested` はキャンセル要求の保存状態であり、ComfyUI 側の停止確認後にのみ `cancelled` へ遷移します。prompt ID を持つ Job は再送信せず、`IN_PROGRESS` と `UNAVAILABLE` は失敗へ変更しません。`NOT_FOUND` のみ grace 期間後の失敗候補です。
+
+0005では既存0004 DBの状態不一致を backfill し、prompt IDがある行は安全な reconciliation 対象、prompt IDがなく実行継続できない行は `migration_status_mismatch` として Generation/Job を failed にします。既存の画像、Artifact、履歴、Presetは削除しません。
+
+Queue 並べ替え、複数 worker/GPU、自動 retry、Phase 5アップスケール、外部画像metadata、Google Drive同期、ComfyUI汎用workflow editor、LoRA学習は未実装です。
 
 ## 方針
 

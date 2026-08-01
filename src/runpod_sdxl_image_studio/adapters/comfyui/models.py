@@ -94,3 +94,12 @@ class PromptHistory:
     is_failed: bool
     outputs: tuple[ComfyUIOutputImage, ...]
     error_message: str | None
+    exists: bool = True
+
+
+@dataclass(frozen=True)
+class ComfyUIQueueStatus:
+    """The prompt IDs currently pending or running in ComfyUI."""
+
+    pending_prompt_ids: tuple[str, ...]
+    running_prompt_ids: tuple[str, ...]

@@ -649,6 +649,12 @@ def disable_enqueue_button() -> gr.Button:
     return gr.Button(value="キューへ追加中...", interactive=False)
 
 
+def disable_batch_enqueue_button() -> gr.Button:
+    """Disable the batch button before its transaction starts."""
+
+    return gr.Button(value="Batch投入中...", interactive=False)
+
+
 def report_gradio_progress(progress: gr.Progress, update: GenerationProgress) -> None:
     """Convert domain 0-100 progress into Gradio's 0-1 or tuple format."""
 

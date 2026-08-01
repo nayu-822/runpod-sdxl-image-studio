@@ -6,8 +6,10 @@ import asyncio
 import contextlib
 import logging
 import threading
+import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from typing import Protocol
 from uuid import UUID, uuid4
 
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_dispatch_queue_repository import (  # noqa: E501
@@ -16,15 +18,62 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_dispatch
 )
 from runpod_sdxl_image_studio.config import Settings
 from runpod_sdxl_image_studio.domain.generation import GenerationProgress, GenerationStatus
-from runpod_sdxl_image_studio.domain.generation_queue import GenerationQueueItem
+from runpod_sdxl_image_studio.domain.generation_queue import (
+    GenerationQueueItem,
+    ReconciliationOutcome,
+    SubmissionState,
+)
+from runpod_sdxl_image_studio.services.generation_errors import PromptPersistenceError
 from runpod_sdxl_image_studio.services.generation_execution_service import (
     GenerationExecutionService,
 )
-from runpod_sdxl_image_studio.services.generation_service import GenerationCancelledError
+from runpod_sdxl_image_studio.services.generation_queue_service import CancellationResult
+from runpod_sdxl_image_studio.services.generation_service import (
+    GenerationCancelledError,
+    PromptSubmissionCoordinator,
+)
 
 logger = logging.getLogger(__name__)
 ProgressReporter = Callable[[GenerationProgress], None]
-ReconcileHandler = Callable[[GenerationQueueItem], Awaitable[bool]]
+ReconcileHandler = Callable[[GenerationQueueItem], Awaitable[ReconciliationOutcome]]
+
+
+class CancellationAdapter(Protocol):
+    async def cancel_prompt(self, prompt_id: str) -> CancellationResult: ...
+
+
+class _QueueSubmissionCoordinator(PromptSubmissionCoordinator):
+    def __init__(
+        self,
+        repository: GenerationDispatchQueueRepositoryProtocol,
+        sequence: int,
+        worker_id: str,
+    ) -> None:
+        self._repository = repository
+        self._sequence = sequence
+        self._worker_id = worker_id
+        self.started = False
+        self.submitted = False
+
+    def begin(self) -> str:
+        item = self._repository.begin_submission(self._sequence, self._worker_id)
+        token = item.entry.submission_token
+        if not token:
+            raise PromptPersistenceError("submission token was not persisted")
+        self.started = True
+        return token
+
+    def mark_submitted(self, prompt_id: str, submission_token: str) -> None:
+        try:
+            self._repository.mark_submitted(
+                self._sequence,
+                self._worker_id,
+                submission_token,
+                prompt_id,
+            )
+        except GenerationDispatchQueueRepositoryError as exc:
+            raise PromptPersistenceError("prompt submission state could not be persisted") from exc
+        self.submitted = True
 
 
 class GenerationQueueWorker:
@@ -38,6 +87,7 @@ class GenerationQueueWorker:
         *,
         worker_id: str | None = None,
         reconcile_handler: ReconcileHandler | None = None,
+        cancellation_adapter: CancellationAdapter | None = None,
         progress_reporter: ProgressReporter | None = None,
     ) -> None:
         self._repository = repository
@@ -45,10 +95,13 @@ class GenerationQueueWorker:
         self._settings = settings
         self.worker_id = worker_id or f"worker-{uuid4()}"
         self._reconcile_handler = reconcile_handler
+        self._cancellation_adapter = cancellation_adapter
         self._progress_reporter = progress_reporter
         self._stop_requested = threading.Event()
         self._wake_requested = threading.Event()
         self._thread: threading.Thread | None = None
+        self._fail_closed = False
+        self._last_reconciled_at = 0.0
 
     def start(self) -> None:
         """Start one daemon thread; callers own the worker lifecycle explicitly."""
@@ -56,6 +109,8 @@ class GenerationQueueWorker:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop_requested.clear()
+        self._fail_closed = False
+        self._last_reconciled_at = 0.0
         self._thread = threading.Thread(
             target=lambda: asyncio.run(self.run()),
             name="generation-queue-worker",
@@ -77,6 +132,13 @@ class GenerationQueueWorker:
         await self.reconcile()
         try:
             while not self._stop_requested.is_set():
+                if self._fail_closed:
+                    logger.error("generation worker stopped fail-closed after ambiguous submission")
+                    break
+                if time.monotonic() - self._last_reconciled_at >= max(
+                    1.0, self._settings.queue_poll_interval_seconds
+                ):
+                    await self.reconcile()
                 claimed = await self.run_once()
                 if claimed:
                     continue
@@ -113,28 +175,42 @@ class GenerationQueueWorker:
             item.entry.batch_index,
         )
         heartbeat = asyncio.create_task(self._heartbeat(item.entry.sequence))
+        submission = _QueueSubmissionCoordinator(
+            self._repository,
+            item.entry.sequence,
+            self.worker_id,
+        )
+        release_claim = True
         try:
             if item.entry.cancel_requested_at is not None:
-                self._repository.mark_cancelled(item.entry.generation_id)
+                await self._cancel_item(item)
                 return True
             if item.generation.comfy_prompt_id or item.job.prompt_id:
                 # A prompt ID means this is recovery work, never a resend candidate.
                 if self._reconcile_handler is not None:
                     await self._reconcile_handler(item)
-                else:
-                    self._repository.release_claim(item.entry.sequence, self.worker_id)
+                return True
+            if item.entry.submission_state is not SubmissionState.READY:
                 return True
             await self._execution_service.execute_persisted(
                 item.entry.generation_id,
                 item.entry.job_id,
                 self._progress_reporter,
                 lambda: self._is_cancel_requested(item.entry.generation_id),
+                submission_coordinator=submission,
             )
             return True
         except GenerationCancelledError:
-            self._repository.mark_cancelled(item.entry.generation_id)
+            if submission.submitted:
+                await self._cancel_item(item)
+            elif submission.started:
+                release_claim = self._quarantine_submission(item, release_claim)
+            else:
+                self._repository.mark_cancelled(item.entry.generation_id)
             return True
         except Exception:  # noqa: BLE001 - one failed job must not stop the FIFO worker
+            if submission.started and not submission.submitted:
+                release_claim = self._quarantine_submission(item, release_claim)
             logger.error(
                 "generation worker execution failed worker_id=%s sequence=%s generation_id=%s",
                 self.worker_id,
@@ -147,35 +223,76 @@ class GenerationQueueWorker:
             heartbeat.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat
-            try:
-                self._repository.release_claim(item.entry.sequence, self.worker_id)
-            except GenerationDispatchQueueRepositoryError:
-                logger.warning("generation worker lease release failed", exc_info=True)
+            if release_claim:
+                try:
+                    self._repository.release_claim(item.entry.sequence, self.worker_id)
+                except GenerationDispatchQueueRepositoryError:
+                    logger.warning("generation worker lease release failed", exc_info=True)
+
+    async def _cancel_item(self, item: GenerationQueueItem) -> None:
+        current = self._repository.get_queue_item(item.generation.id)
+        if current is None:
+            return
+        prompt_id = current.job.prompt_id or current.generation.comfy_prompt_id
+        if not prompt_id:
+            if current.entry.submission_state is SubmissionState.READY:
+                self._repository.mark_cancelled(current.generation.id)
+            return
+        if self._cancellation_adapter is None:
+            return
+        result = await self._cancellation_adapter.cancel_prompt(prompt_id)
+        if result.confirmed:
+            self._repository.mark_cancelled(current.generation.id)
+
+    def _quarantine_submission(self, item: GenerationQueueItem, release_claim: bool) -> bool:
+        try:
+            self._repository.mark_submission_ambiguous(
+                item.entry.sequence,
+                self.worker_id,
+                "prompt request outcome could not be determined",
+            )
+            return release_claim
+        except GenerationDispatchQueueRepositoryError:
+            self._fail_closed = True
+            logger.critical(
+                "worker fail-closed: ambiguous prompt state could not be persisted sequence=%s",
+                item.entry.sequence,
+                exc_info=True,
+            )
+            return False
 
     async def reconcile(self) -> None:
         try:
             released = self._repository.reconcile_expired_claims()
             if released:
                 logger.info("generation worker reconciled expired claims count=%s", released)
+            self._last_reconciled_at = time.monotonic()
             now = datetime.now(UTC)
             items = self._repository.list_queue(
-                statuses=(GenerationStatus.QUEUED, GenerationStatus.RUNNING), limit=500
+                statuses=(
+                    GenerationStatus.PENDING,
+                    GenerationStatus.QUEUED,
+                    GenerationStatus.RUNNING,
+                ),
+                limit=500,
             )
             for item in items:
-                if item.job.prompt_id or item.generation.comfy_prompt_id:
-                    if self._reconcile_handler is None:
-                        continue
-                    recovered = await self._reconcile_handler(item)
-                    if not recovered and self._is_stale(item, now):
-                        self._repository.mark_reconciliation_failed(
-                            item.generation.id,
-                            "ComfyUI prompt could not be reconciled within the grace period",
-                            now=now,
-                        )
-                elif self._is_stale(item, now):
+                prompt_id = item.job.prompt_id or item.generation.comfy_prompt_id
+                if not prompt_id:
+                    # A submitting/ambiguous item is deliberately isolated. It must not be
+                    # treated as a fresh prompt candidate after a process restart.
+                    continue
+                if self._reconcile_handler is None:
+                    continue
+                try:
+                    outcome = await self._reconcile_handler(item)
+                except Exception:  # noqa: BLE001 - reconciliation must not stop the worker
+                    logger.warning("queue item reconciliation handler failed", exc_info=True)
+                    outcome = ReconciliationOutcome.UNAVAILABLE
+                if outcome is ReconciliationOutcome.NOT_FOUND and self._is_stale(item, now):
                     self._repository.mark_reconciliation_failed(
                         item.generation.id,
-                        "persisted queue item has no ComfyUI prompt ID",
+                        "ComfyUI prompt was not found after the reconciliation grace period",
                         now=now,
                     )
         except GenerationDispatchQueueRepositoryError:

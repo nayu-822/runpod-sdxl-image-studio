@@ -51,6 +51,7 @@ def is_valid_status_transition(current: GenerationStatus, target: GenerationStat
     allowed = {
         GenerationStatus.PENDING: {
             GenerationStatus.QUEUED,
+            GenerationStatus.COMPLETED,
             GenerationStatus.FAILED,
             GenerationStatus.CANCELLED,
         },
