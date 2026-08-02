@@ -12,6 +12,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.exc import SQLAlchemyError
 
 from runpod_sdxl_image_studio.adapters.comfyui.cancellation import ComfyUICancellationAdapter
 from runpod_sdxl_image_studio.adapters.comfyui.exceptions import (
@@ -61,7 +62,7 @@ from runpod_sdxl_image_studio.services.generation_queue_service import (
     GenerationQueueService,
     GenerationQueueServiceError,
 )
-from runpod_sdxl_image_studio.ui.tabs.queue_tab import build_queue_tab
+from runpod_sdxl_image_studio.ui.tabs.queue_tab import _ambiguous_controls, build_queue_tab
 
 
 def _database() -> tuple[Any, Any]:
@@ -502,6 +503,8 @@ def test_ambiguous_prompt_can_be_linked_or_explicitly_failed() -> None:
     assert linked.entry.submission_state is SubmissionState.SUBMITTED
     assert linked.generation.status is GenerationStatus.QUEUED
     assert linked.job.prompt_id == "prompt-manual"
+    assert linked.generation.error_code == "prompt_submission_ambiguous_linked"
+    assert linked.job.error_code == "prompt_submission_ambiguous_linked"
     with pytest.raises(GenerationDispatchQueueRepositoryError):
         repository.link_ambiguous_prompt(item.generation.id, "prompt-again")
 
@@ -510,10 +513,87 @@ def test_ambiguous_prompt_can_be_linked_or_explicitly_failed() -> None:
     assert claimed_second is not None
     repository.begin_submission(claimed_second.entry.sequence, "worker-a")
     repository.mark_submission_ambiguous(second.entry.sequence, "worker-a", "unknown")
-    failed = repository.fail_ambiguous_prompt(second.generation.id)
+    with session_scope(factory) as session:
+        job = session.get(GenerationJobModel, str(second.job.id))
+        assert job is not None
+        job.worker_id = "worker-stale"
+        job.claimed_at = datetime(2026, 1, 1, tzinfo=UTC)
+        job.lease_expires_at = datetime(2026, 1, 1, 0, 1, tzinfo=UTC)
+    confirmed_at = datetime(2026, 2, 1, 12, 0, tzinfo=UTC)
+    failed = repository.fail_ambiguous_prompt(second.generation.id, now=confirmed_at)
     assert failed.generation.status is GenerationStatus.FAILED
     assert failed.job.status is GenerationStatus.FAILED
-    assert failed.generation.error_code == "prompt_submission_ambiguous_resolved"
+    assert failed.generation.error_code == "prompt_submission_absence_confirmed"
+    assert failed.job.error_code == "prompt_submission_absence_confirmed"
+    assert failed.generation.error_summary == "prompt absence was manually confirmed by an operator"
+    assert failed.job.error_summary == "prompt absence was manually confirmed by an operator"
+    assert failed.generation.completed_at == confirmed_at
+    assert failed.job.completed_at == confirmed_at
+    assert failed.entry.worker_id is None
+    assert failed.entry.claimed_at is None
+    assert failed.entry.lease_expires_at is None
+    assert failed.job.worker_id is None
+    assert failed.job.claimed_at is None
+    assert failed.job.lease_expires_at is None
+    controls = _ambiguous_controls(failed)
+    assert all(getattr(control, "visible", True) is False for control in controls)
+    with pytest.raises(GenerationDispatchQueueRepositoryError):
+        repository.link_ambiguous_prompt(second.generation.id, "prompt-after-failure")
+    with pytest.raises(GenerationDispatchQueueRepositoryError):
+        repository.fail_ambiguous_prompt(second.generation.id, now=confirmed_at)
+
+    service = GenerationQueueService(repository, Settings(_env_file=None))
+    retry = service.retry(second.generation.id).item
+    assert retry.generation.id != second.generation.id
+    assert retry.job.id != second.job.id
+    assert retry.generation.retry_of_generation_id == second.generation.id
+    assert retry.generation.retry_attempt == second.generation.retry_attempt + 1
+    original = repository.get_queue_item(second.generation.id)
+    assert original is not None
+    assert original.generation.status is GenerationStatus.FAILED
+    assert original.job.status is GenerationStatus.FAILED
+    assert original.generation.error_code == "prompt_submission_absence_confirmed"
+    assert original.generation.completed_at == confirmed_at
+    assert original.job.completed_at == confirmed_at
+    engine.dispose()
+
+
+@pytest.mark.parametrize("action", ["link", "fail"])
+def test_ambiguous_prompt_resolution_rolls_back_all_rows_on_commit_failure(
+    action: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, factory = _database()
+    repository = GenerationDispatchQueueRepository(factory)
+    item = repository.enqueue_single(GenerationSettingsSnapshot.from_settings(_settings()))
+    claimed = repository.claim_next("worker-a", lease_seconds=30)
+    assert claimed is not None
+    repository.begin_submission(claimed.entry.sequence, "worker-a")
+    repository.mark_submission_ambiguous(item.entry.sequence, "worker-a", "unknown")
+
+    def fail_queue_item(*args: Any, **kwargs: Any) -> object:
+        raise SQLAlchemyError("test response materialization failure")
+
+    monkeypatch.setattr(dispatch_module, "_queue_item", fail_queue_item)
+    try:
+        with pytest.raises(GenerationDispatchQueueRepositoryError):
+            if action == "link":
+                repository.link_ambiguous_prompt(item.generation.id, "prompt-rollback")
+            else:
+                repository.fail_ambiguous_prompt(item.generation.id)
+    finally:
+        monkeypatch.undo()
+
+    current = repository.get_queue_item(item.generation.id)
+    assert current is not None
+    assert current.entry.submission_state is SubmissionState.AMBIGUOUS
+    assert current.generation.status is GenerationStatus.PENDING
+    assert current.job.status is GenerationStatus.PENDING
+    assert current.generation.error_code == "prompt_submission_ambiguous"
+    assert current.job.error_code == "prompt_submission_ambiguous"
+    assert current.generation.comfy_prompt_id is None
+    assert current.job.prompt_id is None
+    assert current.generation.completed_at is None
+    assert current.job.completed_at is None
     engine.dispose()
 
 
@@ -574,6 +654,8 @@ def test_migration_failed_prompt_link_clears_terminal_dates_and_claims(
     assert resolved.job.status is GenerationStatus.QUEUED
     assert resolved.generation.comfy_prompt_id == selected_prompt
     assert resolved.job.prompt_id == selected_prompt
+    assert resolved.generation.error_code == "prompt_submission_ambiguous_linked"
+    assert resolved.job.error_code == "prompt_submission_ambiguous_linked"
     assert resolved.generation.completed_at is None
     assert resolved.job.completed_at is None
     assert resolved.job.cancelled_at is None
@@ -659,6 +741,41 @@ def test_normal_failed_prompt_resolution_is_rejected() -> None:
     current = repository.get_queue_item(item.generation.id)
     assert current is not None
     assert current.generation.status is GenerationStatus.FAILED
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("status", "error_code"),
+    [
+        (GenerationStatus.FAILED, "prompt_submission_absence_confirmed"),
+        (GenerationStatus.QUEUED, "prompt_submission_ambiguous_linked"),
+        (GenerationStatus.QUEUED, "prompt_submission_ambiguous_resolved"),
+        (GenerationStatus.QUEUED, None),
+    ],
+)
+def test_ambiguous_prompt_resolution_rejects_non_recoverable_audit_codes(
+    status: GenerationStatus, error_code: str | None
+) -> None:
+    engine, factory = _database()
+    repository = GenerationDispatchQueueRepository(factory)
+    item = repository.enqueue_single(GenerationSettingsSnapshot.from_settings(_settings()))
+    with session_scope(factory) as session:
+        generation = session.get(GenerationModel, str(item.generation.id))
+        job = session.get(GenerationJobModel, str(item.job.id))
+        entry = session.get(GenerationQueueEntryModel, item.entry.sequence)
+        assert generation is not None and job is not None and entry is not None
+        generation.status = status.value
+        job.status = status.value
+        generation.error_code = error_code
+        job.error_code = error_code
+        entry.submission_state = SubmissionState.AMBIGUOUS.value
+
+    with pytest.raises(GenerationDispatchQueueRepositoryError):
+        repository.link_ambiguous_prompt(item.generation.id, "prompt-not-allowed")
+    current = repository.get_queue_item(item.generation.id)
+    assert current is not None
+    assert current.generation.status is status
+    assert current.generation.error_code == error_code
     engine.dispose()
 
 

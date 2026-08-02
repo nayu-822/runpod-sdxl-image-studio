@@ -274,12 +274,16 @@ def _queue_detail(item: GenerationQueueItem | None) -> str:
 
 def _ambiguous_controls(item: GenerationQueueItem | None) -> tuple[object, object, object]:
     terminal = {GenerationStatus.COMPLETED, GenerationStatus.FAILED, GenerationStatus.CANCELLED}
-    migration_recoverable = {
+    resolution_audit_codes = {
         "migration_status_mismatch",
         "migration_status_ambiguous",
         "migration_prompt_id_mismatch",
         "prompt_submission_ambiguous",
-        "prompt_submission_ambiguous_resolved",
+    }
+    migration_recovery_codes = {
+        "migration_status_mismatch",
+        "migration_status_ambiguous",
+        "migration_prompt_id_mismatch",
     }
     terminal_blocked = item is not None and (
         item.generation.status in {GenerationStatus.COMPLETED, GenerationStatus.CANCELLED}
@@ -292,11 +296,11 @@ def _ambiguous_controls(item: GenerationQueueItem | None) -> tuple[object, objec
             or item.job.status is GenerationStatus.FAILED
         )
         and bool(
-            {item.generation.error_code, item.job.error_code}.intersection(migration_recoverable)
+            {item.generation.error_code, item.job.error_code}.intersection(migration_recovery_codes)
         )
     )
     has_resolution_audit = item is not None and bool(
-        {item.generation.error_code, item.job.error_code}.intersection(migration_recoverable)
+        {item.generation.error_code, item.job.error_code}.intersection(resolution_audit_codes)
     )
     eligible = (
         item is not None

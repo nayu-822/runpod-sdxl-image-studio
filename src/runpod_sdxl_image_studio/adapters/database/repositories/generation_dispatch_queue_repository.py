@@ -38,6 +38,23 @@ class GenerationDispatchQueueRepositoryError(RuntimeError):
     """Safe application-facing persistence error for the dispatch queue."""
 
 
+_AMBIGUOUS_PROMPT_RESOLUTION_CODES = frozenset(
+    {
+        "prompt_submission_ambiguous",
+        "migration_prompt_id_mismatch",
+        "migration_status_ambiguous",
+        "migration_status_mismatch",
+    }
+)
+_MIGRATION_AMBIGUOUS_PROMPT_RECOVERY_CODES = frozenset(
+    {
+        "migration_prompt_id_mismatch",
+        "migration_status_ambiguous",
+        "migration_status_mismatch",
+    }
+)
+
+
 class GenerationDispatchQueueRepositoryProtocol(Protocol):
     def enqueue_single(
         self,
@@ -729,18 +746,28 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
                 _begin_immediate_if_sqlite(session)
                 entry, generation, job = _load_queue_rows(session, generation_id)
                 _require_ambiguous_prompt_resolution(entry, generation, job)
+                migration_recovery = GenerationStatus.FAILED.value in {
+                    generation.status,
+                    job.status,
+                } and bool(
+                    {generation.error_code, job.error_code}.intersection(
+                        _MIGRATION_AMBIGUOUS_PROMPT_RECOVERY_CODES
+                    )
+                )
                 summary = "ambiguous prompt manually linked: prompt id was supplied by an operator"
                 generation.comfy_prompt_id = prompt
                 generation.status = GenerationStatus.QUEUED.value
-                generation.completed_at = None
-                generation.error_code = "prompt_submission_ambiguous_resolved"
+                if migration_recovery:
+                    generation.completed_at = None
+                generation.error_code = "prompt_submission_ambiguous_linked"
                 generation.error_summary = summary
                 generation.updated_at = timestamp
                 job.comfy_prompt_id = prompt
                 job.status = GenerationStatus.QUEUED.value
-                job.completed_at = None
-                job.cancelled_at = None
-                job.error_code = "prompt_submission_ambiguous_resolved"
+                if migration_recovery:
+                    job.completed_at = None
+                    job.cancelled_at = None
+                job.error_code = "prompt_submission_ambiguous_linked"
                 job.error_summary = summary
                 job.updated_at = timestamp
                 entry.submission_state = SubmissionState.SUBMITTED.value
@@ -777,14 +804,17 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
                         "completed or cancelled queue item cannot be marked failed"
                     )
                 generation.status = GenerationStatus.FAILED.value
-                generation.error_code = "prompt_submission_ambiguous_resolved"
+                generation.error_code = "prompt_submission_absence_confirmed"
                 generation.error_summary = summary
-                generation.completed_at = generation.completed_at or timestamp
+                generation.completed_at = timestamp
                 generation.updated_at = timestamp
                 job.status = GenerationStatus.FAILED.value
-                job.error_code = "prompt_submission_ambiguous_resolved"
+                job.error_code = "prompt_submission_absence_confirmed"
                 job.error_summary = summary
-                job.completed_at = job.completed_at or timestamp
+                job.completed_at = timestamp
+                job.worker_id = None
+                job.claimed_at = None
+                job.lease_expires_at = None
                 job.updated_at = timestamp
                 entry.worker_id = None
                 entry.claimed_at = None
@@ -1089,16 +1119,10 @@ def _require_ambiguous_prompt_resolution(
 ) -> None:
     if entry.submission_state != SubmissionState.AMBIGUOUS.value:
         raise GenerationDispatchQueueRepositoryError("queue entry is not ambiguous")
-    resolution_codes = {
-        "migration_status_mismatch",
-        "migration_status_ambiguous",
-        "migration_prompt_id_mismatch",
-        "prompt_submission_ambiguous",
-        "prompt_submission_ambiguous_resolved",
-    }
     generation_status = GenerationStatus(generation.status)
     job_status = GenerationStatus(job.status)
-    if not {generation.error_code, job.error_code}.intersection(resolution_codes):
+    error_codes = {generation.error_code, job.error_code}
+    if not error_codes.intersection(_AMBIGUOUS_PROMPT_RESOLUTION_CODES):
         raise GenerationDispatchQueueRepositoryError(
             "ambiguous queue item lacks a supported resolution audit code"
         )
@@ -1106,6 +1130,12 @@ def _require_ambiguous_prompt_resolution(
         GenerationStatus.CANCELLED in {generation_status, job_status}
     ):
         raise GenerationDispatchQueueRepositoryError("terminal queue item cannot be resolved")
+    if GenerationStatus.FAILED in {generation_status, job_status} and not error_codes.intersection(
+        _MIGRATION_AMBIGUOUS_PROMPT_RECOVERY_CODES
+    ):
+        raise GenerationDispatchQueueRepositoryError(
+            "failed ambiguous queue item can only be resolved through migration recovery"
+        )
 
 
 def _prompt_identifier(value: str) -> str:
