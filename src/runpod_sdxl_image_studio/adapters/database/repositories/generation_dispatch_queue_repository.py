@@ -767,6 +767,9 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
                 if migration_recovery:
                     job.completed_at = None
                     job.cancelled_at = None
+                job.worker_id = None
+                job.claimed_at = None
+                job.lease_expires_at = None
                 job.error_code = "prompt_submission_ambiguous_linked"
                 job.error_summary = summary
                 job.updated_at = timestamp

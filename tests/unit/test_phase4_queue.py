@@ -569,6 +569,18 @@ def test_ambiguous_prompt_resolution_rolls_back_all_rows_on_commit_failure(
     assert claimed is not None
     repository.begin_submission(claimed.entry.sequence, "worker-a")
     repository.mark_submission_ambiguous(item.entry.sequence, "worker-a", "unknown")
+    old_claimed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    old_lease_expires_at = datetime(2026, 1, 1, 0, 1, tzinfo=UTC)
+    with session_scope(factory) as session:
+        job = session.get(GenerationJobModel, str(item.job.id))
+        entry = session.get(GenerationQueueEntryModel, item.entry.sequence)
+        assert job is not None and entry is not None
+        job.worker_id = "worker-old"
+        job.claimed_at = old_claimed_at
+        job.lease_expires_at = old_lease_expires_at
+        entry.worker_id = "entry-worker-old"
+        entry.claimed_at = old_claimed_at
+        entry.lease_expires_at = old_lease_expires_at
 
     def fail_queue_item(*args: Any, **kwargs: Any) -> object:
         raise SQLAlchemyError("test response materialization failure")
@@ -594,6 +606,12 @@ def test_ambiguous_prompt_resolution_rolls_back_all_rows_on_commit_failure(
     assert current.job.prompt_id is None
     assert current.generation.completed_at is None
     assert current.job.completed_at is None
+    assert current.job.worker_id == "worker-old"
+    assert current.job.claimed_at == old_claimed_at
+    assert current.job.lease_expires_at == old_lease_expires_at
+    assert current.entry.worker_id == "entry-worker-old"
+    assert current.entry.claimed_at == old_claimed_at
+    assert current.entry.lease_expires_at == old_lease_expires_at
     engine.dispose()
 
 
@@ -640,6 +658,9 @@ def test_migration_failed_prompt_link_clears_terminal_dates_and_claims(
         job.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
         job.cancelled_at = datetime(2026, 1, 1, tzinfo=UTC)
         job.error_code = "migration_status_ambiguous"
+        job.worker_id = "worker-old"
+        job.claimed_at = datetime(2026, 1, 1, tzinfo=UTC)
+        job.lease_expires_at = datetime(2026, 1, 1, 0, 1, tzinfo=UTC)
         generation.status = GenerationStatus.FAILED.value
         generation.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
         generation.error_code = "migration_status_ambiguous"
@@ -663,6 +684,9 @@ def test_migration_failed_prompt_link_clears_terminal_dates_and_claims(
     assert resolved.entry.worker_id is None
     assert resolved.entry.claimed_at is None
     assert resolved.entry.lease_expires_at is None
+    assert resolved.job.worker_id is None
+    assert resolved.job.claimed_at is None
+    assert resolved.job.lease_expires_at is None
     engine.dispose()
 
 
