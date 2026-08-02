@@ -1,5 +1,13 @@
 # RunPod SDXL Image Studio
 
+## Phase 4 追加修正: migration と prompt 状態の復旧
+
+- `0007_phase4_terminal_state_repair` は、Generation / Job の status、完了・キャンセル時刻、Artifact、prompt ID、cancel request を証拠として評価します。通常の `pending/pending + ready + prompt IDなし + cancelなし` は `pending/ready` のまま保持します。
+- 既に旧 `0007` を適用済みで、元の pending と断定できない行は `0008_phase4_recovery_correction` で自動再送対象に戻さず、`migration_status_ambiguous` として監査可能な `ambiguous` に隔離します。
+- ComfyUI の状態確認は typed な `RemotePromptStatus`（`PENDING`、`IN_PROGRESS`、`COMPLETED`、`FAILED`、`CANCELLED`、`NOT_FOUND`、`UNAVAILABLE`）で扱います。`/api/jobs/{prompt_id}` が明示的に 404/405 の場合だけ `/queue` と `/history` を使い、timeout / 5xx では破壊的 fallback を行いません。
+- prompt ID が不一致または送信結果不明の行は自動再送しません。Queue detail で Generation 側、Job 側、または手入力の prompt ID を選び、`prompt IDを紐付け` で両方を同一 ID に解決します。prompt が存在しないことを確認した場合だけ `failed` を明示確定できます。
+- History の `execution_interrupted` は Generation と Job を一つの SQLite transaction で `cancelled` に確定します。既に `completed` / `failed` / `cancelled` の行は上書きしません。
+
 ## フェーズ4: 永続キュー・復旧・キャンセル
 
 SQLite の FIFO キューへ検証済みの `Generation`、`GenerationJob`、Queue entry を同一トランザクションで保存し、アプリケーションプロセス内の単一 worker が ComfyUI への送信と実行を担当します。ブラウザを閉じてもキューと実行状態は DB に残ります。

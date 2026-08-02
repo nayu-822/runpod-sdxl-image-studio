@@ -19,6 +19,18 @@ class PromptHistoryStatus(StrEnum):
     UNKNOWN = "unknown"
 
 
+class RemotePromptStatus(StrEnum):
+    """Typed status returned by the remote prompt reconciliation adapter."""
+
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    NOT_FOUND = "not_found"
+    UNAVAILABLE = "unavailable"
+
+
 @dataclass(frozen=True)
 class ComfyUIDeviceInfo:
     """A device reported by ComfyUI's system stats endpoint."""
@@ -130,6 +142,14 @@ class PromptHistory:
         """Whether ComfyUI reported an execution interruption."""
 
         return self.status is PromptHistoryStatus.INTERRUPTED
+
+
+@dataclass(frozen=True)
+class RemotePromptState:
+    """A normalized remote state with no ComfyUI JSON exposed to the domain."""
+
+    prompt_id: str
+    status: RemotePromptStatus
 
 
 @dataclass(frozen=True)

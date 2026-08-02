@@ -17,7 +17,11 @@ from runpod_sdxl_image_studio.adapters.comfyui.exceptions import (
     ComfyUIWebSocketError,
     WorkflowError,
 )
-from runpod_sdxl_image_studio.adapters.comfyui.models import PromptHistory, PromptHistoryStatus
+from runpod_sdxl_image_studio.adapters.comfyui.models import (
+    PromptHistory,
+    PromptHistoryStatus,
+    RemotePromptStatus,
+)
 from runpod_sdxl_image_studio.adapters.comfyui.websocket_client import ComfyUIWebSocketClient
 from runpod_sdxl_image_studio.adapters.comfyui.workflow_adapter import WorkflowAdapter
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_progress_repository import (
@@ -223,6 +227,27 @@ class GenerationService:
             if existing_image is not None:
                 self._complete_existing_generation(generation_id, job.id)
                 return ReconciliationOutcome.COMPLETED
+            status_reader = getattr(self._client, "get_remote_prompt_status", None)
+            if callable(status_reader):
+                remote_state = await status_reader(prompt_id)
+                if remote_state.status is RemotePromptStatus.NOT_FOUND:
+                    return ReconciliationOutcome.NOT_FOUND
+                if remote_state.status in {
+                    RemotePromptStatus.PENDING,
+                    RemotePromptStatus.IN_PROGRESS,
+                }:
+                    return ReconciliationOutcome.IN_PROGRESS
+                if remote_state.status is RemotePromptStatus.CANCELLED:
+                    return ReconciliationOutcome.CANCELLED
+                if remote_state.status is RemotePromptStatus.FAILED:
+                    self._mark_failed_pair(
+                        job,
+                        GenerationErrorCode.COMFYUI_EXECUTION.value,
+                        "ComfyUI reported a failed remote prompt",
+                    )
+                    return ReconciliationOutcome.FAILED
+                if remote_state.status is RemotePromptStatus.UNAVAILABLE:
+                    return ReconciliationOutcome.UNAVAILABLE
             history = await self._client.get_prompt_history(prompt_id)
             if history.status is PromptHistoryStatus.NOT_FOUND:
                 return ReconciliationOutcome.NOT_FOUND

@@ -767,15 +767,21 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
                 entry, generation, job = _load_queue_rows(session, generation_id)
                 _require_ambiguous_prompt_resolution(entry, generation, job)
                 summary = "prompt absence was manually confirmed by an operator"
+                if GenerationStatus.COMPLETED.value in {generation.status, job.status} or (
+                    GenerationStatus.CANCELLED.value in {generation.status, job.status}
+                ):
+                    raise GenerationDispatchQueueRepositoryError(
+                        "completed or cancelled queue item cannot be marked failed"
+                    )
                 generation.status = GenerationStatus.FAILED.value
                 generation.error_code = "prompt_submission_ambiguous_resolved"
                 generation.error_summary = summary
-                generation.completed_at = timestamp
+                generation.completed_at = generation.completed_at or timestamp
                 generation.updated_at = timestamp
                 job.status = GenerationStatus.FAILED.value
                 job.error_code = "prompt_submission_ambiguous_resolved"
                 job.error_summary = summary
-                job.completed_at = timestamp
+                job.completed_at = job.completed_at or timestamp
                 job.updated_at = timestamp
                 entry.worker_id = None
                 entry.claimed_at = None
@@ -1078,12 +1084,23 @@ def _require_ambiguous_prompt_resolution(
     generation: GenerationModel,
     job: GenerationJobModel,
 ) -> None:
-    terminal = {GenerationStatus.COMPLETED, GenerationStatus.FAILED, GenerationStatus.CANCELLED}
     if entry.submission_state != SubmissionState.AMBIGUOUS.value:
         raise GenerationDispatchQueueRepositoryError("queue entry is not ambiguous")
-    if generation.comfy_prompt_id is not None or job.comfy_prompt_id is not None:
-        raise GenerationDispatchQueueRepositoryError("prompt id is already present")
-    if GenerationStatus(generation.status) in terminal or GenerationStatus(job.status) in terminal:
+    migration_repair = {
+        "migration_status_mismatch",
+        "migration_status_ambiguous",
+        "migration_prompt_id_mismatch",
+    }
+    generation_status = GenerationStatus(generation.status)
+    job_status = GenerationStatus(job.status)
+    if GenerationStatus.COMPLETED in {generation_status, job_status} or (
+        GenerationStatus.CANCELLED in {generation_status, job_status}
+    ):
+        raise GenerationDispatchQueueRepositoryError("terminal queue item cannot be resolved")
+    if GenerationStatus.FAILED in {generation_status, job_status} and not {
+        generation.error_code,
+        job.error_code,
+    }.intersection(migration_repair):
         raise GenerationDispatchQueueRepositoryError("terminal queue item cannot be resolved")
 
 

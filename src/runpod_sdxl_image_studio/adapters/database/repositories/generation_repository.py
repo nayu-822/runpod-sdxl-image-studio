@@ -453,6 +453,89 @@ class GenerationFailureRepository(GenerationFailureRepositoryProtocol):
             raise GenerationRepositoryError("generation failure could not be persisted") from exc
 
 
+class GenerationCancellationRepositoryProtocol(Protocol):
+    """Persist a Generation/Job cancellation without requiring a queue row."""
+
+    def cancel_generation(
+        self,
+        generation_id: UUID,
+        job_id: UUID,
+        *,
+        cancelled_at: datetime,
+        error_code: str,
+        error_summary: str,
+    ) -> None: ...
+
+
+class GenerationCancellationRepository(GenerationCancellationRepositoryProtocol):
+    """Atomically persist an interruption as a terminal cancelled pair."""
+
+    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+        self._session_factory = session_factory
+
+    def cancel_generation(
+        self,
+        generation_id: UUID,
+        job_id: UUID,
+        *,
+        cancelled_at: datetime,
+        error_code: str,
+        error_summary: str,
+    ) -> None:
+        if re.fullmatch(r"[a-z0-9_]+", error_code) is None:
+            raise GenerationRepositoryError("error code is invalid")
+        timestamp = _utc(cancelled_at)
+        if timestamp is None:
+            raise GenerationRepositoryError("cancelled time is required")
+        normalized_summary = error_summary[:1000]
+        try:
+            with session_scope(self._session_factory) as session:
+                generation = _require_generation(session, generation_id)
+                job = _require_job(session, job_id)
+                if job.generation_id != str(generation_id):
+                    raise GenerationRepositoryError("job generation does not match")
+                generation_status = GenerationStatus(generation.status)
+                job_status = GenerationStatus(job.status)
+                if GenerationStatus.COMPLETED in {generation_status, job_status} or (
+                    GenerationStatus.FAILED in {generation_status, job_status}
+                ):
+                    return
+                if (
+                    generation_status is GenerationStatus.CANCELLED
+                    and job_status is GenerationStatus.CANCELLED
+                ):
+                    return
+                allowed = {
+                    GenerationStatus.PENDING,
+                    GenerationStatus.QUEUED,
+                    GenerationStatus.RUNNING,
+                    GenerationStatus.CANCELLED,
+                }
+                if generation_status not in allowed or job_status not in allowed:
+                    raise GenerationRepositoryError("generation and job states are invalid")
+                generation.status = GenerationStatus.CANCELLED.value
+                generation.completed_at = generation.completed_at or timestamp
+                generation.error_code = error_code
+                generation.error_summary = normalized_summary
+                generation.updated_at = timestamp
+                job.status = GenerationStatus.CANCELLED.value
+                job.cancelled_at = job.cancelled_at or timestamp
+                job.completed_at = job.completed_at or timestamp
+                job.error_code = error_code
+                job.error_summary = normalized_summary
+                job.worker_id = None
+                job.claimed_at = None
+                job.lease_expires_at = None
+                job.updated_at = timestamp
+                session.flush()
+        except GenerationRepositoryError:
+            raise
+        except (IntegrityError, SQLAlchemyError, ValueError) as exc:
+            raise GenerationRepositoryError(
+                "generation cancellation could not be persisted"
+            ) from exc
+
+
 class GenerationArtifactRepositoryProtocol(Protocol):
     def add(self, artifact: GenerationArtifact) -> GenerationArtifact: ...
 

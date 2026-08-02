@@ -22,6 +22,7 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_progress
 )
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_repository import (
     GenerationArtifactRepository,
+    GenerationCancellationRepository,
     GenerationCompletionRepository,
     GenerationFailureRepository,
     GenerationJobRepository,
@@ -260,6 +261,7 @@ def build_app(
         app_settings,
         completed_prompt_handler=generation_service.recover_prompt,
         failure_repository=failure_repository,
+        cancellation_repository=GenerationCancellationRepository(session_factory),
     )
 
     async def reconcile_queue_item(item: GenerationQueueItem) -> ReconciliationOutcome:

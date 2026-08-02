@@ -16,6 +16,8 @@ from runpod_sdxl_image_studio.adapters.comfyui.models import (
     PromptHistory,
     PromptHistoryStatus,
     QueuedPrompt,
+    RemotePromptState,
+    RemotePromptStatus,
 )
 
 
@@ -182,6 +184,74 @@ def parse_prompt_history(payload: Mapping[str, object], prompt_id: str) -> Promp
         True,
         status,
     )
+
+
+def parse_remote_prompt_status(payload: Mapping[str, object], prompt_id: str) -> RemotePromptState:
+    """Parse the supported status subset of the modern job endpoint."""
+
+    if not isinstance(payload, Mapping):
+        return RemotePromptState(prompt_id, RemotePromptStatus.UNAVAILABLE)
+    if payload.get("not_found") is True or payload.get("exists") is False:
+        return RemotePromptState(prompt_id, RemotePromptStatus.NOT_FOUND)
+    if payload.get("cancelled") is True or payload.get("canceled") is True:
+        return RemotePromptState(prompt_id, RemotePromptStatus.CANCELLED)
+    if payload.get("completed") is True or payload.get("success") is True:
+        return RemotePromptState(prompt_id, RemotePromptStatus.COMPLETED)
+    if payload.get("failed") is True or payload.get("error") is True:
+        return RemotePromptState(prompt_id, RemotePromptStatus.FAILED)
+
+    status_payload = _mapping_value(payload, "status")
+    job_payload = _mapping_value(payload, "job")
+    candidates: list[object] = [
+        payload.get("status"),
+        payload.get("state"),
+        payload.get("status_str"),
+        payload.get("job_status"),
+    ]
+    if status_payload is not None:
+        candidates.extend(
+            (
+                status_payload.get("status"),
+                status_payload.get("status_str"),
+                status_payload.get("state"),
+            )
+        )
+    if job_payload is not None:
+        candidates.extend(
+            (job_payload.get("status"), job_payload.get("status_str"), job_payload.get("state"))
+        )
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        status = _remote_status_from_string(candidate)
+        if status is not None:
+            return RemotePromptState(prompt_id, status)
+    return RemotePromptState(prompt_id, RemotePromptStatus.UNAVAILABLE)
+
+
+def _remote_status_from_string(value: str) -> RemotePromptStatus | None:
+    normalized = value.strip().casefold()
+    mapping = {
+        "pending": RemotePromptStatus.PENDING,
+        "queued": RemotePromptStatus.PENDING,
+        "waiting": RemotePromptStatus.PENDING,
+        "running": RemotePromptStatus.IN_PROGRESS,
+        "executing": RemotePromptStatus.IN_PROGRESS,
+        "in_progress": RemotePromptStatus.IN_PROGRESS,
+        "processing": RemotePromptStatus.IN_PROGRESS,
+        "success": RemotePromptStatus.COMPLETED,
+        "completed": RemotePromptStatus.COMPLETED,
+        "complete": RemotePromptStatus.COMPLETED,
+        "failed": RemotePromptStatus.FAILED,
+        "error": RemotePromptStatus.FAILED,
+        "cancelled": RemotePromptStatus.CANCELLED,
+        "canceled": RemotePromptStatus.CANCELLED,
+        "interrupted": RemotePromptStatus.CANCELLED,
+        "execution_interrupted": RemotePromptStatus.CANCELLED,
+        "not_found": RemotePromptStatus.NOT_FOUND,
+        "missing": RemotePromptStatus.NOT_FOUND,
+    }
+    return mapping.get(normalized)
 
 
 def _parse_history_status(

@@ -10,9 +10,13 @@ from uuid import UUID
 
 from runpod_sdxl_image_studio.adapters.comfyui.client import ComfyUIClient
 from runpod_sdxl_image_studio.adapters.comfyui.exceptions import ComfyUIError
-from runpod_sdxl_image_studio.adapters.comfyui.models import PromptHistoryStatus
+from runpod_sdxl_image_studio.adapters.comfyui.models import (
+    PromptHistoryStatus,
+    RemotePromptStatus,
+)
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_repository import (
     GenerationArtifactRepositoryProtocol,
+    GenerationCancellationRepositoryProtocol,
     GenerationFailureRepositoryProtocol,
     GenerationJobRepositoryProtocol,
     GenerationRepositoryError,
@@ -38,6 +42,7 @@ class GenerationRecoveryService:
         settings: Settings | None = None,
         completed_prompt_handler: CompletedPromptHandler | None = None,
         failure_repository: GenerationFailureRepositoryProtocol | None = None,
+        cancellation_repository: GenerationCancellationRepositoryProtocol | None = None,
     ) -> None:
         app_settings = settings or get_settings()
         self._client = client
@@ -48,6 +53,7 @@ class GenerationRecoveryService:
         self._max_items = app_settings.recovery_max_items
         self._completed_prompt_handler = completed_prompt_handler
         self._failure_repository = failure_repository
+        self._cancellation_repository = cancellation_repository
 
     async def recover(self, now: datetime | None = None) -> tuple[str, ...]:
         timestamp = now or datetime.now(UTC)
@@ -80,9 +86,54 @@ class GenerationRecoveryService:
                         )
                         messages.append(f"{job.generation_id}: stale pending")
                     continue
+                status_reader = getattr(self._client, "get_remote_prompt_status", None)
+                if callable(status_reader):
+                    remote_state = await status_reader(job.prompt_id)
+                    if remote_state.status in {
+                        RemotePromptStatus.PENDING,
+                        RemotePromptStatus.IN_PROGRESS,
+                        RemotePromptStatus.NOT_FOUND,
+                        RemotePromptStatus.UNAVAILABLE,
+                    }:
+                        continue
+                    if remote_state.status is RemotePromptStatus.CANCELLED:
+                        if self._cancellation_repository is None:
+                            messages.append(
+                                f"{job.generation_id}: cancelled persistence unavailable"
+                            )
+                        else:
+                            self._cancellation_repository.cancel_generation(
+                                job.generation_id,
+                                job.id,
+                                cancelled_at=timestamp,
+                                error_code="comfyui_execution_interrupted",
+                                error_summary="ComfyUI reported execution_interrupted",
+                            )
+                            messages.append(f"{job.generation_id}: cancelled")
+                        continue
+                    if remote_state.status is RemotePromptStatus.FAILED:
+                        self._mark_failed(
+                            job.generation_id,
+                            job.id,
+                            GenerationErrorCode.COMFYUI_EXECUTION.value,
+                            "ComfyUI reported a failed remote prompt",
+                            timestamp,
+                        )
+                        messages.append(f"{job.generation_id}: failed")
+                        continue
                 history = await self._client.get_prompt_history(job.prompt_id)
                 if history.status is PromptHistoryStatus.INTERRUPTED:
-                    messages.append(f"{job.generation_id}: cancelled")
+                    if self._cancellation_repository is None:
+                        messages.append(f"{job.generation_id}: cancelled persistence unavailable")
+                    else:
+                        self._cancellation_repository.cancel_generation(
+                            job.generation_id,
+                            job.id,
+                            cancelled_at=timestamp,
+                            error_code="comfyui_execution_interrupted",
+                            error_summary="ComfyUI reported execution_interrupted",
+                        )
+                        messages.append(f"{job.generation_id}: cancelled")
                 elif history.status is PromptHistoryStatus.FAILED:
                     self._mark_failed(
                         job.generation_id,

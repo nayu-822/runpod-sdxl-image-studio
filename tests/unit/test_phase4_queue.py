@@ -211,13 +211,45 @@ def test_reconciliation_outcome_in_progress_does_not_fail_prompt_job() -> None:
     worker = GenerationQueueWorker(
         repository,
         object(),
-        Settings(_env_file=None, reconciliation_grace_seconds=0),
+        Settings(_env_file=None, reconciliation_grace_seconds=60),
         reconcile_handler=reconcile,
     )
     asyncio.run(worker.reconcile())
     reconciled = repository.get_queue_item(item.generation.id)
     assert reconciled is not None
     assert reconciled.generation.status is GenerationStatus.QUEUED
+    engine.dispose()
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_worker_only_fails_true_not_found_after_grace(stale: bool) -> None:
+    engine, factory = _database()
+    repository = GenerationDispatchQueueRepository(factory)
+    item = repository.enqueue_single(GenerationSettingsSnapshot.from_settings(_settings()))
+    GenerationQueueRepository(factory).mark_queued(item.generation.id, item.job.id, "prompt-1")
+    if stale:
+        with session_scope(factory) as session:
+            entry = session.get(GenerationQueueEntryModel, item.entry.sequence)
+            assert entry is not None
+            entry.updated_at = datetime(2020, 1, 1, tzinfo=UTC)
+
+    async def reconcile(_item: object) -> ReconciliationOutcome:
+        return ReconciliationOutcome.NOT_FOUND
+
+    worker = GenerationQueueWorker(
+        repository,
+        object(),
+        Settings(
+            _env_file=None,
+            reconciliation_grace_seconds=0 if stale else 60,
+        ),
+        reconcile_handler=reconcile,
+    )
+    asyncio.run(worker.reconcile())
+    reconciled = repository.get_queue_item(item.generation.id)
+    assert reconciled is not None
+    expected = GenerationStatus.FAILED if stale else GenerationStatus.QUEUED
+    assert reconciled.generation.status is expected
     engine.dispose()
 
 
@@ -480,6 +512,29 @@ def test_ambiguous_prompt_can_be_linked_or_explicitly_failed() -> None:
     assert failed.generation.status is GenerationStatus.FAILED
     assert failed.job.status is GenerationStatus.FAILED
     assert failed.generation.error_code == "prompt_submission_ambiguous_resolved"
+    engine.dispose()
+
+
+def test_mismatched_prompt_ids_can_be_manually_resolved_without_resubmission() -> None:
+    engine, factory = _database()
+    repository = GenerationDispatchQueueRepository(factory)
+    item = repository.enqueue_single(GenerationSettingsSnapshot.from_settings(_settings()))
+    GenerationQueueRepository(factory).mark_queued(
+        item.generation.id, item.job.id, "generation-prompt"
+    )
+    with session_scope(factory) as session:
+        job = session.get(GenerationJobModel, str(item.job.id))
+        assert job is not None
+        job.comfy_prompt_id = "job-prompt"
+
+    ambiguous = repository.mark_prompt_id_mismatch(item.generation.id)
+    assert ambiguous.generation.comfy_prompt_id == "generation-prompt"
+    assert ambiguous.job.prompt_id == "job-prompt"
+    resolved = repository.link_ambiguous_prompt(item.generation.id, "generation-prompt")
+    assert resolved.entry.submission_state is SubmissionState.SUBMITTED
+    assert resolved.generation.comfy_prompt_id == "generation-prompt"
+    assert resolved.job.prompt_id == "generation-prompt"
+    assert resolved.generation.status is GenerationStatus.QUEUED
     engine.dispose()
 
 
@@ -907,6 +962,8 @@ def test_phase4_migration_backfills_prompt_and_marks_status_mismatch(tmp_path: P
     mismatch_job = "00000000-0000-0000-0000-000000000011"
     prompt_generation = "00000000-0000-0000-0000-000000000002"
     prompt_job = "00000000-0000-0000-0000-000000000012"
+    normal_generation = "00000000-0000-0000-0000-000000000003"
+    normal_job = "00000000-0000-0000-0000-000000000013"
     with engine.begin() as connection:
         for generation_id, status, prompt_id in (
             (mismatch_generation, "queued", None),
@@ -985,6 +1042,46 @@ def test_phase4_migration_backfills_prompt_and_marks_status_mismatch(tmp_path: P
                 "timestamp": timestamp,
             },
         )
+        connection.execute(
+            text(
+                """INSERT INTO generations
+                (id, kind, status, parent_generation_id, retry_of_generation_id,
+                 retry_attempt, settings_snapshot_json, snapshot_schema_version,
+                 checkpoint_name, vae_name, seed, width, height,
+                 positive_prompt_search, negative_prompt_search,
+                 workflow_template_id, workflow_template_version, comfy_prompt_id,
+                 favorite, user_note, error_code, error_summary, created_at,
+                 started_at, completed_at, updated_at)
+                VALUES (:id, 'standard', 'pending', NULL, NULL, 0, :snapshot, 1,
+                 'sdxl.safetensors', NULL, 123, 1024, 1024, 'a cat', '',
+                 'sdxl_txt2img', '1.0', NULL, 0, NULL, NULL, NULL,
+                 :timestamp, NULL, NULL, :timestamp)"""
+            ),
+            {"id": normal_generation, "snapshot": snapshot, "timestamp": timestamp},
+        )
+        connection.execute(
+            text(
+                """INSERT INTO generation_jobs
+                (id, generation_id, status, comfy_prompt_id, progress_value,
+                 progress_maximum, current_node, worker_id, claimed_at,
+                 lease_expires_at, cancel_requested_at, cancelled_at, error_code,
+                 error_summary, created_at, started_at, completed_at, updated_at)
+                VALUES (:id, :generation_id, 'pending', NULL, NULL, NULL, NULL,
+                 NULL, NULL, NULL, NULL, NULL, NULL, NULL, :timestamp, NULL,
+                 NULL, :timestamp)"""
+            ),
+            {"id": normal_job, "generation_id": normal_generation, "timestamp": timestamp},
+        )
+        connection.execute(
+            text(
+                """INSERT INTO generation_queue_entries
+                (generation_id, job_id, batch_id, batch_index, worker_id, claimed_at,
+                 lease_expires_at, cancel_requested_at, enqueued_at, updated_at)
+                VALUES (:generation_id, :job_id, NULL, 0, NULL, NULL, NULL, NULL,
+                 :timestamp, :timestamp)"""
+            ),
+            {"generation_id": normal_generation, "job_id": normal_job, "timestamp": timestamp},
+        )
     engine.dispose()
 
     command.upgrade(config, "head")
@@ -998,9 +1095,98 @@ def test_phase4_migration_backfills_prompt_and_marks_status_mismatch(tmp_path: P
             text("SELECT submission_state FROM generation_queue_entries WHERE generation_id=:id"),
             {"id": prompt_generation},
         ).one()
+        normal = connection.execute(
+            text(
+                """SELECT g.status, j.status AS job_status, q.submission_state,
+                          g.error_code
+                   FROM generations AS g
+                   JOIN generation_jobs AS j ON j.generation_id=g.id
+                   JOIN generation_queue_entries AS q ON q.generation_id=g.id
+                  WHERE g.id=:id"""
+            ),
+            {"id": normal_generation},
+        ).one()
     assert mismatch.status == "failed"
-    assert mismatch.error_code == "migration_status_mismatch"
+    assert mismatch.error_code == "migration_status_ambiguous"
     assert prompt_entry.submission_state == "submitted"
+    assert normal.status == "pending"
+    assert normal.job_status == "pending"
+    assert normal.submission_state == "ready"
+    engine.dispose()
+
+
+def test_phase4_0008_quarantines_old_0007_pending_to_failed_correction(tmp_path: Path) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'phase4-0008.sqlite3').as_posix()}"
+    root = Path(__file__).parents[2]
+    config = Config(str(root / "alembic.ini"))
+    config.set_main_option("script_location", str(root / "alembic"))
+    config.set_main_option("sqlalchemy.url", database_url)
+    command.upgrade(config, "0007_phase4_terminal_state_repair")
+    engine = create_engine(database_url)
+    snapshot = GenerationSettingsSnapshot.from_settings(_settings()).to_json()
+    timestamp = "2026-01-01 00:00:00"
+    generation_id = "00000000-0000-0000-0000-000000000401"
+    job_id = "00000000-0000-0000-0000-000000000411"
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """INSERT INTO generations
+                (id, kind, status, parent_generation_id, retry_of_generation_id,
+                 retry_attempt, settings_snapshot_json, snapshot_schema_version,
+                 checkpoint_name, vae_name, seed, width, height,
+                 positive_prompt_search, negative_prompt_search,
+                 workflow_template_id, workflow_template_version, comfy_prompt_id,
+                 favorite, user_note, error_code, error_summary, created_at,
+                 started_at, completed_at, updated_at)
+                VALUES (:id, 'standard', 'failed', NULL, NULL, 0, :snapshot, 1,
+                 'sdxl.safetensors', NULL, 123, 1024, 1024, 'a cat', '',
+                 'sdxl_txt2img', '1.0', NULL, 0, NULL,
+                 'migration_status_mismatch', 'old', :timestamp, NULL,
+                 :timestamp, :timestamp)"""
+            ),
+            {"id": generation_id, "snapshot": snapshot, "timestamp": timestamp},
+        )
+        connection.execute(
+            text(
+                """INSERT INTO generation_jobs
+                (id, generation_id, status, comfy_prompt_id, progress_value,
+                 progress_maximum, current_node, worker_id, claimed_at,
+                 lease_expires_at, cancel_requested_at, cancelled_at, error_code,
+                 error_summary, created_at, started_at, completed_at, updated_at)
+                VALUES (:id, :generation_id, 'failed', NULL, NULL, NULL, NULL,
+                 NULL, NULL, NULL, NULL, NULL, 'migration_status_mismatch',
+                 'old', :timestamp, NULL, :timestamp, :timestamp)"""
+            ),
+            {"id": job_id, "generation_id": generation_id, "timestamp": timestamp},
+        )
+        connection.execute(
+            text(
+                """INSERT INTO generation_queue_entries
+                (generation_id, job_id, batch_id, batch_index, worker_id, claimed_at,
+                 lease_expires_at, cancel_requested_at, submission_state,
+                 submission_token, submission_started_at, enqueued_at, updated_at)
+                VALUES (:generation_id, :job_id, NULL, 0, NULL, NULL, NULL, NULL,
+                        'ambiguous', NULL, NULL, :timestamp, :timestamp)"""
+            ),
+            {"generation_id": generation_id, "job_id": job_id, "timestamp": timestamp},
+        )
+    engine.dispose()
+
+    command.upgrade(config, "head")
+    engine = create_engine(database_url)
+    with engine.connect() as connection:
+        row = connection.execute(
+            text(
+                """SELECT g.status, g.error_code, q.submission_state
+                   FROM generations AS g
+                   JOIN generation_queue_entries AS q ON q.generation_id=g.id
+                  WHERE g.id=:id"""
+            ),
+            {"id": generation_id},
+        ).one()
+    assert row.status == "failed"
+    assert row.error_code == "migration_status_ambiguous"
+    assert row.submission_state == "ambiguous"
     engine.dispose()
 
 
@@ -1252,8 +1438,9 @@ def test_phase4_followup_migration_repairs_terminal_and_mismatched_rows(tmp_path
     by_id = {row.id: row for row in rows}
     assert by_id["00000000-0000-0000-0000-000000000301"].generation_status == "failed"
     assert by_id["00000000-0000-0000-0000-000000000301"].job_status == "failed"
-    assert by_id["00000000-0000-0000-0000-000000000302"].generation_status == "cancelled"
-    assert by_id["00000000-0000-0000-0000-000000000302"].job_status == "cancelled"
+    assert by_id["00000000-0000-0000-0000-000000000302"].generation_status == "pending"
+    assert by_id["00000000-0000-0000-0000-000000000302"].job_status == "pending"
+    assert by_id["00000000-0000-0000-0000-000000000302"].submission_state == "ambiguous"
     mismatch = by_id["00000000-0000-0000-0000-000000000303"]
     assert mismatch.generation_prompt == "prompt-a"
     assert mismatch.job_prompt == "prompt-b"

@@ -3,13 +3,17 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from runpod_sdxl_image_studio.adapters.comfyui.models import (
     ComfyUIObjectInfo,
     PromptHistoryStatus,
+    RemotePromptStatus,
 )
 from runpod_sdxl_image_studio.adapters.comfyui.parsers import (
     parse_capabilities,
     parse_prompt_history,
+    parse_remote_prompt_status,
     parse_system_stats,
 )
 
@@ -112,3 +116,24 @@ def test_parse_prompt_history_keeps_unknown_status_safe() -> None:
     assert history.status is PromptHistoryStatus.UNKNOWN
     assert not history.is_completed
     assert not history.is_failed
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"status": "pending"}, RemotePromptStatus.PENDING),
+        ({"state": "running"}, RemotePromptStatus.IN_PROGRESS),
+        ({"status": "success"}, RemotePromptStatus.COMPLETED),
+        ({"status": "error"}, RemotePromptStatus.FAILED),
+        ({"cancelled": True}, RemotePromptStatus.CANCELLED),
+        ({"not_found": True}, RemotePromptStatus.NOT_FOUND),
+        ({"future": "shape"}, RemotePromptStatus.UNAVAILABLE),
+    ],
+)
+def test_parse_remote_prompt_status_is_typed_and_safe(
+    payload: dict[str, object], expected: RemotePromptStatus
+) -> None:
+    state = parse_remote_prompt_status(payload, "prompt-1")
+
+    assert state.prompt_id == "prompt-1"
+    assert state.status is expected

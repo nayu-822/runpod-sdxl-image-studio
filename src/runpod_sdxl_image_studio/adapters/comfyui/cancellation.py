@@ -11,8 +11,9 @@ from runpod_sdxl_image_studio.adapters.comfyui.exceptions import (
     ComfyUIResponseError,
 )
 from runpod_sdxl_image_studio.adapters.comfyui.models import (
-    PromptHistory,
     PromptHistoryStatus,
+    RemotePromptState,
+    RemotePromptStatus,
 )
 from runpod_sdxl_image_studio.config import Settings, get_settings
 from runpod_sdxl_image_studio.domain.generation_queue import CancellationOutcome
@@ -72,18 +73,16 @@ class ComfyUICancellationAdapter:
         attempts = max(1, self._settings.history_max_attempts)
         last_outcome = CancellationOutcome.IN_PROGRESS
         for attempt in range(attempts):
-            queue = await self._client.get_queue_status()
-            history = await self._client.get_prompt_history(prompt_id)
-            outcome = _history_outcome(history)
+            remote_state = await self._observe_remote_status(prompt_id)
+            outcome = _remote_outcome(remote_state.status)
             if outcome is not None and outcome is not CancellationOutcome.IN_PROGRESS:
                 return _cancellation_result(outcome)
-            if (
-                prompt_id in queue.pending_prompt_ids
-                or prompt_id in queue.running_prompt_ids
-                or history.status is PromptHistoryStatus.IN_PROGRESS
-            ):
+            if remote_state.status in {
+                RemotePromptStatus.PENDING,
+                RemotePromptStatus.IN_PROGRESS,
+            }:
                 last_outcome = CancellationOutcome.IN_PROGRESS
-            elif history.status is PromptHistoryStatus.NOT_FOUND:
+            elif remote_state.status is RemotePromptStatus.NOT_FOUND:
                 last_outcome = (
                     CancellationOutcome.CANCELLED if accepted else CancellationOutcome.NOT_FOUND
                 )
@@ -99,19 +98,46 @@ class ComfyUICancellationAdapter:
                 await self._sleep(self._settings.history_poll_interval_seconds)
         return _cancellation_result(last_outcome)
 
+    async def _observe_remote_status(self, prompt_id: str) -> RemotePromptState:
+        """Prefer the typed client method while retaining small test doubles compatibility."""
 
-def _history_outcome(history: PromptHistory) -> CancellationOutcome | None:
-    """Translate typed history state into a cancellation decision."""
+        status_reader = getattr(self._client, "get_remote_prompt_status", None)
+        if callable(status_reader):
+            return await status_reader(prompt_id)
+        queue = await self._client.get_queue_status()
+        if prompt_id in queue.pending_prompt_ids:
+            return RemotePromptState(prompt_id, RemotePromptStatus.PENDING)
+        if prompt_id in queue.running_prompt_ids:
+            return RemotePromptState(prompt_id, RemotePromptStatus.IN_PROGRESS)
+        history = await self._client.get_prompt_history(prompt_id)
+        return RemotePromptState(prompt_id, _history_remote_status(history.status))
+
+
+def _remote_outcome(status: RemotePromptStatus) -> CancellationOutcome | None:
+    """Translate typed remote state into a cancellation decision."""
 
     mapping = {
-        PromptHistoryStatus.COMPLETED: CancellationOutcome.COMPLETED,
-        PromptHistoryStatus.FAILED: CancellationOutcome.FAILED,
-        PromptHistoryStatus.INTERRUPTED: CancellationOutcome.CANCELLED,
-        PromptHistoryStatus.IN_PROGRESS: CancellationOutcome.IN_PROGRESS,
-        PromptHistoryStatus.NOT_FOUND: None,
-        PromptHistoryStatus.UNKNOWN: CancellationOutcome.UNAVAILABLE,
+        RemotePromptStatus.COMPLETED: CancellationOutcome.COMPLETED,
+        RemotePromptStatus.FAILED: CancellationOutcome.FAILED,
+        RemotePromptStatus.CANCELLED: CancellationOutcome.CANCELLED,
+        RemotePromptStatus.PENDING: CancellationOutcome.IN_PROGRESS,
+        RemotePromptStatus.IN_PROGRESS: CancellationOutcome.IN_PROGRESS,
+        RemotePromptStatus.NOT_FOUND: None,
+        RemotePromptStatus.UNAVAILABLE: CancellationOutcome.UNAVAILABLE,
     }
-    return mapping[history.status]
+    return mapping[status]
+
+
+def _history_remote_status(status: PromptHistoryStatus) -> RemotePromptStatus:
+    mapping = {
+        PromptHistoryStatus.COMPLETED: RemotePromptStatus.COMPLETED,
+        PromptHistoryStatus.FAILED: RemotePromptStatus.FAILED,
+        PromptHistoryStatus.INTERRUPTED: RemotePromptStatus.CANCELLED,
+        PromptHistoryStatus.IN_PROGRESS: RemotePromptStatus.IN_PROGRESS,
+        PromptHistoryStatus.NOT_FOUND: RemotePromptStatus.NOT_FOUND,
+        PromptHistoryStatus.UNKNOWN: RemotePromptStatus.UNAVAILABLE,
+    }
+    return mapping[status]
 
 
 def _cancellation_result(outcome: CancellationOutcome) -> CancellationResult:

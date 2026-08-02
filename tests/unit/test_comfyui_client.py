@@ -13,7 +13,10 @@ from runpod_sdxl_image_studio.adapters.comfyui.exceptions import (
     ComfyUIResponseError,
     ComfyUITimeoutError,
 )
-from runpod_sdxl_image_studio.adapters.comfyui.models import PromptHistoryStatus
+from runpod_sdxl_image_studio.adapters.comfyui.models import (
+    PromptHistoryStatus,
+    RemotePromptStatus,
+)
 
 FIXTURE_DIR = Path(__file__).parents[1] / "fixtures" / "comfyui"
 
@@ -191,4 +194,74 @@ async def test_prompt_history_404_is_typed_as_not_found() -> None:
 
     assert history.status is PromptHistoryStatus.NOT_FOUND
     assert history.exists is False
+    await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"status": "pending"}, RemotePromptStatus.PENDING),
+        ({"status": "in_progress"}, RemotePromptStatus.IN_PROGRESS),
+        ({"status": "completed"}, RemotePromptStatus.COMPLETED),
+        ({"status": "failed"}, RemotePromptStatus.FAILED),
+        ({"status": "cancelled"}, RemotePromptStatus.CANCELLED),
+    ],
+)
+@respx.mock
+async def test_remote_prompt_status_uses_modern_job_endpoint(
+    payload: dict[str, object], expected: RemotePromptStatus
+) -> None:
+    route = respx.get("http://comfy.test:8188/api/jobs/prompt-1").mock(
+        return_value=httpx.Response(200, json=payload)
+    )
+    client = ComfyUIClient(base_url="http://comfy.test:8188")
+
+    state = await client.get_remote_prompt_status("prompt-1")
+
+    assert route.called
+    assert state.status is expected
+    await client.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_remote_prompt_status_uses_queue_and_history_only_for_unsupported_modern_api() -> (
+    None
+):
+    modern = respx.get("http://comfy.test:8188/api/jobs/prompt-1").mock(
+        return_value=httpx.Response(405, text="unsupported")
+    )
+    queue = respx.get("http://comfy.test:8188/queue").mock(
+        return_value=httpx.Response(
+            200, json={"queue_pending": [[1, "prompt-1"]], "queue_running": []}
+        )
+    )
+    client = ComfyUIClient(base_url="http://comfy.test:8188")
+
+    state = await client.get_remote_prompt_status("prompt-1")
+
+    assert modern.called
+    assert queue.called
+    assert state.status is RemotePromptStatus.PENDING
+    await client.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_remote_prompt_status_404_fallback_returns_not_found() -> None:
+    respx.get("http://comfy.test:8188/api/jobs/prompt-1").mock(
+        return_value=httpx.Response(404, text="unsupported")
+    )
+    respx.get("http://comfy.test:8188/queue").mock(
+        return_value=httpx.Response(200, json={"queue_pending": [], "queue_running": []})
+    )
+    respx.get("http://comfy.test:8188/history/prompt-1").mock(
+        return_value=httpx.Response(404, text="missing")
+    )
+    client = ComfyUIClient(base_url="http://comfy.test:8188")
+
+    state = await client.get_remote_prompt_status("prompt-1")
+
+    assert state.status is RemotePromptStatus.NOT_FOUND
     await client.close()

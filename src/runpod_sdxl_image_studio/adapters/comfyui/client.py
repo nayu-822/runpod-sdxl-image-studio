@@ -20,6 +20,7 @@ from PIL import Image, UnidentifiedImageError
 
 from runpod_sdxl_image_studio.adapters.comfyui.exceptions import (
     ComfyUIConnectionError,
+    ComfyUIError,
     ComfyUIResponseError,
     ComfyUITimeoutError,
 )
@@ -32,11 +33,14 @@ from runpod_sdxl_image_studio.adapters.comfyui.models import (
     PromptHistory,
     PromptHistoryStatus,
     QueuedPrompt,
+    RemotePromptState,
+    RemotePromptStatus,
 )
 from runpod_sdxl_image_studio.adapters.comfyui.parsers import (
     parse_object_info,
     parse_prompt_history,
     parse_queued_prompt,
+    parse_remote_prompt_status,
     parse_system_stats,
 )
 from runpod_sdxl_image_studio.config import Settings, get_settings
@@ -175,6 +179,43 @@ class ComfyUIClient:
                 )
             raise
         return parse_prompt_history(payload, safe_prompt_id)
+
+    async def get_remote_prompt_status(self, prompt_id: str) -> RemotePromptState:
+        """Read a prompt state, using legacy queue/history only when modern is unsupported."""
+
+        safe_prompt_id = _validate_identifier(prompt_id, "prompt id")
+        path = f"/api/jobs/{quote(safe_prompt_id, safe='')}"
+        try:
+            payload = await self._get_json(path)
+        except ComfyUIResponseError as exc:
+            if exc.status_code not in {404, 405}:
+                return RemotePromptState(safe_prompt_id, RemotePromptStatus.UNAVAILABLE)
+            return await self._get_legacy_remote_prompt_status(safe_prompt_id)
+        except (ComfyUIConnectionError, ComfyUITimeoutError):
+            return RemotePromptState(safe_prompt_id, RemotePromptStatus.UNAVAILABLE)
+        return parse_remote_prompt_status(payload, safe_prompt_id)
+
+    async def _get_legacy_remote_prompt_status(self, prompt_id: str) -> RemotePromptState:
+        """Combine queue and history reads without issuing a destructive fallback."""
+
+        try:
+            queue = await self.get_queue_status()
+            if prompt_id in queue.pending_prompt_ids:
+                return RemotePromptState(prompt_id, RemotePromptStatus.PENDING)
+            if prompt_id in queue.running_prompt_ids:
+                return RemotePromptState(prompt_id, RemotePromptStatus.IN_PROGRESS)
+            history = await self.get_prompt_history(prompt_id)
+        except ComfyUIError:
+            return RemotePromptState(prompt_id, RemotePromptStatus.UNAVAILABLE)
+        history_mapping = {
+            PromptHistoryStatus.COMPLETED: RemotePromptStatus.COMPLETED,
+            PromptHistoryStatus.FAILED: RemotePromptStatus.FAILED,
+            PromptHistoryStatus.INTERRUPTED: RemotePromptStatus.CANCELLED,
+            PromptHistoryStatus.IN_PROGRESS: RemotePromptStatus.IN_PROGRESS,
+            PromptHistoryStatus.NOT_FOUND: RemotePromptStatus.NOT_FOUND,
+            PromptHistoryStatus.UNKNOWN: RemotePromptStatus.UNAVAILABLE,
+        }
+        return RemotePromptState(prompt_id, history_mapping[history.status])
 
     async def get_output_image(self, image: ComfyUIOutputImage) -> bytes:
         """Fetch one validated image reference from ComfyUI's ``/view`` endpoint."""

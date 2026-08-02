@@ -1,5 +1,12 @@
 # RunPod SDXL Image Studio 開発計画
 
+## Phase 4 追加修正の実装方針
+
+- Migration 0007 は terminal evidence を優先し、通常の pending/ready 行を failed にしない。旧 0007 適用済み DB で安全に復元できない行は 0008 で `migration_status_ambiguous` / `ambiguous` に隔離し、自動再送しない。
+- ComfyUI の modern job status は Adapter 内で `RemotePromptStatus` に変換する。modern endpoint の明示的な 404/405 の場合に限り queue/history へ fallback し、timeout・5xx・未知 payload は `UNAVAILABLE` として DB 状態を保持する。
+- prompt ID mismatch の手動解決は Queue detail から Generation 側、Job 側、手入力を選択し、Generation / Job の prompt ID、status、submission state、audit、claim を同一 transaction で更新する。`/prompt` の再送は行わない。
+- `execution_interrupted` の Recovery は Generation / Job の `cancelled_at`、`completed_at`、status、audit を同一 transaction で更新し、terminal state を上書きしない。
+
 ## フェーズ4の実装状況
 
 永続 FIFO Queue、単一 worker の lease、Random/連番 batch seed、キャンセル確認、単体 retry、failed-only batch retry、起動時・定期 reconciliation、Queue filter、0004/0005/0006/0007 migration、Gradio二重操作防止、Fake/Mockによる自動テストを実装済みです。キャンセル結果は `CANCELLED`、`COMPLETED`、`FAILED`、`IN_PROGRESS`、`NOT_FOUND`、`UNAVAILABLE` の typed outcome で扱い、history の `execution_interrupted` をキャンセル確定として処理します。

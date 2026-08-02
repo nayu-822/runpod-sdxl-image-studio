@@ -18,14 +18,14 @@ from runpod_sdxl_image_studio.services.generation_queue_service import (
 def build_queue_tab() -> tuple[
     gr.Button,
     gr.Dropdown,
-    gr.Textbox,
+    gr.Dropdown,
     gr.Dropdown,
     gr.Markdown,
     gr.Button,
     gr.Button,
     gr.Button,
     gr.Markdown,
-    gr.Textbox,
+    gr.Dropdown,
     gr.Button,
     gr.Button,
 ]:
@@ -44,7 +44,13 @@ def build_queue_tab() -> tuple[
         cancel = gr.Button("選択ジョブをキャンセル")
         retry = gr.Button("選択ジョブを再試行")
         retry_batch = gr.Button("失敗バッチを再試行")
-    ambiguous_prompt_id = gr.Textbox(label="曖昧なprompt ID", visible=False, interactive=False)
+    ambiguous_prompt_id = gr.Dropdown(
+        label="解決するprompt ID（Generation / Job / 手入力）",
+        choices=[],
+        allow_custom_value=True,
+        visible=False,
+        interactive=False,
+    )
     with gr.Row():
         ambiguous_link = gr.Button("prompt IDを紐付け", visible=False, interactive=False)
         ambiguous_fail = gr.Button(
@@ -175,7 +181,13 @@ def make_queue_ambiguous_link_handler(
                 raise GenerationQueueServiceError("曖昧なジョブを選択してください")
             item = service.link_ambiguous_prompt(UUID(selected), prompt_id or "")
             return (
-                gr.Textbox(value="", visible=False, interactive=False),
+                gr.Dropdown(
+                    choices=[],
+                    allow_custom_value=True,
+                    value=None,
+                    visible=False,
+                    interactive=False,
+                ),
                 gr.Button(visible=False, interactive=False),
                 gr.Button(visible=False, interactive=False),
                 f"promptを紐付けました: `{item.job.prompt_id}`",
@@ -195,7 +207,13 @@ def make_queue_ambiguous_fail_handler(
                 raise GenerationQueueServiceError("曖昧なジョブを選択してください")
             item = service.fail_ambiguous_prompt(UUID(selected))
             return (
-                gr.Textbox(value="", visible=False, interactive=False),
+                gr.Dropdown(
+                    choices=[],
+                    allow_custom_value=True,
+                    value=None,
+                    visible=False,
+                    interactive=False,
+                ),
                 gr.Button(visible=False, interactive=False),
                 gr.Button(visible=False, interactive=False),
                 f"prompt不在を確認し、ジョブを失敗確定しました: `{item.generation.id}`",
@@ -231,6 +249,9 @@ def _queue_detail(item: GenerationQueueItem | None) -> str:
     batch = f"\nバッチ: `{item.batch.name}` 番号={item.entry.batch_index}" if item.batch else ""
     cancel = "\nキャンセル要求済み" if item.entry.cancel_requested_at else ""
     error = f"\nエラー: `{item.generation.error_summary}`" if item.generation.error_summary else ""
+    error_code = (
+        f"\nerror_code: `{item.generation.error_code}`" if item.generation.error_code else ""
+    )
     ambiguous = (
         "\n**曖昧なpromptは自動再送信されません。明示的な解決操作を使用してください。**"
         if item.entry.submission_state.value == "ambiguous"
@@ -247,22 +268,60 @@ def _queue_detail(item: GenerationQueueItem | None) -> str:
         f"Checkpoint: `{snapshot.checkpoint_name}` Seed: `{snapshot.seed}` "
         f"サイズ: `{snapshot.width}x{snapshot.height}` LoRA: `{len(snapshot.loras)}`\n"
         f"進捗: `{item.job.progress_value}/{item.job.progress_maximum}` "
-        f"ノード: `{item.job.current_node or '-'}`{error}"
+        f"ノード: `{item.job.current_node or '-'}`{error_code}{error}"
     )
 
 
 def _ambiguous_controls(item: GenerationQueueItem | None) -> tuple[object, object, object]:
     terminal = {GenerationStatus.COMPLETED, GenerationStatus.FAILED, GenerationStatus.CANCELLED}
+    migration_recoverable = {
+        "migration_status_mismatch",
+        "migration_status_ambiguous",
+        "migration_prompt_id_mismatch",
+    }
+    terminal_blocked = item is not None and (
+        item.generation.status in {GenerationStatus.COMPLETED, GenerationStatus.CANCELLED}
+        or item.job.status in {GenerationStatus.COMPLETED, GenerationStatus.CANCELLED}
+    )
+    failed_migration = (
+        item is not None
+        and (
+            item.generation.status is GenerationStatus.FAILED
+            or item.job.status is GenerationStatus.FAILED
+        )
+        and bool(
+            {item.generation.error_code, item.job.error_code}.intersection(migration_recoverable)
+        )
+    )
     eligible = (
         item is not None
         and item.entry.submission_state.value == "ambiguous"
-        and item.generation.comfy_prompt_id is None
-        and item.job.prompt_id is None
-        and item.generation.status not in terminal
-        and item.job.status not in terminal
+        and not terminal_blocked
+        and (
+            item.generation.status not in terminal
+            and item.job.status not in terminal
+            or failed_migration
+        )
     )
+    choices: list[tuple[str, str]] = []
+    if item is not None:
+        if item.generation.comfy_prompt_id:
+            choices.append(
+                (
+                    "Generation側: " + item.generation.comfy_prompt_id,
+                    item.generation.comfy_prompt_id,
+                )
+            )
+        if item.job.prompt_id:
+            choices.append(("Job側: " + item.job.prompt_id, item.job.prompt_id))
     return (
-        gr.Textbox(value="", visible=eligible, interactive=eligible),
+        gr.Dropdown(
+            choices=choices,
+            allow_custom_value=True,
+            value=None,
+            visible=eligible,
+            interactive=eligible,
+        ),
         gr.Button(visible=eligible, interactive=eligible),
         gr.Button(visible=eligible, interactive=eligible),
     )

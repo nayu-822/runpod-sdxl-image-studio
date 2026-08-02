@@ -15,7 +15,10 @@ from runpod_sdxl_image_studio.adapters.comfyui.models import (
     ComfyUICapabilities,
     ComfyUIOutputImage,
     PromptHistory,
+    PromptHistoryStatus,
     QueuedPrompt,
+    RemotePromptState,
+    RemotePromptStatus,
 )
 from runpod_sdxl_image_studio.adapters.comfyui.workflow_adapter import WorkflowAdapter
 from runpod_sdxl_image_studio.adapters.database.engine import (
@@ -1055,6 +1058,85 @@ async def test_recovery_marks_stale_pending_and_comfyui_failure_without_resubmit
     assert repository.get_by_id(failed.id).status is GenerationStatus.FAILED  # type: ignore[union-attr]
     assert jobs.list_recoverable() == ()
     assert stale_job.id != failed_job.id
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_recovery_persists_interrupted_as_atomic_cancelled_pair(tmp_path: Path) -> None:
+    settings, engine, repository, artifacts, _, jobs = _repositories(tmp_path)
+    generation = repository.create_pending(GenerationSettingsSnapshot.from_settings(_settings()))
+    job = jobs.create(GenerationJob(generation.id, GenerationStatus.PENDING))
+    repository.mark_queued(generation.id, "prompt-interrupted")
+    jobs.update_prompt_id(job.id, "prompt-interrupted")
+
+    class Client:
+        async def get_prompt_history(self, prompt_id: str) -> PromptHistory:
+            assert prompt_id == "prompt-interrupted"
+            return PromptHistory(
+                prompt_id,
+                False,
+                False,
+                (),
+                None,
+                True,
+                status=PromptHistoryStatus.INTERRUPTED,
+            )
+
+    recovery = GenerationRecoveryService(
+        Client(),  # type: ignore[arg-type]
+        repository,
+        jobs,
+        artifacts,
+        settings,
+        cancellation_repository=repository_module.GenerationCancellationRepository(
+            repository._session_factory
+        ),
+    )
+
+    messages = await recovery.recover(datetime(2026, 7, 26, 1, 0, tzinfo=UTC))
+
+    persisted = repository.get_by_id(generation.id)
+    persisted_job = jobs.get_by_generation(generation.id)
+    assert f"{generation.id}: cancelled" in messages
+    assert persisted is not None and persisted.status is GenerationStatus.CANCELLED
+    assert persisted_job is not None and persisted_job.status is GenerationStatus.CANCELLED
+    assert persisted_job.cancelled_at is not None
+    assert persisted.completed_at is not None
+    assert await recovery.recover() == ()
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_recovery_uses_typed_remote_cancelled_status(tmp_path: Path) -> None:
+    settings, engine, repository, artifacts, _, jobs = _repositories(tmp_path)
+    generation = repository.create_pending(GenerationSettingsSnapshot.from_settings(_settings()))
+    job = jobs.create(GenerationJob(generation.id, GenerationStatus.PENDING))
+    repository.mark_queued(generation.id, "prompt-typed-cancel")
+    jobs.update_prompt_id(job.id, "prompt-typed-cancel")
+
+    class Client:
+        async def get_remote_prompt_status(self, prompt_id: str) -> RemotePromptState:
+            return RemotePromptState(prompt_id, RemotePromptStatus.CANCELLED)
+
+        async def get_prompt_history(self, prompt_id: str) -> PromptHistory:
+            raise AssertionError(f"typed cancellation must not read history: {prompt_id}")
+
+    recovery = GenerationRecoveryService(
+        Client(),  # type: ignore[arg-type]
+        repository,
+        jobs,
+        artifacts,
+        settings,
+        cancellation_repository=repository_module.GenerationCancellationRepository(
+            repository._session_factory
+        ),
+    )
+
+    messages = await recovery.recover(datetime(2026, 7, 26, 1, 0, tzinfo=UTC))
+
+    assert f"{generation.id}: cancelled" in messages
+    assert repository.get_by_id(generation.id).status is GenerationStatus.CANCELLED  # type: ignore[union-attr]
+    assert jobs.get_by_generation(generation.id).status is GenerationStatus.CANCELLED  # type: ignore[union-attr]
     engine.dispose()
 
 
