@@ -213,17 +213,15 @@ class GenerationRecoveryService:
         error_summary: str,
         failed_at: datetime,
     ) -> None:
-        if self._failure_repository is not None:
-            self._failure_repository.fail_generation(
-                generation_id,
-                job_id,
-                error_code=error_code,
-                error_summary=error_summary,
-                failed_at=failed_at,
-            )
-            return
-        self._generation_repository.mark_failed(generation_id, error_code, error_summary)
-        self._job_repository.mark_failed(job_id, error_code, error_summary)
+        if self._failure_repository is None:
+            raise GenerationRepositoryError("atomic failure persistence is unavailable")
+        self._failure_repository.fail_generation(
+            generation_id,
+            job_id,
+            error_code=error_code,
+            error_summary=error_summary,
+            failed_at=failed_at,
+        )
 
 
 def _utc(value: datetime) -> datetime:
