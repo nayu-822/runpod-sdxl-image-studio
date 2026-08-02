@@ -34,13 +34,15 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_start_re
 )
 from runpod_sdxl_image_studio.adapters.database.repositories.upscale_settings_repository import (
     UpscaleSettingsRepository,
+    UpscaleSettingsRepositoryError,
 )
 from runpod_sdxl_image_studio.adapters.storage.local_storage import LocalStorageAdapter
 from runpod_sdxl_image_studio.config import Settings
-from runpod_sdxl_image_studio.domain.generation import GenerationKind
+from runpod_sdxl_image_studio.domain.generation import GenerationKind, GenerationStatus, StoredImage
 from runpod_sdxl_image_studio.domain.generation_artifact import ArtifactType, GenerationArtifact
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
+from runpod_sdxl_image_studio.domain.job import GenerationJob
 from runpod_sdxl_image_studio.domain.upscale import (
     UpscaleLoadLevel,
     UpscaleMethod,
@@ -53,6 +55,7 @@ from runpod_sdxl_image_studio.domain.upscale_snapshot import (
     UpscaleSettingsSnapshot,
     UpscaleSnapshotError,
 )
+from runpod_sdxl_image_studio.services.generation_service import GenerationService
 from runpod_sdxl_image_studio.services.upscale_enqueue_service import (
     UpscaleEnqueueError,
     UpscaleEnqueueService,
@@ -263,3 +266,95 @@ def test_upscaled_storage_uses_separate_directory(tmp_path: Path) -> None:
         _png(), UUID(int=101), datetime(2026, 8, 2, tzinfo=UTC), kind=GenerationKind.UPSCALE
     )
     assert "/upscaled/" in stored.path.as_posix()
+
+
+@pytest.mark.parametrize("failure_kind", ["settings", "sidecar", "metadata_artifact", "thumbnail"])
+def test_optional_upscale_artifact_failures_do_not_reopen_completed_state(
+    tmp_path: Path, failure_kind: str
+) -> None:
+    class ArtifactRepository:
+        def list_by_generation(self, generation_id: UUID) -> tuple[object, ...]:
+            del generation_id
+            return ()
+
+        def add(self, artifact: object) -> object:
+            if failure_kind == "metadata_artifact":
+                raise RuntimeError("metadata artifact failure")
+            return artifact
+
+    class MetadataStorage:
+        def save_for_image(self, image_path: Path, payload: dict[str, object]) -> Path:
+            del payload
+            if failure_kind == "sidecar":
+                raise RuntimeError("sidecar failure")
+            path = image_path.with_suffix(".json")
+            path.write_text("{}", encoding="utf-8")
+            return path
+
+        def relative_path(self, path: Path) -> str:
+            return path.name
+
+        def sha256(self, path: Path) -> str:
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    class ThumbnailStorage:
+        def save(self, image_path: Path, generation_id: UUID, created_at: datetime) -> Path:
+            del image_path, generation_id, created_at
+            raise RuntimeError("thumbnail failure")
+
+        def relative_path(self, path: Path) -> str:
+            return path.name
+
+        def sha256(self, path: Path) -> str:
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    class UpscaleRepository:
+        def get_by_generation(self, generation_id: UUID) -> object | None:
+            del generation_id
+            if failure_kind == "settings":
+                raise UpscaleSettingsRepositoryError("settings failure")
+            return None
+
+        def get_by_source_artifact(self, source_artifact_id: UUID) -> tuple[object, ...]:
+            del source_artifact_id
+            return ()
+
+    settings = Settings(_env_file=None, data_dir=tmp_path)
+    image_path = tmp_path / "result.png"
+    image_path.write_bytes(_png((8, 8)))
+    service = GenerationService(
+        object(),
+        object(),
+        object(),
+        object(),
+        lambda: None,  # type: ignore[arg-type]
+        settings,
+        thumbnail_storage=ThumbnailStorage() if failure_kind == "thumbnail" else None,  # type: ignore[arg-type]
+        metadata_storage=MetadataStorage() if failure_kind != "thumbnail" else None,  # type: ignore[arg-type]
+        upscale_settings_repository=UpscaleRepository(),  # type: ignore[arg-type]
+    )
+    service._artifact_repository = ArtifactRepository()  # noqa: SLF001 - exercise optional boundary
+    job = GenerationJob(
+        generation_id=uuid4(),
+        status=GenerationStatus.COMPLETED,
+        created_at=datetime.now(UTC),
+    )
+    image = StoredImage(
+        path=image_path,
+        sha256=hashlib.sha256(image_path.read_bytes()).hexdigest(),
+        size_bytes=image_path.stat().st_size,
+        width=8,
+        height=8,
+        mime_type="image/png",
+    )
+
+    service._persist_optional_artifacts(  # noqa: SLF001 - verify completion boundary
+        job,
+        _settings(),
+        image,
+        datetime.now(UTC),
+        GenerationKind.UPSCALE,
+        None,
+    )
+
+    assert job.status is GenerationStatus.COMPLETED
