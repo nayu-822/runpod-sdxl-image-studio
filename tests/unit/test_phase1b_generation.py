@@ -542,7 +542,7 @@ async def test_view_endpoint_rejects_oversized_declared_or_actual_bytes(
         return_value=httpx.Response(200, headers=headers, content=content)
     )
     settings = Settings(_env_file=None, max_output_image_bytes=4)
-    client = ComfyUIClient(settings)
+    client = ComfyUIClient(settings, base_url="http://comfy.test:8188")
 
     with pytest.raises(ComfyUIResponseError):
         await client.get_output_image(ComfyUIOutputImage("image.png", "", "output"))

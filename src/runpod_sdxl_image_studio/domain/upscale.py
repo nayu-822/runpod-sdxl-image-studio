@@ -119,20 +119,22 @@ def estimate_load_level(
     output_width: int,
     output_height: int,
 ) -> UpscaleLoadLevel:
-    factor = max(output_width / source_width, output_height / source_height)
+    if source_width <= 0 or source_height <= 0 or output_width <= 0 or output_height <= 0:
+        raise ValueError("source and output dimensions must be positive")
+    pixel_ratio = (output_width * output_height) / (source_width * source_height)
     if method is UpscaleMethod.IMAGE:
         return (
             UpscaleLoadLevel.LOW
-            if factor <= 2
+            if pixel_ratio <= 2
             else UpscaleLoadLevel.MEDIUM
-            if factor <= 4
+            if pixel_ratio <= 4
             else UpscaleLoadLevel.HIGH
         )
     return (
         UpscaleLoadLevel.LOW
-        if factor <= 1.5
+        if pixel_ratio <= 1.5
         else UpscaleLoadLevel.MEDIUM
-        if factor <= 3
+        if pixel_ratio <= 3
         else UpscaleLoadLevel.HIGH
     )
 

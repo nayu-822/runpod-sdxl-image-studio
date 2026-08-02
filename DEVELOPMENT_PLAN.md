@@ -17,7 +17,7 @@
 
 0005/0006では既存DBの状態不一致を terminal state と Artifact の証拠に基づいて補正し、Generation と Job の prompt ID 不一致は `migration_prompt_id_mismatch` として Queue entry ごと `ambiguous` に隔離します。0005/0006適用済みDBには0007後続migrationを適用し、cancel requestだけで `cancelled` へ遷移させず、復元できない状態を監査可能に保持します。既存の画像、Artifact、履歴、Presetは削除しません。
 
-Queue 並べ替え、複数 worker/GPU、自動 retry、Phase 5アップスケール、外部画像metadata、Google Drive同期、ComfyUI汎用workflow editor、LoRA学習は未実装です。
+Queue 並べ替え、複数 worker/GPU、自動 retry、外部画像metadata、Google Drive同期、ComfyUI汎用workflow editor、LoRA学習は未実装です。
 
 ## 方針
 
@@ -436,8 +436,11 @@ reconciliationを残します。アップスケール実処理、Google Drive同
 
 ## フェーズ5の完了状況
 
-フェーズ5を実装しました。完了済み画像Generationを親とする、非破壊で再現可能な画像アップスケールとLatentアップスケール、
+フェーズ5の主要経路を実装済みです。完了済み画像Generationを親とする、非破壊で再現可能な画像アップスケールとLatentアップスケール、
 アップスケール専用snapshotと`generation_upscale_settings` migration、一次Artifactの再検証、upscaler catalog、固定workflow、
-ComfyUI input upload、upscaled保存先、キュー実行・再試行・復旧経路、比較用UIを追加しています。
+ComfyUI input upload、送信前capability検証、出力寸法検証、upscaled保存先、キュー実行・再試行・復旧経路、比較用UIを追加しています。
+
+ただし、実GPU・実ComfyUIを使った運用確認は未実施です。Fake/SQLite/Alembicによる自動テストで検証し、実環境では
+capability不足時のfailed確定、再起動後のhistory復旧、誤寸法出力のfailed確定、元画像非上書き、UIの親画像選択と比較を手動確認する必要があります。
 
 未実装としてPhase 6、複数worker、queue並べ替え、自動retry、Google Drive同期、汎用workflow editorは引き続き対象外です。

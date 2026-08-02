@@ -91,8 +91,13 @@ def test_upscale_domain_resolves_source_artifact_size_and_load_levels() -> None:
     size = resolve_output_size(settings, 513, 512, max_width=2048, max_height=2048)
     assert size.width == 1088
     assert size.height == 1024
-    assert estimate_load_level(UpscaleMethod.IMAGE, 512, 512, 1024, 1024) is UpscaleLoadLevel.LOW
+    assert estimate_load_level(UpscaleMethod.IMAGE, 512, 512, 1024, 1024) is UpscaleLoadLevel.MEDIUM
     assert estimate_load_level(UpscaleMethod.LATENT, 512, 512, 2048, 2048) is UpscaleLoadLevel.HIGH
+    assert estimate_load_level(UpscaleMethod.IMAGE, 100, 100, 100, 200) is UpscaleLoadLevel.LOW
+    assert estimate_load_level(UpscaleMethod.IMAGE, 100, 100, 200, 200) is UpscaleLoadLevel.MEDIUM
+    assert estimate_load_level(UpscaleMethod.IMAGE, 100, 100, 300, 200) is UpscaleLoadLevel.HIGH
+    assert estimate_load_level(UpscaleMethod.LATENT, 100, 100, 100, 150) is UpscaleLoadLevel.LOW
+    assert estimate_load_level(UpscaleMethod.LATENT, 100, 100, 100, 300) is UpscaleLoadLevel.MEDIUM
     with pytest.raises(ValueError):
         UpscaleSettings(
             method=UpscaleMethod.IMAGE,

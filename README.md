@@ -419,9 +419,11 @@ Presetと検索用インデックスはSQLiteの`data/database/image_studio.sqli
 完了済みGenerationの一次画像を親として、画像アップスケールまたはLatentアップスケールをキューへ追加できます。
 親画像はSHA-256、MIME、寸法、許可ディレクトリ内の実体を再検証し、元画像は変更しません。アップスケールは常に
 新しいGeneration、Job、Queue entry、`generation_upscale_settings`行として保存され、結果は
-`generations/YYYY-MM-DD/upscaled`へ保存します。
+`generations/YYYY-MM-DD/upscaled`へ保存します。親画像はDBの完了Generationと主Artifactから選択し、履歴で完了したアップスケールを選ぶと
+親画像と結果を比較表示できます。
 
-倍率または64の倍数の目標寸法、最大幅・高さ・ピクセル数・倍率、取得済みupscalerを検証します。Latent方式では親の
+倍率または64の倍数の目標寸法、最大幅・高さ・ピクセル数・倍率、取得済みupscalerを検証します。送信前にComfyUIのrequired node、checkpoint、VAE、sampler、scheduler、LoRA、upscalerも検証し、
+不足時はpromptを送信せずGeneration/Jobをretry可能なfailedへ確定します。Latent方式では親の
 保存済みGeneration snapshotからprompt、seed、checkpoint、VAE、LoRA、sampler、scheduler、CFG、stepsを復元し、
 ブラウザ状態や現在のUI値を使いません。ComfyUIへの入力画像アップロードと固定whitelist workflowをAdapterに閉じ込め、
 既存prompt IDの再送信は行いません。

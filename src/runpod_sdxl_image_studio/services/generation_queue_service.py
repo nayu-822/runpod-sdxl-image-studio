@@ -13,6 +13,7 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_dispatch
     GenerationDispatchQueueRepositoryProtocol,
 )
 from runpod_sdxl_image_studio.adapters.database.repositories.upscale_settings_repository import (
+    UpscaleSettingsRepositoryError,
     UpscaleSettingsRepositoryProtocol,
 )
 from runpod_sdxl_image_studio.config import Settings
@@ -266,7 +267,11 @@ class GenerationQueueService:
             return QueueEnqueueResult(new_item, new_item.entry.sequence)
         except GenerationQueueServiceError:
             raise
-        except (GenerationDispatchQueueRepositoryError, ValueError) as exc:
+        except (
+            GenerationDispatchQueueRepositoryError,
+            UpscaleSettingsRepositoryError,
+            ValueError,
+        ) as exc:
             raise GenerationQueueServiceError(
                 _enqueue_error_message(exc, "ジョブの再試行")
             ) from exc

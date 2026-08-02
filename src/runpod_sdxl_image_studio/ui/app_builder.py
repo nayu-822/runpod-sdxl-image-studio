@@ -165,10 +165,14 @@ from runpod_sdxl_image_studio.ui.tabs.system_tab import (
     size_preset_values,
 )
 from runpod_sdxl_image_studio.ui.tabs.upscale_tab import (
+    begin_upscale_enqueue,
     build_upscale_tab,
-    make_latest_parent_handler,
-    make_upscale_enqueue_handler,
+    make_latest_parent_selection_handler,
+    make_parent_selection_handler,
+    make_upscale_enqueue_details_handler,
     make_upscale_plan_handler,
+    make_upscale_result_handler,
+    make_upscale_visibility_handler,
 )
 from runpod_sdxl_image_studio.ui.view_models import initial_status_markdown
 from runpod_sdxl_image_studio.workflows.loader import load_txt2img_template, load_workflow_template
@@ -268,6 +272,7 @@ def build_app(
         upscale_workflow_adapter=UpscaleWorkflowAdapter(
             loaded_image_upscale.as_mapping(), loaded_latent_upscale.as_mapping()
         ),
+        upscaler_catalog=upscale_catalog,
     )
     cancellation_adapter = ComfyUICancellationAdapter(client, app_settings)
     queue_service = GenerationQueueService(
@@ -356,12 +361,16 @@ def build_app(
         with gr.Tab("履歴"):
             history = build_history_tab()
         with gr.Tab("アップスケール"):
-            upscale = build_upscale_tab(upscale_catalog.models or ())
+            upscale = build_upscale_tab(upscale_catalog)
         with gr.Tab("プリセット"):
             presets = build_preset_tab()
 
         upscale.enqueue_button.click(
-            fn=make_upscale_enqueue_handler(upscale_enqueue_service),
+            fn=begin_upscale_enqueue,
+            outputs=[upscale.enqueue_button],
+            queue=False,
+        ).then(
+            fn=make_upscale_enqueue_details_handler(upscale_enqueue_service),
             inputs=[
                 upscale.parent_generation_id,
                 upscale.method,
@@ -376,9 +385,33 @@ def build_app(
             concurrency_limit=1,
         )
         upscale.latest_button.click(
-            fn=make_latest_parent_handler(upscale_enqueue_service),
-            outputs=[upscale.parent_generation_id, upscale.status],
+            fn=make_latest_parent_selection_handler(upscale_enqueue_service),
+            outputs=[upscale.parent_generation_id, upscale.source_preview, upscale.status],
             concurrency_limit=1,
+        )
+        history.selected.change(
+            fn=make_parent_selection_handler(upscale_enqueue_service),
+            inputs=[history.selected],
+            outputs=[upscale.parent_generation_id, upscale.source_preview, upscale.status],
+            concurrency_limit=1,
+        )
+        history.selected.change(
+            fn=make_upscale_result_handler(upscale_enqueue_service),
+            inputs=[history.selected],
+            outputs=[upscale.result, upscale.comparison, upscale.status],
+            concurrency_limit=1,
+        )
+        upscale.method.change(
+            fn=make_upscale_visibility_handler(),
+            inputs=[upscale.method],
+            outputs=[upscale.upscaler_name, upscale.denoise],
+            queue=False,
+        )
+        demo.load(
+            fn=make_upscale_visibility_handler(),
+            inputs=[upscale.method],
+            outputs=[upscale.upscaler_name, upscale.denoise],
+            queue=False,
         )
         upscale_plan_inputs = [
             upscale.parent_generation_id,

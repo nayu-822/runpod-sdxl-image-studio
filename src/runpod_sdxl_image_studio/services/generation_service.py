@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 from uuid import UUID, uuid4
 
+from runpod_sdxl_image_studio.adapters.catalog.upscaler_catalog import UpscalerCatalog
 from runpod_sdxl_image_studio.adapters.comfyui.client import ComfyUIClient
 from runpod_sdxl_image_studio.adapters.comfyui.exceptions import (
     ComfyUIError,
@@ -43,6 +44,7 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_start_re
     GenerationStartRepositoryProtocol,
 )
 from runpod_sdxl_image_studio.adapters.database.repositories.upscale_settings_repository import (
+    UpscaleSettingsRepositoryError,
     UpscaleSettingsRepositoryProtocol,
 )
 from runpod_sdxl_image_studio.adapters.storage.exceptions import StorageError
@@ -72,6 +74,7 @@ from runpod_sdxl_image_studio.domain.generation_settings import (
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
 from runpod_sdxl_image_studio.domain.job import GenerationJob
 from runpod_sdxl_image_studio.domain.system_status import CapabilityRefreshResult
+from runpod_sdxl_image_studio.domain.upscale_snapshot import UpscaleSettingsSnapshot
 from runpod_sdxl_image_studio.services.generation_errors import (
     ArtifactPersistenceError,
     CompletionPersistenceError,
@@ -88,6 +91,9 @@ from runpod_sdxl_image_studio.services.generation_persistence import (
 from runpod_sdxl_image_studio.services.upscale_enqueue_service import (
     UpscaleEnqueueError,
     verify_source_artifact,
+)
+from runpod_sdxl_image_studio.services.upscale_output_validation import (
+    validate_upscale_output,
 )
 
 logger = logging.getLogger(__name__)
@@ -150,6 +156,7 @@ class GenerationService:
         metadata_storage: GenerationMetadataStorage | None = None,
         upscale_settings_repository: UpscaleSettingsRepositoryProtocol | None = None,
         upscale_workflow_adapter: UpscaleWorkflowAdapter | None = None,
+        upscaler_catalog: UpscalerCatalog | None = None,
     ) -> None:
         self._client = client
         self._workflow_adapter = workflow_adapter
@@ -206,6 +213,9 @@ class GenerationService:
         self._metadata_storage = metadata_storage
         self._upscale_settings_repository = upscale_settings_repository
         self._upscale_workflow_adapter = upscale_workflow_adapter
+        self._upscaler_catalog = upscaler_catalog or UpscalerCatalog.scan(
+            self._settings.upscaler_dir
+        )
         self._jobs: dict[UUID, GenerationJob] = {}
         self._results: dict[UUID, GenerationResult] = {}
         self._lock = asyncio.Lock()
@@ -279,9 +289,24 @@ class GenerationService:
             if not history.is_completed or not history.outputs:
                 return ReconciliationOutcome.IN_PROGRESS
             image_bytes = await self._client.get_output_image(history.outputs[0])
+            persisted_upscale = None
+            if generation.kind is GenerationKind.UPSCALE:
+                try:
+                    persisted_upscale = self._validate_upscale_output(generation_id, image_bytes)
+                except UpscaleEnqueueError as exc:
+                    if exc.code == "upscale_output_dimension_mismatch":
+                        return self._fail_reconciled_upscale(job, exc)
+                    raise
             stored_image = self._storage.store_image(
                 image_bytes, generation_id, generation.created_at, kind=generation.kind
             )
+            if persisted_upscale is not None:
+                try:
+                    self._ensure_stored_upscale_dimensions(stored_image, persisted_upscale)
+                except UpscaleEnqueueError as exc:
+                    if exc.code == "upscale_output_dimension_mismatch":
+                        return self._fail_reconciled_upscale(job, exc)
+                    raise
             recovery_job = GenerationJob(
                 generation_id=generation_id,
                 status=GenerationStatus.RUNNING,
@@ -299,7 +324,14 @@ class GenerationService:
                 is_recovery=True,
             )
             return ReconciliationOutcome.COMPLETED
-        except (ComfyUIError, GenerationRepositoryError, StorageError, ValueError) as exc:
+        except (
+            ComfyUIError,
+            GenerationRepositoryError,
+            UpscaleSettingsRepositoryError,
+            UpscaleEnqueueError,
+            StorageError,
+            ValueError,
+        ) as exc:
             logger.error(
                 "Generation recovery failed generation=%s prompt_id=%s error=%s",
                 generation_id,
@@ -308,6 +340,36 @@ class GenerationService:
                 exc_info=True,
             )
             return ReconciliationOutcome.UNAVAILABLE
+
+    def _validate_upscale_output(
+        self, generation_id: UUID, image_bytes: bytes
+    ) -> UpscaleSettingsSnapshot:
+        if self._upscale_settings_repository is None:
+            raise UpscaleEnqueueError(
+                "upscale_settings_unavailable", "upscale settings repository is unavailable"
+            )
+        return validate_upscale_output(
+            generation_id, image_bytes, self._upscale_settings_repository
+        )
+
+    def _fail_reconciled_upscale(
+        self, job: GenerationJob, error: UpscaleEnqueueError
+    ) -> ReconciliationOutcome:
+        self._mark_failed_pair(job, error.code, str(error))
+        return ReconciliationOutcome.FAILED
+
+    @staticmethod
+    def _ensure_stored_upscale_dimensions(
+        stored_image: StoredImage, snapshot: UpscaleSettingsSnapshot
+    ) -> None:
+        if (stored_image.width, stored_image.height) != (
+            snapshot.target_width,
+            snapshot.target_height,
+        ):
+            raise UpscaleEnqueueError(
+                "upscale_output_dimension_mismatch",
+                "stored upscale output dimensions do not match the persisted target",
+            )
 
     async def recover_prompt(self, generation_id: UUID, prompt_id: str) -> bool:
         """Compatibility wrapper for the pre-Phase 4 recovery service."""
@@ -673,20 +735,18 @@ class GenerationService:
             if source_artifact is None or source_artifact.id != upscale_snapshot.source_artifact_id:
                 raise ComfyUIPromptError("upscale source artifact was not found")
             source = verify_source_artifact(source_artifact, self._settings)
+            source_generation = self._generation_repository.get_by_id(
+                upscale_snapshot.source_generation_id
+            )
+            if source_generation is None:
+                raise ComfyUIPromptError("upscale parent generation was not found")
+            await self._preflight_upscale(upscale_snapshot, source_generation.settings_snapshot)
             upload = getattr(self._client, "upload_input_image", None)
             if not callable(upload):
                 raise ComfyUIPromptError("ComfyUI input image upload is unavailable")
             source_token = await upload(
                 source.path.read_bytes(), job.generation_id, upscale_snapshot.source_sha256
             )
-            if self._generation_repository is not None:
-                source_generation = self._generation_repository.get_by_id(
-                    upscale_snapshot.source_generation_id
-                )
-            else:
-                source_generation = None
-            if source_generation is None:
-                raise ComfyUIPromptError("upscale parent generation was not found")
             source_token_name = (
                 source_token.filename if hasattr(source_token, "filename") else str(source_token)
             )
@@ -795,13 +855,25 @@ class GenerationService:
         if cancel_check is not None and cancel_check():
             raise GenerationCancelledError("generation was cancelled during execution")
         image_bytes = await self._client.get_output_image(history.outputs[0])
+        persisted_upscale = None
+        if kind is GenerationKind.UPSCALE:
+            try:
+                persisted_upscale = self._validate_upscale_output(job.generation_id, image_bytes)
+            except UpscaleEnqueueError as exc:
+                if exc.code == "upscale_output_dimension_mismatch":
+                    self._mark_failed_pair(job, exc.code, str(exc))
+                raise
         job.stored_image = self._storage.store_image(
             image_bytes,
             job.generation_id,
             created_at,
             kind=kind,
         )
-        if kind is GenerationKind.UPSCALE and self._upscale_settings_repository is not None:
+        if (
+            kind is GenerationKind.UPSCALE
+            and persisted_upscale is None
+            and self._upscale_settings_repository is not None
+        ):
             persisted_upscale = self._upscale_settings_repository.get_by_generation(
                 job.generation_id
             )
@@ -813,7 +885,103 @@ class GenerationService:
                     "upscale_output_dimension_mismatch",
                     "ComfyUIのアップスケール出力寸法が要求値と一致しません。",
                 )
+        if persisted_upscale is not None and job.stored_image is not None:
+            try:
+                self._ensure_stored_upscale_dimensions(job.stored_image, persisted_upscale)
+            except UpscaleEnqueueError as exc:
+                self._mark_failed_pair(job, exc.code, str(exc))
+                raise
         self._complete_job(job, settings, created_at, kind, parent_generation_id)
+
+    async def _preflight_upscale(
+        self,
+        upscale_snapshot: UpscaleSettingsSnapshot,
+        source_settings: GenerationSettingsSnapshot,
+    ) -> None:
+        """Check all deterministic ComfyUI requirements before source upload."""
+
+        try:
+            capabilities_result = await self._capabilities_provider()
+        except Exception as exc:  # noqa: BLE001 - capability failure is retryable and safe
+            raise UpscaleEnqueueError(
+                "upscale_capabilities_unavailable",
+                "ComfyUI capabilities could not be retrieved",
+            ) from exc
+        capabilities = capabilities_result.capabilities
+        if not capabilities_result.is_success or capabilities is None:
+            raise UpscaleEnqueueError(
+                "upscale_capabilities_unavailable",
+                "ComfyUI capabilities are unavailable",
+            )
+
+        required_nodes = (
+            (
+                "LoadImage",
+                "UpscaleModelLoader",
+                "ImageUpscaleWithModel",
+                "ImageScale",
+                "SaveImage",
+            )
+            if upscale_snapshot.method.value == "image"
+            else (
+                "LoadImage",
+                "CheckpointLoaderSimple",
+                "CLIPTextEncode",
+                "VAEEncode",
+                "LatentUpscale",
+                "KSampler",
+                "VAEDecode",
+                "SaveImage",
+            )
+        )
+        available_nodes: frozenset[str] = getattr(
+            capabilities, "available_node_classes", frozenset()
+        )
+        if any(node not in available_nodes for node in required_nodes):
+            raise UpscaleEnqueueError(
+                "upscale_required_node_missing",
+                "one or more required upscale nodes are unavailable",
+            )
+
+        if upscale_snapshot.method.value == "image":
+            model_name = upscale_snapshot.upscaler_name or ""
+            if model_name not in getattr(
+                capabilities, "upscale_models", ()
+            ) or not self._upscaler_catalog.contains(model_name):
+                raise UpscaleEnqueueError(
+                    "upscale_model_missing",
+                    "the selected upscaler is unavailable",
+                )
+            return
+
+        if source_settings.checkpoint_name not in getattr(capabilities, "checkpoints", ()):
+            raise UpscaleEnqueueError(
+                "upscale_checkpoint_missing", "the source checkpoint is unavailable"
+            )
+        if source_settings.sampler_name not in getattr(capabilities, "samplers", ()):
+            raise UpscaleEnqueueError("upscale_sampler_missing", "the sampler is unavailable")
+        if source_settings.scheduler_name not in getattr(capabilities, "schedulers", ()):
+            raise UpscaleEnqueueError("upscale_scheduler_missing", "the scheduler is unavailable")
+        if len(source_settings.loras) > self._settings.max_loras:
+            raise UpscaleEnqueueError(
+                "upscale_lora_limit_exceeded", "the configured LoRA limit was exceeded"
+            )
+        missing_loras = tuple(
+            lora.name
+            for lora in source_settings.loras
+            if lora.name not in getattr(capabilities, "loras", ())
+        )
+        if missing_loras or (source_settings.loras and "LoraLoader" not in available_nodes):
+            raise UpscaleEnqueueError(
+                "upscale_lora_missing", "one or more source LoRAs are unavailable"
+            )
+        if source_settings.vae_name is not None:
+            if source_settings.vae_name not in getattr(capabilities, "vaes", ()):
+                raise UpscaleEnqueueError("upscale_vae_missing", "the source VAE is unavailable")
+            if "VAELoader" not in available_nodes:
+                raise UpscaleEnqueueError(
+                    "upscale_required_node_missing", "the external VAE node is unavailable"
+                )
 
     def _persist_progress(self, job: GenerationJob, progress: GenerationProgress) -> None:
         try:
@@ -968,7 +1136,7 @@ class GenerationService:
                 artifact.artifact_type
                 for artifact in self._artifact_repository.list_by_generation(job.generation_id)
             }
-        except GenerationRepositoryError as exc:
+        except Exception as exc:  # noqa: BLE001 - optional metadata must not change completion
             logger.warning(
                 "Optional artifact lookup warning generation=%s error=%s",
                 job.generation_id,
@@ -1006,7 +1174,7 @@ class GenerationService:
                             created_at=created_at,
                         )
                     )
-                except (GenerationRepositoryError, StorageError, OSError) as exc:
+                except Exception as exc:  # noqa: BLE001 - optional metadata is best effort
                     logger.warning(
                         "Generation sidecar warning generation=%s error=%s",
                         job.generation_id,
@@ -1031,7 +1199,7 @@ class GenerationService:
                         created_at=created_at,
                     )
                 )
-            except (GenerationRepositoryError, StorageError, OSError) as exc:
+            except Exception as exc:  # noqa: BLE001 - optional thumbnail is best effort
                 logger.warning(
                     "Generation thumbnail warning generation=%s error=%s",
                     job.generation_id,
@@ -1155,6 +1323,8 @@ def _safe_generation_error(
         if isinstance(error, FailurePersistenceError) and original_error is not None:
             return "生成に失敗しました。加えて、履歴の失敗状態を完全に保存できませんでした。"
         return persistence_error_message(error)
+    if isinstance(error, UpscaleSettingsRepositoryError):
+        return "upscale settings could not be read"
     if isinstance(error, GenerationRepositoryError):
         return "生成結果の保存状態を確定できませんでした。"
     if isinstance(error, WorkflowError):
@@ -1171,6 +1341,8 @@ def _safe_generation_error(
 def _generation_error_code(error: Exception) -> str:
     if isinstance(error, UpscaleEnqueueError):
         return error.code
+    if isinstance(error, UpscaleSettingsRepositoryError):
+        return "upscale_settings_unavailable"
     if isinstance(error, GenerationPersistenceError):
         return persistence_error_code(error)
     if isinstance(error, WorkflowError):

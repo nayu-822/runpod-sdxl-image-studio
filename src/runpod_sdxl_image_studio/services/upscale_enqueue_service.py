@@ -18,10 +18,11 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_dispatch
 )
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_repository import (
     GenerationArtifactRepositoryProtocol,
+    GenerationRepositoryError,
     GenerationRepositoryProtocol,
 )
 from runpod_sdxl_image_studio.config import Settings
-from runpod_sdxl_image_studio.domain.generation import GenerationStatus
+from runpod_sdxl_image_studio.domain.generation import GenerationKind, GenerationStatus
 from runpod_sdxl_image_studio.domain.generation_artifact import GenerationArtifact
 from runpod_sdxl_image_studio.domain.generation_history import (
     GenerationHistoryQuery,
@@ -62,6 +63,20 @@ class UpscalePlan:
     load_level: UpscaleLoadLevel
 
 
+@dataclass(frozen=True)
+class UpscaleParentSelection:
+    generation_id: UUID
+    preview_path: Path
+
+
+@dataclass(frozen=True)
+class UpscaleComparison:
+    parent_generation_id: UUID
+    result_generation_id: UUID
+    result_path: Path
+    gallery: tuple[tuple[str, str], ...]
+
+
 class UpscaleEnqueueService:
     def __init__(
         self,
@@ -90,6 +105,71 @@ class UpscaleEnqueueService:
             if self._artifacts.get_primary_image(generation.id) is not None:
                 return generation.id
         return None
+
+    def select_parent(self, generation_id: UUID) -> UpscaleParentSelection:
+        """Resolve a completed parent and its persisted image for UI preview."""
+
+        try:
+            generation = self._generations.get_by_id(generation_id)
+            if generation is None:
+                raise UpscaleEnqueueError(
+                    "upscale_parent_not_found", "the selected Generation was not found"
+                )
+            if generation.status is not GenerationStatus.COMPLETED:
+                raise UpscaleEnqueueError(
+                    "upscale_parent_not_completed", "only completed Generations can be selected"
+                )
+            artifact = self._artifacts.get_primary_image(generation_id)
+            if artifact is None:
+                raise UpscaleEnqueueError(
+                    "upscale_source_artifact_missing", "the selected Generation has no image"
+                )
+            source = verify_source_artifact(artifact, self._settings)
+            return UpscaleParentSelection(generation_id, source.path)
+        except UpscaleEnqueueError:
+            raise
+        except (GenerationRepositoryError, ValueError, OSError) as exc:
+            raise UpscaleEnqueueError(
+                "upscale_parent_unavailable", "the selected parent could not be read"
+            ) from exc
+
+    def comparison_for_generation(self, generation_id: UUID) -> UpscaleComparison:
+        """Return two persisted files only for a completed upscale Generation."""
+
+        try:
+            generation = self._generations.get_by_id(generation_id)
+            if generation is None or generation.kind is not GenerationKind.UPSCALE:
+                raise UpscaleEnqueueError(
+                    "upscale_result_unavailable", "the selected Generation is not an upscale"
+                )
+            if generation.status is not GenerationStatus.COMPLETED:
+                raise UpscaleEnqueueError(
+                    "upscale_result_not_completed", "the upscale result is not completed"
+                )
+            if generation.parent_generation_id is None:
+                raise UpscaleEnqueueError(
+                    "upscale_parent_not_found", "the upscale parent was not found"
+                )
+            parent_artifact = self._artifacts.get_primary_image(generation.parent_generation_id)
+            result_artifact = self._artifacts.get_primary_image(generation_id)
+            if parent_artifact is None or result_artifact is None:
+                raise UpscaleEnqueueError(
+                    "upscale_result_artifact_missing", "the comparison images are unavailable"
+                )
+            parent = verify_source_artifact(parent_artifact, self._settings)
+            result = verify_source_artifact(result_artifact, self._settings)
+            return UpscaleComparison(
+                generation.parent_generation_id,
+                generation_id,
+                result.path,
+                ((str(parent.path), "parent"), (str(result.path), "upscaled")),
+            )
+        except UpscaleEnqueueError:
+            raise
+        except (GenerationRepositoryError, ValueError, OSError) as exc:
+            raise UpscaleEnqueueError(
+                "upscale_result_unavailable", "the comparison images could not be read"
+            ) from exc
 
     def plan(self, parent_generation_id: UUID, upscale_settings: UpscaleSettings) -> UpscalePlan:
         parent = self._generations.get_by_id(parent_generation_id)
@@ -269,7 +349,9 @@ def verify_source_artifact(
 __all__ = [
     "UpscaleEnqueueError",
     "UpscaleEnqueueService",
+    "UpscaleComparison",
     "UpscalePlan",
+    "UpscaleParentSelection",
     "VerifiedUpscaleSource",
     "verify_source_artifact",
 ]

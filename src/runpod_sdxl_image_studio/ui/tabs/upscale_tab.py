@@ -9,6 +9,7 @@ from uuid import UUID
 
 import gradio as gr
 
+from runpod_sdxl_image_studio.adapters.catalog.upscaler_catalog import UpscalerCatalog
 from runpod_sdxl_image_studio.domain.upscale import (
     UpscaleMethod,
     UpscaleSettings,
@@ -31,6 +32,7 @@ class UpscaleTabComponents:
     target_width: Any
     target_height: Any
     upscaler_name: Any
+    catalog_message: Any
     denoise: Any
     plan: Any
     enqueue_button: Any
@@ -39,7 +41,25 @@ class UpscaleTabComponents:
     comparison: Any
 
 
-def build_upscale_tab(upscaler_choices: tuple[str, ...] = ()) -> UpscaleTabComponents:
+def build_upscale_tab(
+    upscaler_catalog: UpscalerCatalog | tuple[str, ...] | None = (),
+) -> UpscaleTabComponents:
+    if isinstance(upscaler_catalog, UpscalerCatalog):
+        upscaler_choices = upscaler_catalog.models or ()
+        catalog_text = (
+            "upscalerカタログを取得できません。設定ディレクトリを確認してください。"
+            if upscaler_catalog.models is None
+            else "upscalerカタログは取得済みですが、利用可能なモデルがありません。"
+            if not upscaler_catalog.models
+            else f"upscalerカタログ: {len(upscaler_catalog.models)}件"
+        )
+    else:
+        upscaler_choices = upscaler_catalog or ()
+        catalog_text = (
+            "upscalerカタログは未取得です。"
+            if upscaler_catalog is None
+            else f"upscalerカタログ: {len(upscaler_choices)}件"
+        )
     with gr.Row():
         parent_id = gr.Textbox(label="親Generation ID", placeholder="completed generation UUID")
         source_preview = gr.Image(label="親画像", interactive=False, type="filepath")
@@ -60,6 +80,7 @@ def build_upscale_tab(upscaler_choices: tuple[str, ...] = ()) -> UpscaleTabCompo
         factor = gr.Number(label="倍率", value=2.0, minimum=1.01, maximum=16.0)
         width = gr.Number(label="幅", value=1024, minimum=64, precision=0)
         height = gr.Number(label="高さ", value=1024, minimum=64, precision=0)
+    catalog_message = gr.Markdown(catalog_text)
     upscaler = gr.Dropdown(list(upscaler_choices), label="Upscaler", allow_custom_value=False)
     denoise = gr.Slider(0, 1, value=0.35, step=0.01, label="Denoise（Latentのみ）")
     plan = gr.Markdown("出力サイズと負荷見積もりは親画像確認後に表示されます。")
@@ -77,6 +98,7 @@ def build_upscale_tab(upscaler_choices: tuple[str, ...] = ()) -> UpscaleTabCompo
         width,
         height,
         upscaler,
+        catalog_message,
         denoise,
         plan,
         enqueue_button,
@@ -94,6 +116,107 @@ def make_latest_parent_handler(
         if generation_id is None:
             return "", "完了済みの一次画像がありません。"
         return str(generation_id), f"親画像を選択しました: `{generation_id}`"
+
+    return handler
+
+
+def make_latest_parent_selection_handler(
+    service: UpscaleEnqueueService,
+) -> Callable[[], tuple[str, object, str]]:
+    def handler() -> tuple[str, object, str]:
+        generation_id = service.latest_completed_generation_id()
+        if generation_id is None:
+            return "", None, "完了済みの画像がありません。"
+        return make_parent_selection_handler(service)(str(generation_id))
+
+    return handler
+
+
+def make_parent_selection_handler(
+    service: UpscaleEnqueueService,
+) -> Callable[[str | None], tuple[str, object, str]]:
+    def handler(selected: str | None) -> tuple[str, object, str]:
+        if not selected or not selected.strip():
+            return "", None, "親Generationを選択してください。"
+        try:
+            selection = service.select_parent(UUID(selected.strip()))
+            return (
+                str(selection.generation_id),
+                str(selection.preview_path),
+                f"親画像を選択しました: `{selection.generation_id}`",
+            )
+        except (ValueError, UpscaleEnqueueError) as exc:
+            return "", None, f"親画像を選択できません: {exc}"
+
+    return handler
+
+
+def make_upscale_result_handler(
+    service: UpscaleEnqueueService,
+) -> Callable[[str | None], tuple[object, object, str]]:
+    def handler(selected: str | None) -> tuple[object, object, str]:
+        if not selected or not selected.strip():
+            return None, [], ""
+        try:
+            result = service.comparison_for_generation(UUID(selected.strip()))
+            return (
+                str(result.result_path),
+                list(result.gallery),
+                f"アップスケール結果を表示しました: `{result.result_generation_id}`",
+            )
+        except (ValueError, UpscaleEnqueueError):
+            return None, [], ""
+
+    return handler
+
+
+def make_upscale_visibility_handler() -> Callable[[str], tuple[object, object]]:
+    def handler(method: str) -> tuple[object, object]:
+        is_image = method == UpscaleMethod.IMAGE.value
+        return gr.update(visible=is_image), gr.update(visible=not is_image)
+
+    return handler
+
+
+def begin_upscale_enqueue() -> gr.Button:
+    return gr.Button(value="アップスケール処理中…", interactive=False)
+
+
+def make_upscale_enqueue_details_handler(
+    service: UpscaleEnqueueService,
+) -> Callable[..., tuple[Any, str]]:
+    def handler(
+        parent_generation_id: str,
+        method: str,
+        sizing_mode: str,
+        scale_factor: float | None,
+        target_width: float | None,
+        target_height: float | None,
+        upscaler_name: str | None,
+        denoise: float | None,
+    ) -> tuple[Any, str]:
+        try:
+            settings = _settings_from_inputs(
+                method,
+                sizing_mode,
+                scale_factor,
+                target_width,
+                target_height,
+                upscaler_name,
+                denoise,
+            )
+            parent_id = UUID(parent_generation_id.strip())
+            item = service.enqueue(parent_id, settings)
+            return gr.Button(interactive=True), (
+                f"Generation ID: `{item.generation.id}`\n\n"
+                f"Queue順序: `{item.entry.sequence}`\n\n"
+                f"親Generation ID: `{parent_id}`\n\n"
+                f"方式: `{settings.method.value}` / 出力予定サイズ: "
+                f"`{item.generation.settings_snapshot.width} x "
+                f"{item.generation.settings_snapshot.height}`"
+            )
+        except Exception as exc:  # noqa: BLE001 - restore the button on every safe error
+            return gr.Button(interactive=True), f"アップスケールを追加できませんでした: {exc}"
 
     return handler
 
@@ -125,7 +248,7 @@ def make_upscale_enqueue_handler(
             return gr.Button(
                 interactive=True
             ), f"キューへ追加しました（順序 {item.entry.sequence}）。"
-        except (ValueError, UpscaleEnqueueError) as exc:
+        except Exception as exc:  # noqa: BLE001 - every safe UI path restores the button
             return gr.Button(interactive=True), f"アップスケールを追加できませんでした: {exc}"
 
     return handler
@@ -189,7 +312,13 @@ def _settings_from_inputs(
 __all__ = [
     "UpscaleTabComponents",
     "build_upscale_tab",
+    "begin_upscale_enqueue",
     "make_latest_parent_handler",
+    "make_latest_parent_selection_handler",
+    "make_parent_selection_handler",
     "make_upscale_enqueue_handler",
+    "make_upscale_enqueue_details_handler",
     "make_upscale_plan_handler",
+    "make_upscale_result_handler",
+    "make_upscale_visibility_handler",
 ]
