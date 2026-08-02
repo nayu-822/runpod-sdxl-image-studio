@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 from PIL import Image, UnidentifiedImageError
 
 from runpod_sdxl_image_studio.config import Settings, get_settings
-from runpod_sdxl_image_studio.domain.generation import StoredImage
+from runpod_sdxl_image_studio.domain.generation import GenerationKind, StoredImage
 
 from .exceptions import StorageError
 
@@ -53,6 +53,8 @@ class LocalStorageAdapter:
         image_bytes: bytes,
         generation_id: UUID,
         created_at: datetime,
+        *,
+        kind: GenerationKind = GenerationKind.STANDARD,
     ) -> StoredImage:
         """Validate and atomically save an image without overwriting an existing file."""
 
@@ -61,7 +63,8 @@ class LocalStorageAdapter:
         width, height = _validate_image(image_bytes)
         local_datetime = created_at.astimezone(self._timezone)
         local_date = local_datetime.date().isoformat()
-        target_dir = self._data_dir / "generations" / local_date / "generated"
+        folder = "upscaled" if kind is GenerationKind.UPSCALE else "generated"
+        target_dir = self._data_dir / "generations" / local_date / folder
         target_dir.mkdir(parents=True, exist_ok=True)
         timestamp = local_datetime.strftime("%Y%m%d_%H%M%S")
         final_path = target_dir / f"{timestamp}_{generation_id.hex[:8]}.png"

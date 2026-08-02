@@ -46,6 +46,9 @@ class Settings(BaseSettings):
     max_output_image_bytes: int = Field(
         52_428_800, validation_alias="IMAGE_STUDIO_MAX_OUTPUT_IMAGE_BYTES"
     )
+    max_upscale_input_image_bytes: int = Field(
+        52_428_800, validation_alias="IMAGE_STUDIO_MAX_UPSCALE_INPUT_IMAGE_BYTES"
+    )
 
     data_dir: Path = Field(
         Path("/workspace/image-studio-data"), validation_alias="IMAGE_STUDIO_DATA_DIR"
@@ -180,6 +183,7 @@ class Settings(BaseSettings):
         "thumbnail_size",
         "history_max_attempts",
         "max_output_image_bytes",
+        "max_upscale_input_image_bytes",
         "max_lora_thumbnail_bytes",
         "lora_thumbnail_max_edge",
         "max_trigger_words",

@@ -413,3 +413,23 @@ alembic upgrade head
 
 Presetと検索用インデックスはSQLiteの`data/database/image_studio.sqlite3`へ保存されます。Gradioは引き続き
 5系（`gradio>=5.0.0,<6.0.0`）を使用します。
+
+## Phase 5: 画像・Latentアップスケール
+
+完了済みGenerationの一次画像を親として、画像アップスケールまたはLatentアップスケールをキューへ追加できます。
+親画像はSHA-256、MIME、寸法、許可ディレクトリ内の実体を再検証し、元画像は変更しません。アップスケールは常に
+新しいGeneration、Job、Queue entry、`generation_upscale_settings`行として保存され、結果は
+`generations/YYYY-MM-DD/upscaled`へ保存します。
+
+倍率または64の倍数の目標寸法、最大幅・高さ・ピクセル数・倍率、取得済みupscalerを検証します。Latent方式では親の
+保存済みGeneration snapshotからprompt、seed、checkpoint、VAE、LoRA、sampler、scheduler、CFG、stepsを復元し、
+ブラウザ状態や現在のUI値を使いません。ComfyUIへの入力画像アップロードと固定whitelist workflowをAdapterに閉じ込め、
+既存prompt IDの再送信は行いません。
+
+Phase 5 migration確認:
+
+```bash
+alembic upgrade head
+alembic downgrade -1
+alembic upgrade head
+```

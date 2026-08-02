@@ -1,0 +1,11 @@
+{
+  "1": {"class_type": "LoadImage", "inputs": {"image": "__SOURCE_IMAGE__", "upload": "image"}},
+  "2": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "__CHECKPOINT_NAME__"}},
+  "3": {"class_type": "CLIPTextEncode", "inputs": {"text": "__POSITIVE_PROMPT__", "clip": ["2", 1]}},
+  "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "__NEGATIVE_PROMPT__", "clip": ["2", 1]}},
+  "5": {"class_type": "VAEEncode", "inputs": {"pixels": ["1", 0], "vae": ["2", 2]}},
+  "6": {"class_type": "LatentUpscale", "inputs": {"samples": ["5", 0], "upscale_method": "nearest-exact", "width": 1024, "height": 1024, "crop": "disabled"}},
+  "7": {"class_type": "KSampler", "inputs": {"model": ["2", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["6", 0], "seed": 0, "steps": 20, "cfg": 7.0, "sampler_name": "euler", "scheduler": "normal", "denoise": 0.35}},
+  "8": {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": ["2", 2]}},
+  "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "runpod_sdxl_image_studio/upscaled", "images": ["8", 0]}}
+}

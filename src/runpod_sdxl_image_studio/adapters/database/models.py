@@ -144,6 +144,45 @@ class GenerationArtifactModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class GenerationUpscaleSettingsModel(Base):
+    """Immutable request projection for one upscale generation."""
+
+    __tablename__ = "generation_upscale_settings"
+    __table_args__ = (
+        CheckConstraint("method IN ('image', 'latent')", name="ck_upscale_method"),
+        CheckConstraint("sizing_mode IN ('factor', 'dimensions')", name="ck_upscale_sizing_mode"),
+        CheckConstraint(
+            "(sizing_mode='factor' AND scale_factor IS NOT NULL AND scale_factor > 1) OR "
+            "(sizing_mode='dimensions' AND scale_factor IS NULL)",
+            name="ck_upscale_sizing_values",
+        ),
+        CheckConstraint(
+            "target_width > 0 AND target_height > 0", name="ck_upscale_target_positive"
+        ),
+        CheckConstraint(
+            "denoise IS NULL OR (denoise >= 0 AND denoise <= 1)", name="ck_upscale_denoise"
+        ),
+    )
+
+    generation_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("generations.id", ondelete="CASCADE"), primary_key=True
+    )
+    source_artifact_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("generation_artifacts.id", ondelete="RESTRICT"), nullable=False
+    )
+    method: Mapped[str] = mapped_column(String(16), nullable=False)
+    sizing_mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    scale_factor: Mapped[float | None] = mapped_column(nullable=True)
+    target_width: Mapped[int] = mapped_column(Integer, nullable=False)
+    target_height: Mapped[int] = mapped_column(Integer, nullable=False)
+    upscaler_name: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    denoise: Mapped[float | None] = mapped_column(nullable=True)
+    settings_snapshot_json: Mapped[str] = mapped_column(Text, nullable=False)
+    snapshot_schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class GenerationJobModel(Base):
     __tablename__ = "generation_jobs"
     __table_args__ = (UniqueConstraint("generation_id", name="uq_generation_job_generation"),)
@@ -290,6 +329,8 @@ Index("ix_generations_seed", GenerationModel.seed)
 Index("ix_generations_resolution", GenerationModel.width, GenerationModel.height)
 Index("ix_generation_loras_name", GenerationLoraModel.lora_name)
 Index("ix_generation_artifacts_generation", GenerationArtifactModel.generation_id)
+Index("ix_generation_upscale_source_artifact", GenerationUpscaleSettingsModel.source_artifact_id)
+Index("ix_generation_upscale_method", GenerationUpscaleSettingsModel.method)
 Index("ix_generation_jobs_generation", GenerationJobModel.generation_id)
 Index("ix_generation_jobs_prompt", GenerationJobModel.comfy_prompt_id)
 

@@ -13,17 +13,20 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from runpod_sdxl_image_studio.adapters.database.engine import session_scope
 from runpod_sdxl_image_studio.adapters.database.models import (
+    GenerationArtifactModel,
     GenerationBatchModel,
     GenerationJobModel,
     GenerationLoraModel,
     GenerationModel,
     GenerationQueueEntryModel,
+    GenerationUpscaleSettingsModel,
 )
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_repository import (
     _generation_domain,
     _job_domain,
 )
 from runpod_sdxl_image_studio.domain.generation import GenerationKind, GenerationStatus
+from runpod_sdxl_image_studio.domain.generation_artifact import ArtifactType
 from runpod_sdxl_image_studio.domain.generation_queue import (
     BatchSeedStrategy,
     GenerationBatch,
@@ -32,6 +35,7 @@ from runpod_sdxl_image_studio.domain.generation_queue import (
     SubmissionState,
 )
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
+from runpod_sdxl_image_studio.domain.upscale_snapshot import UpscaleSettingsSnapshot
 
 
 class GenerationDispatchQueueRepositoryError(RuntimeError):
@@ -86,6 +90,21 @@ class GenerationDispatchQueueRepositoryProtocol(Protocol):
         retry_of_generations: Sequence[UUID | None] | None = None,
         retry_attempts: Sequence[int] | None = None,
     ) -> tuple[GenerationBatch, tuple[GenerationQueueItem, ...]]: ...
+
+    def enqueue_upscale(
+        self,
+        snapshot: GenerationSettingsSnapshot,
+        upscale_snapshot: UpscaleSettingsSnapshot,
+        *,
+        parent_generation_id: UUID,
+        source_artifact_id: UUID,
+        generation_id: UUID | None = None,
+        job_id: UUID | None = None,
+        retry_of_generation_id: UUID | None = None,
+        retry_attempt: int = 0,
+        pending_limit: int | None = None,
+        enqueued_at: datetime | None = None,
+    ) -> GenerationQueueItem: ...
 
     def claim_next(
         self, worker_id: str, *, lease_seconds: float, now: datetime | None = None
@@ -255,6 +274,111 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
             raise GenerationDispatchQueueRepositoryError(
                 "generation could not be enqueued"
             ) from exc
+
+    def enqueue_upscale(
+        self,
+        snapshot: GenerationSettingsSnapshot,
+        upscale_snapshot: UpscaleSettingsSnapshot,
+        *,
+        parent_generation_id: UUID,
+        source_artifact_id: UUID,
+        generation_id: UUID | None = None,
+        job_id: UUID | None = None,
+        retry_of_generation_id: UUID | None = None,
+        retry_attempt: int = 0,
+        pending_limit: int | None = None,
+        enqueued_at: datetime | None = None,
+    ) -> GenerationQueueItem:
+        """Create the upscale Generation, Job, settings and queue row atomically."""
+
+        if retry_attempt < 0:
+            raise GenerationDispatchQueueRepositoryError("retry attempt must not be negative")
+        if upscale_snapshot.source_generation_id != parent_generation_id:
+            raise GenerationDispatchQueueRepositoryError("upscale parent does not match snapshot")
+        if upscale_snapshot.source_artifact_id != source_artifact_id:
+            raise GenerationDispatchQueueRepositoryError("upscale artifact does not match snapshot")
+        timestamp = _utc(enqueued_at or datetime.now(UTC))
+        generation_id = generation_id or uuid4()
+        job_id = job_id or uuid4()
+        try:
+            with session_scope(self._session_factory) as session:
+                _begin_immediate_if_sqlite(session)
+                if retry_of_generation_id is not None:
+                    existing = session.scalar(
+                        select(GenerationQueueEntryModel)
+                        .join(
+                            GenerationModel,
+                            GenerationModel.id == GenerationQueueEntryModel.generation_id,
+                        )
+                        .where(
+                            GenerationModel.retry_of_generation_id == str(retry_of_generation_id)
+                        )
+                    )
+                    if existing is not None:
+                        return _queue_item_from_entry(session, existing)
+                _check_pending_capacity(session, pending_limit, 1)
+                parent = session.get(GenerationModel, str(parent_generation_id))
+                if parent is None or parent.status != GenerationStatus.COMPLETED.value:
+                    raise GenerationDispatchQueueRepositoryError("upscale parent is not completed")
+                artifact = session.get(GenerationArtifactModel, str(source_artifact_id))
+                if artifact is None or artifact.generation_id != str(parent_generation_id):
+                    raise GenerationDispatchQueueRepositoryError(
+                        "upscale source artifact was not found"
+                    )
+                if artifact.artifact_type != ArtifactType.IMAGE.value:
+                    raise GenerationDispatchQueueRepositoryError(
+                        "upscale source artifact is not an image"
+                    )
+                if (
+                    artifact.width != upscale_snapshot.source_width
+                    or artifact.height != upscale_snapshot.source_height
+                ):
+                    raise GenerationDispatchQueueRepositoryError(
+                        "upscale source dimensions do not match"
+                    )
+                generation, job = _insert_generation_and_job(
+                    session,
+                    snapshot,
+                    generation_id=generation_id,
+                    job_id=job_id,
+                    kind=GenerationKind.UPSCALE,
+                    parent_generation_id=parent_generation_id,
+                    retry_of_generation_id=retry_of_generation_id,
+                    retry_attempt=retry_attempt,
+                    timestamp=timestamp,
+                )
+                session.add(
+                    GenerationUpscaleSettingsModel(
+                        generation_id=str(generation_id),
+                        source_artifact_id=str(source_artifact_id),
+                        method=upscale_snapshot.method.value,
+                        sizing_mode=upscale_snapshot.sizing_mode.value,
+                        scale_factor=upscale_snapshot.requested_scale_factor,
+                        target_width=upscale_snapshot.target_width,
+                        target_height=upscale_snapshot.target_height,
+                        upscaler_name=upscale_snapshot.upscaler_name,
+                        denoise=upscale_snapshot.denoise,
+                        settings_snapshot_json=upscale_snapshot.to_json(),
+                        snapshot_schema_version=upscale_snapshot.schema_version,
+                        created_at=timestamp,
+                        updated_at=timestamp,
+                    )
+                )
+                entry = GenerationQueueEntryModel(
+                    generation_id=str(generation_id),
+                    job_id=str(job_id),
+                    batch_index=0,
+                    submission_state=SubmissionState.READY.value,
+                    enqueued_at=timestamp,
+                    updated_at=timestamp,
+                )
+                session.add(entry)
+                session.flush()
+                return _queue_item(session, entry, generation, job)
+        except GenerationDispatchQueueRepositoryError:
+            raise
+        except (IntegrityError, SQLAlchemyError, ValueError) as exc:
+            raise GenerationDispatchQueueRepositoryError("upscale could not be enqueued") from exc
 
     def enqueue_batch(
         self,

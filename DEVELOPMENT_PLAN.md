@@ -433,3 +433,11 @@ GenerationServiceが受け付けるようにしました。Repository群は`Gene
 Phase 4へは、生成キュー、複数ジョブ、キャンセル、再試行、失敗のみ再実行、バッチ生成、stale jobの高度な
 reconciliationを残します。アップスケール実処理、Google Drive同期、外部metadata import、複数ユーザー対応も
 従来計画どおり後続フェーズです。
+
+## フェーズ5の完了状況
+
+フェーズ5を実装しました。完了済み画像Generationを親とする、非破壊で再現可能な画像アップスケールとLatentアップスケール、
+アップスケール専用snapshotと`generation_upscale_settings` migration、一次Artifactの再検証、upscaler catalog、固定workflow、
+ComfyUI input upload、upscaled保存先、キュー実行・再試行・復旧経路、比較用UIを追加しています。
+
+未実装としてPhase 6、複数worker、queue並べ替え、自動retry、Google Drive同期、汎用workflow editorは引き続き対象外です。

@@ -1,0 +1,14 @@
+{
+  "template_id": "sdxl_image_upscale",
+  "schema_version": 1,
+  "workflow_version": "1.0",
+  "workflow_file": "workflows/templates/sdxl_image_upscale_api.json",
+  "required_node_classes": ["LoadImage", "UpscaleModelLoader", "ImageUpscaleWithModel", "ImageScale", "SaveImage"],
+  "bindings": {
+    "source_image": ["1", "inputs", "image"],
+    "upscaler_name": ["2", "inputs", "model_name"],
+    "width": ["5", "inputs", "width"],
+    "height": ["5", "inputs", "height"],
+    "filename_prefix": ["4", "inputs", "filename_prefix"]
+  }
+}

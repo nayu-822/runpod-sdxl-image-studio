@@ -1,0 +1,22 @@
+{
+  "template_id": "sdxl_latent_upscale",
+  "schema_version": 1,
+  "workflow_version": "1.0",
+  "workflow_file": "workflows/templates/sdxl_latent_upscale_api.json",
+  "required_node_classes": ["LoadImage", "CheckpointLoaderSimple", "CLIPTextEncode", "VAEEncode", "LatentUpscale", "KSampler", "VAEDecode", "SaveImage"],
+  "bindings": {
+    "source_image": ["1", "inputs", "image"],
+    "checkpoint_name": ["2", "inputs", "ckpt_name"],
+    "positive_prompt": ["3", "inputs", "text"],
+    "negative_prompt": ["4", "inputs", "text"],
+    "seed": ["7", "inputs", "seed"],
+    "steps": ["7", "inputs", "steps"],
+    "cfg_scale": ["7", "inputs", "cfg"],
+    "sampler_name": ["7", "inputs", "sampler_name"],
+    "scheduler_name": ["7", "inputs", "scheduler"],
+    "denoise": ["7", "inputs", "denoise"],
+    "width": ["6", "inputs", "width"],
+    "height": ["6", "inputs", "height"],
+    "filename_prefix": ["10", "inputs", "filename_prefix"]
+  }
+}

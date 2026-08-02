@@ -22,8 +22,21 @@ class LoadedWorkflowTemplate:
 def load_txt2img_template(root_dir: Path | None = None) -> LoadedWorkflowTemplate:
     """Load the repository-controlled SDXL txt2img definition and template."""
 
+    return load_workflow_template("sdxl_txt2img", root_dir)
+
+
+_WORKFLOW_IDS = frozenset({"sdxl_txt2img", "sdxl_image_upscale", "sdxl_latent_upscale"})
+
+
+def load_workflow_template(
+    template_id: str, root_dir: Path | None = None
+) -> LoadedWorkflowTemplate:
+    """Load only a repository-controlled workflow; user paths never enter this API."""
+
+    if template_id not in _WORKFLOW_IDS:
+        raise WorkflowTemplateError("workflow template is not in the fixed whitelist")
     repository_root = root_dir or Path(__file__).resolve().parents[3]
-    definition_path = repository_root / "workflows" / "definitions" / "sdxl_txt2img.json"
+    definition_path = repository_root / "workflows" / "definitions" / f"{template_id}.json"
     definition = _read_json_object(definition_path)
     workflow_file = definition.get("workflow_file")
     if not isinstance(workflow_file, str) or not workflow_file:

@@ -12,6 +12,9 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_dispatch
     GenerationDispatchQueueRepositoryError,
     GenerationDispatchQueueRepositoryProtocol,
 )
+from runpod_sdxl_image_studio.adapters.database.repositories.upscale_settings_repository import (
+    UpscaleSettingsRepositoryProtocol,
+)
 from runpod_sdxl_image_studio.config import Settings
 from runpod_sdxl_image_studio.domain.generation import GenerationStatus
 from runpod_sdxl_image_studio.domain.generation_queue import (
@@ -75,10 +78,13 @@ class GenerationQueueService:
         repository: GenerationDispatchQueueRepositoryProtocol,
         settings: Settings,
         cancellation_adapter: GenerationCancellationAdapterProtocol | None = None,
+        *,
+        upscale_settings_repository: UpscaleSettingsRepositoryProtocol | None = None,
     ) -> None:
         self._repository = repository
         self._settings = settings
         self._cancellation_adapter = cancellation_adapter
+        self._upscale_settings_repository = upscale_settings_repository
         self._wake_callback: Callable[[], None] | None = None
 
     def set_wake_callback(self, callback: Callable[[], None] | None) -> None:
@@ -230,14 +236,32 @@ class GenerationQueueService:
                 raise GenerationQueueServiceError(
                     "失敗またはキャンセル済みジョブだけ再試行できます。"
                 )
-            new_item = self._repository.enqueue_single(
-                item.generation.settings_snapshot,
-                kind=item.generation.kind,
-                parent_generation_id=item.generation.parent_generation_id,
-                retry_of_generation_id=item.generation.id,
-                retry_attempt=item.generation.retry_attempt + 1,
-                pending_limit=self._settings.queue_max_pending_jobs,
-            )
+            if item.generation.kind.value == "upscale":
+                if self._upscale_settings_repository is None:
+                    raise GenerationQueueServiceError("アップスケール設定Repositoryが未設定です。")
+                upscale_snapshot = self._upscale_settings_repository.get_by_generation(
+                    item.generation.id
+                )
+                if upscale_snapshot is None or item.generation.parent_generation_id is None:
+                    raise GenerationQueueServiceError("アップスケール設定を復元できません。")
+                new_item = self._repository.enqueue_upscale(
+                    item.generation.settings_snapshot,
+                    upscale_snapshot,
+                    parent_generation_id=item.generation.parent_generation_id,
+                    source_artifact_id=upscale_snapshot.source_artifact_id,
+                    retry_of_generation_id=item.generation.id,
+                    retry_attempt=item.generation.retry_attempt + 1,
+                    pending_limit=self._settings.queue_max_pending_jobs,
+                )
+            else:
+                new_item = self._repository.enqueue_single(
+                    item.generation.settings_snapshot,
+                    kind=item.generation.kind,
+                    parent_generation_id=item.generation.parent_generation_id,
+                    retry_of_generation_id=item.generation.id,
+                    retry_attempt=item.generation.retry_attempt + 1,
+                    pending_limit=self._settings.queue_max_pending_jobs,
+                )
             self._wake()
             return QueueEnqueueResult(new_item, new_item.entry.sequence)
         except GenerationQueueServiceError:

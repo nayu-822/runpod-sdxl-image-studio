@@ -64,6 +64,7 @@ class ComfyUIClient:
         self._base_url = configured_base_url.rstrip("/")
         self._timeout = timeout if timeout is not None else app_settings.comfyui_timeout_seconds
         self._max_output_image_bytes = app_settings.max_output_image_bytes
+        self._max_upscale_input_image_bytes = app_settings.max_upscale_input_image_bytes
         self._http_client = http_client
         self._owns_http_client = http_client is None
         self._closed = False
@@ -245,6 +246,53 @@ class ComfyUIClient:
         _validate_image_bytes(response.content)
         return response.content
 
+    async def upload_input_image(
+        self,
+        image_bytes: bytes,
+        generation_id: UUID,
+        source_sha256: str,
+    ) -> ComfyUIOutputImage:
+        """Stage a verified source artifact in ComfyUI's input area.
+
+        The generated name is application-owned and therefore never trusts a source
+        file name or an external URL.
+        """
+
+        if not image_bytes or len(image_bytes) > self._max_upscale_input_image_bytes:
+            raise ComfyUIResponseError("upscale input image is empty or oversized")
+        if len(source_sha256) != 64 or any(
+            char not in "0123456789abcdefABCDEF" for char in source_sha256
+        ):
+            raise ComfyUIResponseError("upscale source hash is invalid")
+        _validate_image_bytes(image_bytes)
+        filename = f"image-studio-{generation_id.hex}-{source_sha256[:12]}.png"
+        response = await self._request(
+            "POST",
+            "/upload/image",
+            data={"type": "input", "overwrite": "false"},
+            files={"image": (filename, image_bytes, "image/png")},
+        )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise ComfyUIResponseError("ComfyUI upload response is invalid") from exc
+        if not isinstance(payload, Mapping):
+            raise ComfyUIResponseError("ComfyUI upload response is invalid")
+        returned_name = payload.get("name")
+        returned_subfolder = payload.get("subfolder", "")
+        returned_type = payload.get("type", "input")
+        if (
+            not isinstance(returned_name, str)
+            or not isinstance(returned_subfolder, str)
+            or not isinstance(returned_type, str)
+        ):
+            raise ComfyUIResponseError("ComfyUI upload response is incomplete")
+        return ComfyUIOutputImage(
+            filename=_validate_filename(returned_name),
+            subfolder=_validate_subfolder(returned_subfolder),
+            output_type=returned_type if returned_type == "input" else "input",
+        )
+
     async def close(self) -> None:
         """Close an internally created HTTP client; injected clients remain owned by callers."""
 
@@ -356,6 +404,8 @@ def _validate_filename(value: str) -> str:
 def _validate_subfolder(value: str) -> str:
     if not isinstance(value, str) or value in {".", ".."}:
         raise ComfyUIResponseError("ComfyUI subfolder is invalid")
+    if value == "":
+        return ""
     normalized = value.replace("\\", "/")
     if posixpath.isabs(normalized) or ntpath.isabs(value):
         raise ComfyUIResponseError("ComfyUI subfolder is invalid")

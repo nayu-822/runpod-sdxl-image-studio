@@ -6,8 +6,12 @@ from dataclasses import dataclass
 
 import gradio as gr
 
+from runpod_sdxl_image_studio.adapters.catalog.upscaler_catalog import UpscalerCatalog
 from runpod_sdxl_image_studio.adapters.comfyui.cancellation import ComfyUICancellationAdapter
 from runpod_sdxl_image_studio.adapters.comfyui.client import ComfyUIClient
+from runpod_sdxl_image_studio.adapters.comfyui.upscale_workflow_adapter import (
+    UpscaleWorkflowAdapter,
+)
 from runpod_sdxl_image_studio.adapters.comfyui.websocket_client import ComfyUIWebSocketClient
 from runpod_sdxl_image_studio.adapters.comfyui.workflow_adapter import WorkflowAdapter
 from runpod_sdxl_image_studio.adapters.database.engine import (
@@ -37,6 +41,9 @@ from runpod_sdxl_image_studio.adapters.database.repositories.lora_metadata_repos
 )
 from runpod_sdxl_image_studio.adapters.database.repositories.preset_repository import (
     PresetRepository,
+)
+from runpod_sdxl_image_studio.adapters.database.repositories.upscale_settings_repository import (
+    UpscaleSettingsRepository,
 )
 from runpod_sdxl_image_studio.adapters.storage.generation_metadata_storage import (
     GenerationMetadataStorage,
@@ -78,6 +85,8 @@ from runpod_sdxl_image_studio.services.lora_catalog_service import (
 )
 from runpod_sdxl_image_studio.services.preset_service import PresetService
 from runpod_sdxl_image_studio.services.recent_settings_service import RecentSettingsService
+from runpod_sdxl_image_studio.services.upscale_enqueue_service import UpscaleEnqueueService
+from runpod_sdxl_image_studio.services.upscale_service import UpscaleService
 from runpod_sdxl_image_studio.ui.components.lora_editor import (
     add_lora_row,
     component_outputs,
@@ -155,8 +164,14 @@ from runpod_sdxl_image_studio.ui.tabs.system_tab import (
     make_refresh_handler,
     size_preset_values,
 )
+from runpod_sdxl_image_studio.ui.tabs.upscale_tab import (
+    build_upscale_tab,
+    make_latest_parent_handler,
+    make_upscale_enqueue_handler,
+    make_upscale_plan_handler,
+)
 from runpod_sdxl_image_studio.ui.view_models import initial_status_markdown
-from runpod_sdxl_image_studio.workflows.loader import load_txt2img_template
+from runpod_sdxl_image_studio.workflows.loader import load_txt2img_template, load_workflow_template
 
 APP_TITLE = "RunPod SDXL Image Studio"
 APP_CSS = """
@@ -217,6 +232,18 @@ def build_app(
     loaded_workflow = load_txt2img_template(
         app_settings.workflow_dir.parent if app_settings.workflow_dir.exists() else None
     )
+    workflow_root = app_settings.workflow_dir.parent if app_settings.workflow_dir.exists() else None
+    loaded_image_upscale = load_workflow_template("sdxl_image_upscale", workflow_root)
+    loaded_latent_upscale = load_workflow_template("sdxl_latent_upscale", workflow_root)
+    upscale_settings_repository = UpscaleSettingsRepository(session_factory)
+    upscale_catalog = UpscalerCatalog.scan(app_settings.upscaler_dir)
+    upscale_enqueue_service = UpscaleEnqueueService(
+        generation_repository,
+        artifact_repository,
+        dispatch_queue_repository,
+        app_settings,
+        catalog=upscale_catalog,
+    )
     generation_service = GenerationService(
         client,
         WorkflowAdapter(loaded_workflow.as_mapping()),
@@ -237,16 +264,22 @@ def build_app(
         ),
         thumbnail_storage=HistoryThumbnailStorage(app_settings),
         metadata_storage=GenerationMetadataStorage(app_settings.data_dir),
+        upscale_settings_repository=upscale_settings_repository,
+        upscale_workflow_adapter=UpscaleWorkflowAdapter(
+            loaded_image_upscale.as_mapping(), loaded_latent_upscale.as_mapping()
+        ),
     )
     cancellation_adapter = ComfyUICancellationAdapter(client, app_settings)
     queue_service = GenerationQueueService(
         dispatch_queue_repository,
         app_settings,
         cancellation_adapter,
+        upscale_settings_repository=upscale_settings_repository,
     )
     execution_service = GenerationExecutionService(
         generation_service,
         dispatch_queue_repository,
+        UpscaleService(generation_service),
     )
     history_service = GenerationHistoryService(
         generation_repository,
@@ -322,8 +355,48 @@ def build_app(
             lora_management = build_lora_management_tab(catalog_service)
         with gr.Tab("履歴"):
             history = build_history_tab()
+        with gr.Tab("アップスケール"):
+            upscale = build_upscale_tab(upscale_catalog.models or ())
         with gr.Tab("プリセット"):
             presets = build_preset_tab()
+
+        upscale.enqueue_button.click(
+            fn=make_upscale_enqueue_handler(upscale_enqueue_service),
+            inputs=[
+                upscale.parent_generation_id,
+                upscale.method,
+                upscale.sizing_mode,
+                upscale.scale_factor,
+                upscale.target_width,
+                upscale.target_height,
+                upscale.upscaler_name,
+                upscale.denoise,
+            ],
+            outputs=[upscale.enqueue_button, upscale.status],
+            concurrency_limit=1,
+        )
+        upscale.latest_button.click(
+            fn=make_latest_parent_handler(upscale_enqueue_service),
+            outputs=[upscale.parent_generation_id, upscale.status],
+            concurrency_limit=1,
+        )
+        upscale_plan_inputs = [
+            upscale.parent_generation_id,
+            upscale.method,
+            upscale.sizing_mode,
+            upscale.scale_factor,
+            upscale.target_width,
+            upscale.target_height,
+            upscale.upscaler_name,
+            upscale.denoise,
+        ]
+        for component in upscale_plan_inputs:
+            component.change(
+                fn=make_upscale_plan_handler(upscale_enqueue_service),
+                inputs=upscale_plan_inputs,
+                outputs=[upscale.plan],
+                queue=False,
+            )
 
         capability_inputs = [
             generation.checkpoint,
