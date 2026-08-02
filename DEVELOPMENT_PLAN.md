@@ -6,6 +6,8 @@
 - ComfyUI の modern job status は Adapter 内で `RemotePromptStatus` に変換する。modern endpoint の明示的な 404/405 の場合に限り queue/history へ fallback し、timeout・5xx・未知 payload は `UNAVAILABLE` として DB 状態を保持する。
 - prompt ID mismatch の手動解決は Queue detail から Generation 側、Job 側、手入力を選択し、Generation / Job の prompt ID、status、submission state、audit、claim を同一 transaction で更新する。`/prompt` の再送は行わない。
 - `execution_interrupted` の Recovery は Generation / Job の `cancelled_at`、`completed_at`、status、audit を同一 transaction で更新し、terminal state を上書きしない。
+- 手動 prompt 解消で queued に戻す場合は、Generation / Job の terminal 日時を NULL にし、既存の cancel request は無条件に消去しない。
+- Queue entry がない旧 Job の remote `NOT_FOUND` は `reconciliation_grace_seconds`（Job.updated_at → Job.created_at → Generation.updated_at → Generation.created_at）で判定し、期限超過時のみ `reconciliation_prompt_missing` の atomic failure とする。
 
 ## フェーズ4の実装状況
 

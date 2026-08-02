@@ -18,7 +18,7 @@ from runpod_sdxl_image_studio.services.generation_queue_service import (
 def build_queue_tab() -> tuple[
     gr.Button,
     gr.Dropdown,
-    gr.Dropdown,
+    gr.Textbox,
     gr.Dropdown,
     gr.Markdown,
     gr.Button,
@@ -278,6 +278,8 @@ def _ambiguous_controls(item: GenerationQueueItem | None) -> tuple[object, objec
         "migration_status_mismatch",
         "migration_status_ambiguous",
         "migration_prompt_id_mismatch",
+        "prompt_submission_ambiguous",
+        "prompt_submission_ambiguous_resolved",
     }
     terminal_blocked = item is not None and (
         item.generation.status in {GenerationStatus.COMPLETED, GenerationStatus.CANCELLED}
@@ -293,9 +295,13 @@ def _ambiguous_controls(item: GenerationQueueItem | None) -> tuple[object, objec
             {item.generation.error_code, item.job.error_code}.intersection(migration_recoverable)
         )
     )
+    has_resolution_audit = item is not None and bool(
+        {item.generation.error_code, item.job.error_code}.intersection(migration_recoverable)
+    )
     eligible = (
         item is not None
         and item.entry.submission_state.value == "ambiguous"
+        and has_resolution_audit
         and not terminal_blocked
         and (
             item.generation.status not in terminal

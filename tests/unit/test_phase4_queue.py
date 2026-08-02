@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import gradio as gr
 import pytest
 from alembic import command
 from alembic.config import Config
@@ -60,6 +61,7 @@ from runpod_sdxl_image_studio.services.generation_queue_service import (
     GenerationQueueService,
     GenerationQueueServiceError,
 )
+from runpod_sdxl_image_studio.ui.tabs.queue_tab import build_queue_tab
 
 
 def _database() -> tuple[Any, Any]:
@@ -536,6 +538,136 @@ def test_mismatched_prompt_ids_can_be_manually_resolved_without_resubmission() -
     assert resolved.job.prompt_id == "generation-prompt"
     assert resolved.generation.status is GenerationStatus.QUEUED
     engine.dispose()
+
+
+@pytest.mark.parametrize("selected_prompt", ["generation-prompt", "job-prompt", "manual-prompt"])
+def test_migration_failed_prompt_link_clears_terminal_dates_and_claims(
+    selected_prompt: str,
+) -> None:
+    engine, factory = _database()
+    repository = GenerationDispatchQueueRepository(factory)
+    item = repository.enqueue_single(GenerationSettingsSnapshot.from_settings(_settings()))
+    GenerationQueueRepository(factory).mark_queued(
+        item.generation.id, item.job.id, "generation-prompt"
+    )
+    with session_scope(factory) as session:
+        job = session.get(GenerationJobModel, str(item.job.id))
+        generation = session.get(GenerationModel, str(item.generation.id))
+        entry = session.get(GenerationQueueEntryModel, item.entry.sequence)
+        assert job is not None and generation is not None and entry is not None
+        job.comfy_prompt_id = "job-prompt"
+        job.status = GenerationStatus.FAILED.value
+        job.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+        job.cancelled_at = datetime(2026, 1, 1, tzinfo=UTC)
+        job.error_code = "migration_status_ambiguous"
+        generation.status = GenerationStatus.FAILED.value
+        generation.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+        generation.error_code = "migration_status_ambiguous"
+        entry.submission_state = SubmissionState.AMBIGUOUS.value
+        entry.worker_id = "worker-old"
+        entry.claimed_at = datetime(2026, 1, 1, tzinfo=UTC)
+        entry.lease_expires_at = datetime(2026, 1, 1, tzinfo=UTC)
+
+    resolved = repository.link_ambiguous_prompt(item.generation.id, selected_prompt)
+
+    assert resolved.generation.status is GenerationStatus.QUEUED
+    assert resolved.job.status is GenerationStatus.QUEUED
+    assert resolved.generation.comfy_prompt_id == selected_prompt
+    assert resolved.job.prompt_id == selected_prompt
+    assert resolved.generation.completed_at is None
+    assert resolved.job.completed_at is None
+    assert resolved.job.cancelled_at is None
+    assert resolved.entry.submission_state is SubmissionState.SUBMITTED
+    assert resolved.entry.worker_id is None
+    assert resolved.entry.claimed_at is None
+    assert resolved.entry.lease_expires_at is None
+    engine.dispose()
+
+
+def test_manual_prompt_link_retains_existing_cancel_request() -> None:
+    engine, factory = _database()
+    repository = GenerationDispatchQueueRepository(factory)
+    item = repository.enqueue_single(GenerationSettingsSnapshot.from_settings(_settings()))
+    GenerationQueueRepository(factory).mark_queued(
+        item.generation.id, item.job.id, "generation-prompt"
+    )
+    requested_at = datetime(2026, 1, 1, tzinfo=UTC)
+    with session_scope(factory) as session:
+        job = session.get(GenerationJobModel, str(item.job.id))
+        generation = session.get(GenerationModel, str(item.generation.id))
+        entry = session.get(GenerationQueueEntryModel, item.entry.sequence)
+        assert job is not None and generation is not None and entry is not None
+        job.comfy_prompt_id = "job-prompt"
+        job.status = GenerationStatus.FAILED.value
+        job.error_code = "migration_status_ambiguous"
+        job.cancel_requested_at = requested_at
+        generation.status = GenerationStatus.FAILED.value
+        generation.error_code = "migration_status_ambiguous"
+        entry.submission_state = SubmissionState.AMBIGUOUS.value
+        entry.cancel_requested_at = requested_at
+
+    resolved = repository.link_ambiguous_prompt(item.generation.id, "generation-prompt")
+
+    assert resolved.entry.cancel_requested_at == requested_at
+    assert resolved.job.cancel_requested_at == requested_at
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "terminal_status", [GenerationStatus.COMPLETED, GenerationStatus.CANCELLED]
+)
+def test_terminal_prompt_resolution_is_rejected(terminal_status: GenerationStatus) -> None:
+    engine, factory = _database()
+    repository = GenerationDispatchQueueRepository(factory)
+    item = repository.enqueue_single(GenerationSettingsSnapshot.from_settings(_settings()))
+    with session_scope(factory) as session:
+        generation = session.get(GenerationModel, str(item.generation.id))
+        job = session.get(GenerationJobModel, str(item.job.id))
+        entry = session.get(GenerationQueueEntryModel, item.entry.sequence)
+        assert generation is not None and job is not None and entry is not None
+        generation.status = terminal_status.value
+        job.status = terminal_status.value
+        generation.error_code = "migration_status_ambiguous"
+        job.error_code = "migration_status_ambiguous"
+        entry.submission_state = SubmissionState.AMBIGUOUS.value
+
+    with pytest.raises(GenerationDispatchQueueRepositoryError):
+        repository.link_ambiguous_prompt(item.generation.id, "prompt-terminal")
+    current = repository.get_queue_item(item.generation.id)
+    assert current is not None
+    assert current.generation.status is terminal_status
+    engine.dispose()
+
+
+def test_normal_failed_prompt_resolution_is_rejected() -> None:
+    engine, factory = _database()
+    repository = GenerationDispatchQueueRepository(factory)
+    item = repository.enqueue_single(GenerationSettingsSnapshot.from_settings(_settings()))
+    with session_scope(factory) as session:
+        generation = session.get(GenerationModel, str(item.generation.id))
+        job = session.get(GenerationJobModel, str(item.job.id))
+        entry = session.get(GenerationQueueEntryModel, item.entry.sequence)
+        assert generation is not None and job is not None and entry is not None
+        generation.status = GenerationStatus.FAILED.value
+        job.status = GenerationStatus.FAILED.value
+        generation.error_code = "comfyui_execution_error"
+        job.error_code = "comfyui_execution_error"
+        entry.submission_state = SubmissionState.AMBIGUOUS.value
+
+    with pytest.raises(GenerationDispatchQueueRepositoryError):
+        repository.link_ambiguous_prompt(item.generation.id, "prompt-normal-failed")
+    current = repository.get_queue_item(item.generation.id)
+    assert current is not None
+    assert current.generation.status is GenerationStatus.FAILED
+    engine.dispose()
+
+
+def test_queue_tab_uses_textbox_for_batch_filter_and_preserves_output_arity() -> None:
+    with gr.Blocks():
+        components = build_queue_tab()
+
+    assert len(components) == 12
+    assert isinstance(components[2], gr.Textbox)
 
 
 def test_batch_enqueue_rolls_back_all_rows_on_mid_batch_failure(

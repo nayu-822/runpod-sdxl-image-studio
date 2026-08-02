@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from uuid import UUID
@@ -1137,6 +1137,94 @@ async def test_recovery_uses_typed_remote_cancelled_status(tmp_path: Path) -> No
     assert f"{generation.id}: cancelled" in messages
     assert repository.get_by_id(generation.id).status is GenerationStatus.CANCELLED  # type: ignore[union-attr]
     assert jobs.get_by_generation(generation.id).status is GenerationStatus.CANCELLED  # type: ignore[union-attr]
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stale", [False, True])
+async def test_recovery_not_found_uses_reconciliation_grace_without_queue_entry(
+    tmp_path: Path,
+    stale: bool,
+) -> None:
+    settings, engine, repository, artifacts, _, jobs = _repositories(tmp_path)
+    generation = repository.create_pending(GenerationSettingsSnapshot.from_settings(_settings()))
+    job = jobs.create(GenerationJob(generation.id, GenerationStatus.PENDING))
+    repository.mark_queued(generation.id, "prompt-missing")
+    jobs.update_prompt_id(job.id, "prompt-missing")
+
+    class Client:
+        async def get_remote_prompt_status(self, prompt_id: str) -> RemotePromptState:
+            return RemotePromptState(prompt_id, RemotePromptStatus.NOT_FOUND)
+
+        async def get_prompt_history(self, prompt_id: str) -> PromptHistory:
+            raise AssertionError(f"typed NOT_FOUND must not read history: {prompt_id}")
+
+    recovery = GenerationRecoveryService(
+        Client(),  # type: ignore[arg-type]
+        repository,
+        jobs,
+        artifacts,
+        settings,
+        failure_repository=repository_module.GenerationFailureRepository(
+            repository._session_factory
+        ),
+    )
+    now = datetime.now(UTC) + (timedelta(seconds=121) if stale else timedelta())
+
+    messages = await recovery.recover(now)
+
+    persisted = repository.get_by_id(generation.id)
+    persisted_job = jobs.get_by_generation(generation.id)
+    assert persisted is not None and persisted_job is not None
+    expected = GenerationStatus.FAILED if stale else GenerationStatus.QUEUED
+    assert persisted.status is expected
+    assert persisted_job.status is expected
+    if stale:
+        assert f"{generation.id}: stale prompt not found" in messages
+        assert persisted.error_code == "reconciliation_prompt_missing"
+        assert persisted_job.error_code == "reconciliation_prompt_missing"
+    else:
+        assert messages == ()
+        assert jobs.list_recoverable() != ()
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "remote_status",
+    [RemotePromptStatus.PENDING, RemotePromptStatus.IN_PROGRESS, RemotePromptStatus.UNAVAILABLE],
+)
+async def test_recovery_keeps_nonterminal_remote_statuses(
+    tmp_path: Path,
+    remote_status: RemotePromptStatus,
+) -> None:
+    settings, engine, repository, artifacts, _, jobs = _repositories(tmp_path)
+    generation = repository.create_pending(GenerationSettingsSnapshot.from_settings(_settings()))
+    job = jobs.create(GenerationJob(generation.id, GenerationStatus.PENDING))
+    repository.mark_queued(generation.id, "prompt-live")
+    jobs.update_prompt_id(job.id, "prompt-live")
+
+    class Client:
+        async def get_remote_prompt_status(self, prompt_id: str) -> RemotePromptState:
+            return RemotePromptState(prompt_id, remote_status)
+
+        async def get_prompt_history(self, prompt_id: str) -> PromptHistory:
+            raise AssertionError(f"{remote_status} must not read history: {prompt_id}")
+
+    recovery = GenerationRecoveryService(
+        Client(),  # type: ignore[arg-type]
+        repository,
+        jobs,
+        artifacts,
+        settings,
+        failure_repository=repository_module.GenerationFailureRepository(
+            repository._session_factory
+        ),
+    )
+
+    assert await recovery.recover(datetime.now(UTC) + timedelta(days=1)) == ()
+    assert repository.get_by_id(generation.id).status is GenerationStatus.QUEUED  # type: ignore[union-attr]
+    assert jobs.get_by_generation(generation.id).status is GenerationStatus.QUEUED  # type: ignore[union-attr]
     engine.dispose()
 
 

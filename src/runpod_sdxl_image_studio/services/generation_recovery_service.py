@@ -23,9 +23,16 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_reposito
     GenerationRepositoryProtocol,
 )
 from runpod_sdxl_image_studio.config import Settings, get_settings
-from runpod_sdxl_image_studio.domain.generation import GenerationErrorCode
+from runpod_sdxl_image_studio.domain.generation import Generation, GenerationErrorCode
+from runpod_sdxl_image_studio.domain.job import GenerationJob
 
 logger = logging.getLogger(__name__)
+
+RECONCILIATION_PROMPT_MISSING_CODE = "reconciliation_prompt_missing"
+RECONCILIATION_PROMPT_MISSING_SUMMARY = (
+    "ComfyUI prompt was not found in either the remote queue or history "
+    "after the reconciliation grace period"
+)
 
 
 class CompletedPromptHandler(Protocol):
@@ -50,13 +57,14 @@ class GenerationRecoveryService:
         self._job_repository = job_repository
         self._artifact_repository = artifact_repository
         self._stale_seconds = app_settings.stale_pending_seconds
+        self._reconciliation_grace_seconds = app_settings.reconciliation_grace_seconds
         self._max_items = app_settings.recovery_max_items
         self._completed_prompt_handler = completed_prompt_handler
         self._failure_repository = failure_repository
         self._cancellation_repository = cancellation_repository
 
     async def recover(self, now: datetime | None = None) -> tuple[str, ...]:
-        timestamp = now or datetime.now(UTC)
+        timestamp = _utc(now or datetime.now(UTC))
         messages: list[str] = []
         try:
             jobs = self._job_repository.list_recoverable(self._max_items)
@@ -72,7 +80,7 @@ class GenerationRecoveryService:
                 }:
                     continue
                 if job.prompt_id is None:
-                    created = job.created_at or timestamp
+                    created = _utc(job.created_at or timestamp)
                     if (
                         generation.status.value == "pending"
                         and (timestamp - created).total_seconds() >= self._stale_seconds
@@ -92,9 +100,19 @@ class GenerationRecoveryService:
                     if remote_state.status in {
                         RemotePromptStatus.PENDING,
                         RemotePromptStatus.IN_PROGRESS,
-                        RemotePromptStatus.NOT_FOUND,
                         RemotePromptStatus.UNAVAILABLE,
                     }:
+                        continue
+                    if remote_state.status is RemotePromptStatus.NOT_FOUND:
+                        if self._is_prompt_missing_stale(job, generation, timestamp):
+                            self._mark_failed(
+                                job.generation_id,
+                                job.id,
+                                RECONCILIATION_PROMPT_MISSING_CODE,
+                                RECONCILIATION_PROMPT_MISSING_SUMMARY,
+                                timestamp,
+                            )
+                            messages.append(f"{job.generation_id}: stale prompt not found")
                         continue
                     if remote_state.status is RemotePromptStatus.CANCELLED:
                         if self._cancellation_repository is None:
@@ -122,7 +140,17 @@ class GenerationRecoveryService:
                         messages.append(f"{job.generation_id}: failed")
                         continue
                 history = await self._client.get_prompt_history(job.prompt_id)
-                if history.status is PromptHistoryStatus.INTERRUPTED:
+                if history.status is PromptHistoryStatus.NOT_FOUND:
+                    if self._is_prompt_missing_stale(job, generation, timestamp):
+                        self._mark_failed(
+                            job.generation_id,
+                            job.id,
+                            RECONCILIATION_PROMPT_MISSING_CODE,
+                            RECONCILIATION_PROMPT_MISSING_SUMMARY,
+                            timestamp,
+                        )
+                        messages.append(f"{job.generation_id}: stale prompt not found")
+                elif history.status is PromptHistoryStatus.INTERRUPTED:
                     if self._cancellation_repository is None:
                         messages.append(f"{job.generation_id}: cancelled persistence unavailable")
                     else:
@@ -155,6 +183,28 @@ class GenerationRecoveryService:
                 messages.append(f"{job.generation_id}: 状態を維持しました")
         return tuple(messages)
 
+    def _is_prompt_missing_stale(
+        self,
+        job: GenerationJob,
+        generation: Generation,
+        now: datetime,
+    ) -> bool:
+        reference = next(
+            (
+                value
+                for value in (
+                    job.updated_at,
+                    job.created_at,
+                    generation.updated_at,
+                    generation.created_at,
+                )
+                if value is not None
+            ),
+            now,
+        )
+        reference_utc = _utc(reference)
+        return (now - reference_utc).total_seconds() >= self._reconciliation_grace_seconds
+
     def _mark_failed(
         self,
         generation_id: UUID,
@@ -174,3 +224,9 @@ class GenerationRecoveryService:
             return
         self._generation_repository.mark_failed(generation_id, error_code, error_summary)
         self._job_repository.mark_failed(job_id, error_code, error_summary)
+
+
+def _utc(value: datetime) -> datetime:
+    """Normalize recovery timestamps before comparing or persisting them."""
+
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)

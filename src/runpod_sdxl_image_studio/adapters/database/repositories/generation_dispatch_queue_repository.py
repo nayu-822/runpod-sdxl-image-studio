@@ -732,11 +732,14 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
                 summary = "ambiguous prompt manually linked: prompt id was supplied by an operator"
                 generation.comfy_prompt_id = prompt
                 generation.status = GenerationStatus.QUEUED.value
+                generation.completed_at = None
                 generation.error_code = "prompt_submission_ambiguous_resolved"
                 generation.error_summary = summary
                 generation.updated_at = timestamp
                 job.comfy_prompt_id = prompt
                 job.status = GenerationStatus.QUEUED.value
+                job.completed_at = None
+                job.cancelled_at = None
                 job.error_code = "prompt_submission_ambiguous_resolved"
                 job.error_summary = summary
                 job.updated_at = timestamp
@@ -1086,21 +1089,22 @@ def _require_ambiguous_prompt_resolution(
 ) -> None:
     if entry.submission_state != SubmissionState.AMBIGUOUS.value:
         raise GenerationDispatchQueueRepositoryError("queue entry is not ambiguous")
-    migration_repair = {
+    resolution_codes = {
         "migration_status_mismatch",
         "migration_status_ambiguous",
         "migration_prompt_id_mismatch",
+        "prompt_submission_ambiguous",
+        "prompt_submission_ambiguous_resolved",
     }
     generation_status = GenerationStatus(generation.status)
     job_status = GenerationStatus(job.status)
+    if not {generation.error_code, job.error_code}.intersection(resolution_codes):
+        raise GenerationDispatchQueueRepositoryError(
+            "ambiguous queue item lacks a supported resolution audit code"
+        )
     if GenerationStatus.COMPLETED in {generation_status, job_status} or (
         GenerationStatus.CANCELLED in {generation_status, job_status}
     ):
-        raise GenerationDispatchQueueRepositoryError("terminal queue item cannot be resolved")
-    if GenerationStatus.FAILED in {generation_status, job_status} and not {
-        generation.error_code,
-        job.error_code,
-    }.intersection(migration_repair):
         raise GenerationDispatchQueueRepositoryError("terminal queue item cannot be resolved")
 
 

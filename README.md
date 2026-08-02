@@ -7,6 +7,8 @@
 - ComfyUI の状態確認は typed な `RemotePromptStatus`（`PENDING`、`IN_PROGRESS`、`COMPLETED`、`FAILED`、`CANCELLED`、`NOT_FOUND`、`UNAVAILABLE`）で扱います。`/api/jobs/{prompt_id}` が明示的に 404/405 の場合だけ `/queue` と `/history` を使い、timeout / 5xx では破壊的 fallback を行いません。
 - prompt ID が不一致または送信結果不明の行は自動再送しません。Queue detail で Generation 側、Job 側、または手入力の prompt ID を選び、`prompt IDを紐付け` で両方を同一 ID に解決します。prompt が存在しないことを確認した場合だけ `failed` を明示確定できます。
 - History の `execution_interrupted` は Generation と Job を一つの SQLite transaction で `cancelled` に確定します。既に `completed` / `failed` / `cancelled` の行は上書きしません。
+- 手動で prompt ID を確定した migration ambiguous 行は `completed_at`、Job の `completed_at` / `cancelled_at` を NULL に戻します。既存の `cancel_requested_at` は利用者操作の可能性があるため保持し、worker のキャンセル確認へ渡します。
+- Queue entry のない旧 Job も `NOT_FOUND` の場合は `reconciliation_grace_seconds` と Job/Generation の更新日時で判定し、期限超過後だけ `reconciliation_prompt_missing` として Generation / Job を原子的に failed へ確定します。
 
 ## フェーズ4: 永続キュー・復旧・キャンセル
 
