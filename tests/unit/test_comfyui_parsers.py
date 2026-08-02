@@ -3,9 +3,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from runpod_sdxl_image_studio.adapters.comfyui.models import ComfyUIObjectInfo
+from runpod_sdxl_image_studio.adapters.comfyui.models import (
+    ComfyUIObjectInfo,
+    PromptHistoryStatus,
+)
 from runpod_sdxl_image_studio.adapters.comfyui.parsers import (
     parse_capabilities,
+    parse_prompt_history,
     parse_system_stats,
 )
 
@@ -82,3 +86,29 @@ def test_parse_system_stats_tolerates_missing_devices() -> None:
 
     assert stats.system_os == "linux"
     assert stats.devices == ()
+
+
+def test_parse_prompt_history_classifies_execution_interrupted() -> None:
+    history = parse_prompt_history(
+        {
+            "prompt-1": {
+                "status": {
+                    "status_str": "error",
+                    "messages": [["execution_interrupted", {"node_id": "4"}]],
+                }
+            }
+        },
+        "prompt-1",
+    )
+
+    assert history.status is PromptHistoryStatus.INTERRUPTED
+    assert history.is_interrupted
+    assert not history.is_failed
+
+
+def test_parse_prompt_history_keeps_unknown_status_safe() -> None:
+    history = parse_prompt_history({"prompt-1": {"status": {"status_str": "future"}}}, "prompt-1")
+
+    assert history.status is PromptHistoryStatus.UNKNOWN
+    assert not history.is_completed
+    assert not history.is_failed

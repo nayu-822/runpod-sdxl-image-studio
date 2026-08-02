@@ -17,7 +17,7 @@ from runpod_sdxl_image_studio.adapters.comfyui.exceptions import (
     ComfyUIWebSocketError,
     WorkflowError,
 )
-from runpod_sdxl_image_studio.adapters.comfyui.models import PromptHistory
+from runpod_sdxl_image_studio.adapters.comfyui.models import PromptHistory, PromptHistoryStatus
 from runpod_sdxl_image_studio.adapters.comfyui.websocket_client import ComfyUIWebSocketClient
 from runpod_sdxl_image_studio.adapters.comfyui.workflow_adapter import WorkflowAdapter
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_progress_repository import (
@@ -224,15 +224,19 @@ class GenerationService:
                 self._complete_existing_generation(generation_id, job.id)
                 return ReconciliationOutcome.COMPLETED
             history = await self._client.get_prompt_history(prompt_id)
-            if not history.exists:
+            if history.status is PromptHistoryStatus.NOT_FOUND:
                 return ReconciliationOutcome.NOT_FOUND
-            if history.is_failed:
+            if history.status is PromptHistoryStatus.INTERRUPTED:
+                return ReconciliationOutcome.CANCELLED
+            if history.status is PromptHistoryStatus.FAILED:
                 self._mark_failed_pair(
                     job,
                     GenerationErrorCode.COMFYUI_EXECUTION.value,
                     "ComfyUIで生成が失敗しました。",
                 )
                 return ReconciliationOutcome.FAILED
+            if history.status is PromptHistoryStatus.UNKNOWN:
+                return ReconciliationOutcome.UNAVAILABLE
             if not history.is_completed or not history.outputs:
                 return ReconciliationOutcome.IN_PROGRESS
             image_bytes = await self._client.get_output_image(history.outputs[0])

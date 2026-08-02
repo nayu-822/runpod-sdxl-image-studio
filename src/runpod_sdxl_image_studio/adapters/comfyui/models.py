@@ -5,6 +5,18 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
+
+
+class PromptHistoryStatus(StrEnum):
+    """Normalized status values returned by ComfyUI history."""
+
+    COMPLETED = "completed"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
+    IN_PROGRESS = "in_progress"
+    NOT_FOUND = "not_found"
+    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True)
@@ -95,6 +107,29 @@ class PromptHistory:
     outputs: tuple[ComfyUIOutputImage, ...]
     error_message: str | None
     exists: bool = True
+    status: PromptHistoryStatus = PromptHistoryStatus.UNKNOWN
+
+    def __post_init__(self) -> None:
+        """Infer the status for backwards-compatible test and adapter fixtures."""
+
+        if self.status is not PromptHistoryStatus.UNKNOWN:
+            return
+        inferred = (
+            PromptHistoryStatus.NOT_FOUND
+            if not self.exists
+            else PromptHistoryStatus.COMPLETED
+            if self.is_completed
+            else PromptHistoryStatus.FAILED
+            if self.is_failed
+            else PromptHistoryStatus.UNKNOWN
+        )
+        object.__setattr__(self, "status", inferred)
+
+    @property
+    def is_interrupted(self) -> bool:
+        """Whether ComfyUI reported an execution interruption."""
+
+        return self.status is PromptHistoryStatus.INTERRUPTED
 
 
 @dataclass(frozen=True)

@@ -30,6 +30,7 @@ from runpod_sdxl_image_studio.adapters.comfyui.models import (
     ComfyUIQueueStatus,
     ComfyUISystemStats,
     PromptHistory,
+    PromptHistoryStatus,
     QueuedPrompt,
 )
 from runpod_sdxl_image_studio.adapters.comfyui.parsers import (
@@ -162,8 +163,16 @@ class ComfyUIClient:
         try:
             payload = await self._get_json(f"/history/{quote(safe_prompt_id, safe='')}")
         except ComfyUIResponseError as exc:
-            if str(exc) == "ComfyUI returned HTTP status 404":
-                return PromptHistory(safe_prompt_id, False, False, (), None, False)
+            if exc.status_code == 404:
+                return PromptHistory(
+                    safe_prompt_id,
+                    False,
+                    False,
+                    (),
+                    None,
+                    False,
+                    PromptHistoryStatus.NOT_FOUND,
+                )
             raise
         return parse_prompt_history(payload, safe_prompt_id)
 

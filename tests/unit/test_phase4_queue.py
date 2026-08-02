@@ -22,6 +22,7 @@ from runpod_sdxl_image_studio.adapters.comfyui.models import (
     ComfyUIOutputImage,
     ComfyUIQueueStatus,
     PromptHistory,
+    PromptHistoryStatus,
 )
 from runpod_sdxl_image_studio.adapters.database.engine import create_session_factory, session_scope
 from runpod_sdxl_image_studio.adapters.database.models import (
@@ -46,6 +47,7 @@ from runpod_sdxl_image_studio.db.migration_runner import upgrade_database
 from runpod_sdxl_image_studio.domain.generation import GenerationStatus
 from runpod_sdxl_image_studio.domain.generation_queue import (
     BatchSeedStrategy,
+    CancellationOutcome,
     ReconciliationOutcome,
     SubmissionState,
 )
@@ -326,6 +328,30 @@ def test_cancel_pending_and_retry_keep_snapshots_and_link_generations() -> None:
     engine.dispose()
 
 
+def test_cancel_does_not_mark_mismatched_pending_pair_cancelled() -> None:
+    engine, factory = _database()
+    repository = GenerationDispatchQueueRepository(factory)
+    item = repository.enqueue_single(GenerationSettingsSnapshot.from_settings(_settings()))
+    with session_scope(factory) as session:
+        generation = session.get(GenerationModel, str(item.generation.id))
+        job = session.get(GenerationJobModel, str(item.job.id))
+        assert generation is not None and job is not None
+        generation.comfy_prompt_id = "generation-prompt"
+        job.comfy_prompt_id = "job-prompt"
+
+    service = GenerationQueueService(repository, Settings(_env_file=None))
+    with pytest.raises(GenerationQueueServiceError, match="prompt ID"):
+        asyncio.run(service.cancel(item.generation.id))
+
+    current = repository.get_queue_item(item.generation.id)
+    assert current is not None
+    assert current.generation.status is GenerationStatus.PENDING
+    assert current.job.status is GenerationStatus.PENDING
+    assert current.generation.comfy_prompt_id == "generation-prompt"
+    assert current.job.prompt_id == "job-prompt"
+    engine.dispose()
+
+
 def test_running_cancel_requires_adapter_confirmation() -> None:
     engine, factory = _database()
     dispatch_repository = GenerationDispatchQueueRepository(factory)
@@ -390,6 +416,40 @@ def test_worker_retries_persistent_cancel_until_comfyui_confirms() -> None:
     second = repository.get_queue_item(item.generation.id)
     assert second is not None and second.generation.status is GenerationStatus.CANCELLED
     assert adapter.calls == 2
+    engine.dispose()
+
+
+def test_worker_does_not_overwrite_completion_when_cancel_races() -> None:
+    engine, factory = _database()
+    repository = GenerationDispatchQueueRepository(factory)
+    item = repository.enqueue_single(GenerationSettingsSnapshot.from_settings(_settings()))
+    GenerationQueueRepository(factory).mark_queued(item.generation.id, item.job.id, "prompt-race")
+    repository.request_cancel(item.generation.id)
+
+    class Adapter:
+        async def cancel_prompt(self, prompt_id: str) -> CancellationResult:
+            assert prompt_id == "prompt-race"
+            return CancellationResult(
+                requested=True,
+                outcome=CancellationOutcome.COMPLETED,
+            )
+
+    async def reconcile(_: object) -> ReconciliationOutcome:
+        return ReconciliationOutcome.COMPLETED
+
+    worker = GenerationQueueWorker(
+        repository,
+        object(),
+        Settings(_env_file=None),
+        cancellation_adapter=Adapter(),
+        reconcile_handler=reconcile,
+    )
+    asyncio.run(worker.reconcile())
+
+    current = repository.get_queue_item(item.generation.id)
+    assert current is not None
+    assert current.generation.status is GenerationStatus.QUEUED
+    assert current.job.status is GenerationStatus.QUEUED
     engine.dispose()
 
 
@@ -628,18 +688,103 @@ def test_comfyui_modern_cancellation_is_confirmed_without_legacy_fallback() -> N
     assert client.legacy_calls == 0
 
 
-def test_comfyui_modern_false_does_not_try_legacy_or_confirm() -> None:
+@pytest.mark.parametrize(
+    ("history", "expected"),
+    [
+        (PromptHistory("prompt-1", True, False, (), None), CancellationOutcome.COMPLETED),
+        (PromptHistory("prompt-1", False, True, (), "failed"), CancellationOutcome.FAILED),
+        (PromptHistory("prompt-1", False, False, (), None), CancellationOutcome.UNAVAILABLE),
+        (PromptHistory("prompt-1", False, False, (), None, False), CancellationOutcome.NOT_FOUND),
+    ],
+)
+def test_comfyui_modern_false_observes_state_without_legacy_fallback(
+    history: PromptHistory,
+    expected: CancellationOutcome,
+) -> None:
+    class FakeClient:
+        legacy_calls = 0
+
+        async def cancel_job(self, prompt_id: str) -> bool:
+            return False
+
+        async def get_queue_status(self) -> ComfyUIQueueStatus:
+            return ComfyUIQueueStatus((), ())
+
+        async def get_prompt_history(self, prompt_id: str) -> PromptHistory:
+            return history
+
+        async def delete_queued_prompt(self, prompt_id: str) -> None:
+            self.legacy_calls += 1
+
+        async def interrupt_prompt(self, prompt_id: str) -> None:
+            self.legacy_calls += 1
+
+    client = FakeClient()
+    result = asyncio.run(
+        ComfyUICancellationAdapter(
+            client,
+            Settings(_env_file=None, history_max_attempts=1),
+        ).cancel_prompt("prompt-1")
+    )
+
+    assert result.requested is True
+    assert result.confirmed is False
+    assert result.outcome is expected
+    assert client.legacy_calls == 0
+
+
+def test_comfyui_history_running_is_in_progress_even_when_queue_is_empty() -> None:
     class FakeClient:
         async def cancel_job(self, prompt_id: str) -> bool:
             return False
 
         async def get_queue_status(self) -> ComfyUIQueueStatus:
-            raise AssertionError("modern false must not fall back")
+            return ComfyUIQueueStatus((), ())
+
+        async def get_prompt_history(self, prompt_id: str) -> PromptHistory:
+            return PromptHistory(
+                prompt_id,
+                False,
+                False,
+                (),
+                None,
+                True,
+                status=PromptHistoryStatus.IN_PROGRESS,
+            )
+
+    result = asyncio.run(
+        ComfyUICancellationAdapter(
+            FakeClient(),
+            Settings(_env_file=None, history_max_attempts=1),
+        ).cancel_prompt("prompt-1")
+    )
+
+    assert result.outcome is CancellationOutcome.IN_PROGRESS
+
+
+def test_comfyui_interrupted_history_confirms_cancellation() -> None:
+    class FakeClient:
+        async def cancel_job(self, prompt_id: str) -> bool:
+            return True
+
+        async def get_queue_status(self) -> ComfyUIQueueStatus:
+            return ComfyUIQueueStatus((), ())
+
+        async def get_prompt_history(self, prompt_id: str) -> PromptHistory:
+            return PromptHistory(
+                prompt_id,
+                False,
+                False,
+                (),
+                None,
+                True,
+                status=PromptHistoryStatus.INTERRUPTED,
+            )
 
     result = asyncio.run(ComfyUICancellationAdapter(FakeClient()).cancel_prompt("prompt-1"))
 
-    assert result.requested is True
-    assert result.confirmed is False
+    assert result.outcome is CancellationOutcome.CANCELLED
+    assert result.confirmed is True
 
 
 @pytest.mark.parametrize("status_code", [404, 405])
@@ -941,4 +1086,178 @@ def test_phase4_migration_deduplicates_retry_links_before_unique_indexes(tmp_pat
     assert generation_links[1].retry_of_generation_id is None
     assert batch_links[0].retry_of_batch_id == source_batch
     assert batch_links[1].retry_of_batch_id is None
+    engine.dispose()
+
+
+def test_phase4_followup_migration_repairs_terminal_and_mismatched_rows(tmp_path: Path) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'phase4-followup.sqlite3').as_posix()}"
+    root = Path(__file__).parents[2]
+    config = Config(str(root / "alembic.ini"))
+    config.set_main_option("script_location", str(root / "alembic"))
+    config.set_main_option("sqlalchemy.url", database_url)
+    command.upgrade(config, "0006_phase4_reconcile_existing_state")
+    engine = create_engine(database_url)
+    snapshot = GenerationSettingsSnapshot.from_settings(_settings()).to_json()
+    timestamp = "2026-01-01 00:00:00"
+
+    def insert_pair(
+        connection: Any,
+        generation_id: str,
+        job_id: str,
+        generation_status: str,
+        job_status: str,
+        generation_prompt: str | None,
+        job_prompt: str | None,
+        queue_state: str,
+        cancel_requested: bool = False,
+    ) -> None:
+        connection.execute(
+            text(
+                """INSERT INTO generations
+                (id, kind, status, parent_generation_id, retry_of_generation_id,
+                 retry_attempt, settings_snapshot_json, snapshot_schema_version,
+                 checkpoint_name, vae_name, seed, width, height,
+                 positive_prompt_search, negative_prompt_search,
+                 workflow_template_id, workflow_template_version, comfy_prompt_id,
+                 favorite, user_note, error_code, error_summary, created_at,
+                 started_at, completed_at, updated_at)
+                VALUES (:id, 'standard', :status, NULL, NULL, 0, :snapshot, 1,
+                 'sdxl.safetensors', NULL, 123, 1024, 1024, 'a cat', '',
+                 'sdxl_txt2img', '1.0', :prompt, 0, NULL, NULL, NULL,
+                 :timestamp, NULL, NULL, :timestamp)"""
+            ),
+            {
+                "id": generation_id,
+                "status": generation_status,
+                "snapshot": snapshot,
+                "prompt": generation_prompt,
+                "timestamp": timestamp,
+            },
+        )
+        connection.execute(
+            text(
+                """INSERT INTO generation_jobs
+                (id, generation_id, status, comfy_prompt_id, progress_value,
+                 progress_maximum, current_node, worker_id, claimed_at,
+                 lease_expires_at, cancel_requested_at, cancelled_at, error_code,
+                 error_summary, created_at, started_at, completed_at, updated_at)
+                VALUES (:id, :generation_id, :status, :prompt, NULL, NULL, NULL,
+                 NULL, NULL, NULL, :cancel_requested, NULL, NULL, NULL,
+                 :timestamp, NULL, NULL, :timestamp)"""
+            ),
+            {
+                "id": job_id,
+                "generation_id": generation_id,
+                "status": job_status,
+                "prompt": job_prompt,
+                "cancel_requested": timestamp if cancel_requested else None,
+                "timestamp": timestamp,
+            },
+        )
+        connection.execute(
+            text(
+                """INSERT INTO generation_queue_entries
+                (generation_id, job_id, batch_id, batch_index, worker_id, claimed_at,
+                 lease_expires_at, cancel_requested_at, submission_state,
+                 submission_token, submission_started_at, enqueued_at, updated_at)
+                VALUES (:generation_id, :job_id, NULL, 0, NULL, NULL, NULL, :cancel,
+                        :state, NULL, NULL, :timestamp, :timestamp)"""
+            ),
+            {
+                "generation_id": generation_id,
+                "job_id": job_id,
+                "cancel": timestamp if cancel_requested else None,
+                "state": queue_state,
+                "timestamp": timestamp,
+            },
+        )
+
+    with engine.begin() as connection:
+        insert_pair(
+            connection,
+            "00000000-0000-0000-0000-000000000301",
+            "00000000-0000-0000-0000-000000000311",
+            "failed",
+            "failed",
+            "prompt-failed",
+            "prompt-failed",
+            "submitted",
+        )
+        insert_pair(
+            connection,
+            "00000000-0000-0000-0000-000000000302",
+            "00000000-0000-0000-0000-000000000312",
+            "pending",
+            "pending",
+            None,
+            None,
+            "ready",
+            cancel_requested=True,
+        )
+        insert_pair(
+            connection,
+            "00000000-0000-0000-0000-000000000303",
+            "00000000-0000-0000-0000-000000000313",
+            "queued",
+            "queued",
+            "prompt-a",
+            "prompt-b",
+            "submitted",
+        )
+        insert_pair(
+            connection,
+            "00000000-0000-0000-0000-000000000304",
+            "00000000-0000-0000-0000-000000000314",
+            "completed",
+            "queued",
+            "prompt-complete",
+            "prompt-complete",
+            "submitted",
+        )
+        connection.execute(
+            text(
+                """INSERT INTO generation_artifacts
+                (id, generation_id, artifact_type, local_path, sha256, size_bytes,
+                 width, height, mime_type, created_at)
+                VALUES ('00000000-0000-0000-0000-000000000321',
+                        '00000000-0000-0000-0000-000000000304', 'image',
+                        'generations/image.png', 'a', 1, 1, 1, 'image/png', :timestamp)"""
+            ),
+            {"timestamp": timestamp},
+        )
+    engine.dispose()
+
+    command.upgrade(config, "head")
+    engine = create_engine(database_url)
+    with engine.connect() as connection:
+        rows = connection.execute(
+            text(
+                """SELECT g.id, g.status AS generation_status, j.status AS job_status,
+                          g.comfy_prompt_id AS generation_prompt,
+                          j.comfy_prompt_id AS job_prompt,
+                          q.submission_state, g.error_code
+                   FROM generations AS g
+                   JOIN generation_jobs AS j ON j.generation_id=g.id
+                   JOIN generation_queue_entries AS q ON q.generation_id=g.id
+                  WHERE g.id IN (:failed, :cancelled, :mismatch, :completed)
+                  ORDER BY g.id"""
+            ),
+            {
+                "failed": "00000000-0000-0000-0000-000000000301",
+                "cancelled": "00000000-0000-0000-0000-000000000302",
+                "mismatch": "00000000-0000-0000-0000-000000000303",
+                "completed": "00000000-0000-0000-0000-000000000304",
+            },
+        ).all()
+    by_id = {row.id: row for row in rows}
+    assert by_id["00000000-0000-0000-0000-000000000301"].generation_status == "failed"
+    assert by_id["00000000-0000-0000-0000-000000000301"].job_status == "failed"
+    assert by_id["00000000-0000-0000-0000-000000000302"].generation_status == "cancelled"
+    assert by_id["00000000-0000-0000-0000-000000000302"].job_status == "cancelled"
+    mismatch = by_id["00000000-0000-0000-0000-000000000303"]
+    assert mismatch.generation_prompt == "prompt-a"
+    assert mismatch.job_prompt == "prompt-b"
+    assert mismatch.submission_state == "ambiguous"
+    assert mismatch.error_code == "migration_prompt_id_mismatch"
+    assert by_id["00000000-0000-0000-0000-000000000304"].job_status == "completed"
     engine.dispose()

@@ -125,6 +125,24 @@ class Settings(BaseSettings):
     queue_auto_refresh_seconds: float = Field(
         3.0, validation_alias="IMAGE_STUDIO_QUEUE_AUTO_REFRESH_SECONDS"
     )
+    image_download_stale_after_seconds: float = Field(
+        300.0, validation_alias="IMAGE_STUDIO_IMAGE_DOWNLOAD_STALE_AFTER_SECONDS"
+    )
+    metadata_request_max_wait_seconds: float = Field(
+        60.0, validation_alias="IMAGE_STUDIO_METADATA_REQUEST_MAX_WAIT_SECONDS"
+    )
+    metadata_connect_timeout_seconds: float = Field(
+        10.0, validation_alias="IMAGE_STUDIO_METADATA_CONNECT_TIMEOUT_SECONDS"
+    )
+    metadata_read_timeout_seconds: float = Field(
+        30.0, validation_alias="IMAGE_STUDIO_METADATA_READ_TIMEOUT_SECONDS"
+    )
+    metadata_rate_limiter_wait_seconds: float = Field(
+        5.0, validation_alias="IMAGE_STUDIO_METADATA_RATE_LIMITER_WAIT_SECONDS"
+    )
+    metadata_heartbeat_interval_seconds: float = Field(
+        5.0, validation_alias="IMAGE_STUDIO_METADATA_HEARTBEAT_INTERVAL_SECONDS"
+    )
     max_trigger_words: int = Field(50, validation_alias="IMAGE_STUDIO_MAX_TRIGGER_WORDS")
     max_compatible_models: int = Field(20, validation_alias="IMAGE_STUDIO_MAX_COMPATIBLE_MODELS")
 
@@ -208,7 +226,15 @@ class Settings(BaseSettings):
         return value
 
     @field_validator(
-        "queue_poll_interval_seconds", "queue_lease_seconds", "queue_heartbeat_seconds"
+        "queue_poll_interval_seconds",
+        "queue_lease_seconds",
+        "queue_heartbeat_seconds",
+        "image_download_stale_after_seconds",
+        "metadata_request_max_wait_seconds",
+        "metadata_connect_timeout_seconds",
+        "metadata_read_timeout_seconds",
+        "metadata_rate_limiter_wait_seconds",
+        "metadata_heartbeat_interval_seconds",
     )
     @classmethod
     def validate_queue_timing(cls, value: float) -> float:
@@ -227,6 +253,18 @@ class Settings(BaseSettings):
     def validate_queue_lease(self) -> Settings:
         if self.queue_lease_seconds <= self.queue_heartbeat_seconds:
             raise ValueError("queue_lease_seconds must be greater than queue_heartbeat_seconds")
+        metadata_wait = max(
+            self.metadata_request_max_wait_seconds,
+            self.metadata_connect_timeout_seconds
+            + self.metadata_read_timeout_seconds
+            + self.metadata_rate_limiter_wait_seconds
+            + self.metadata_heartbeat_interval_seconds
+            + 5.0,
+        )
+        if self.image_download_stale_after_seconds <= metadata_wait:
+            raise ValueError(
+                "image_download_stale_after_seconds must exceed the maximum metadata request wait"
+            )
         return self
 
     @field_validator("max_upscale_factor")

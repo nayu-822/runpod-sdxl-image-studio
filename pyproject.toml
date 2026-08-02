@@ -56,7 +56,7 @@ indent-style = "space"
 
 [tool.mypy]
 plugins = ["pydantic.mypy"]
-python_version = "3.12"
+python_version = "3.11"
 files = ["src"]
 check_untyped_defs = true
 disallow_any_generics = true
@@ -68,6 +68,11 @@ show_error_codes = true
 warn_redundant_casts = true
 warn_unused_ignores = true
 ignore_missing_imports = true
+follow_imports = "skip"
+
+[[tool.mypy.overrides]]
+module = ["numpy.*"]
+follow_imports = "skip"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

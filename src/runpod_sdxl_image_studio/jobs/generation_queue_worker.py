@@ -19,6 +19,7 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_dispatch
 from runpod_sdxl_image_studio.config import Settings
 from runpod_sdxl_image_studio.domain.generation import GenerationProgress, GenerationStatus
 from runpod_sdxl_image_studio.domain.generation_queue import (
+    CancellationOutcome,
     GenerationQueueItem,
     ReconciliationOutcome,
     SubmissionState,
@@ -185,10 +186,12 @@ class GenerationQueueWorker:
             if item.entry.cancel_requested_at is not None:
                 await self._cancel_item(item)
                 return True
-            if item.generation.comfy_prompt_id or item.job.prompt_id:
+            if _has_prompt_mismatch(item):
+                self._repository.mark_prompt_id_mismatch(item.generation.id)
+                return True
+            if _prompt_id(item):
                 # A prompt ID means this is recovery work, never a resend candidate.
-                if self._reconcile_handler is not None:
-                    await self._reconcile_handler(item)
+                await self._reconcile_item(item)
                 return True
             if item.entry.submission_state is not SubmissionState.READY:
                 return True
@@ -233,7 +236,10 @@ class GenerationQueueWorker:
         current = self._repository.get_queue_item(item.generation.id)
         if current is None:
             return
-        prompt_id = current.job.prompt_id or current.generation.comfy_prompt_id
+        if _has_prompt_mismatch(current):
+            self._repository.mark_prompt_id_mismatch(current.generation.id)
+            return
+        prompt_id = _prompt_id(current)
         if not prompt_id:
             if current.entry.submission_state is SubmissionState.READY:
                 self._repository.mark_cancelled(current.generation.id)
@@ -241,8 +247,30 @@ class GenerationQueueWorker:
         if self._cancellation_adapter is None:
             return
         result = await self._cancellation_adapter.cancel_prompt(prompt_id)
-        if result.confirmed:
+        if result.outcome is CancellationOutcome.CANCELLED:
             self._repository.mark_cancelled(current.generation.id)
+        elif result.outcome in {
+            CancellationOutcome.COMPLETED,
+            CancellationOutcome.FAILED,
+        }:
+            await self._reconcile_item(current)
+        elif result.outcome is CancellationOutcome.NOT_FOUND and self._is_stale(
+            current, datetime.now(UTC)
+        ):
+            self._repository.mark_reconciliation_failed(
+                current.generation.id,
+                "キャンセル要求後のComfyUI promptが猶予期間を過ぎても見つかりません。",
+            )
+
+    async def _reconcile_item(self, item: GenerationQueueItem) -> ReconciliationOutcome:
+        """Run normal prompt reconciliation and apply interruption cancellation."""
+
+        if self._reconcile_handler is None:
+            return ReconciliationOutcome.UNAVAILABLE
+        outcome = await self._reconcile_handler(item)
+        if outcome is ReconciliationOutcome.CANCELLED:
+            self._repository.mark_cancelled(item.generation.id)
+        return outcome
 
     def _quarantine_submission(self, item: GenerationQueueItem, release_claim: bool) -> bool:
         try:
@@ -297,15 +325,17 @@ class GenerationQueueWorker:
                             exc_info=True,
                         )
                     continue
-                prompt_id = item.job.prompt_id or item.generation.comfy_prompt_id
-                if not prompt_id:
+                if _has_prompt_mismatch(item):
+                    self._repository.mark_prompt_id_mismatch(item.generation.id, now=now)
+                    continue
+                if _prompt_id(item) is None:
                     # A submitting/ambiguous item is deliberately isolated. It must not be
                     # treated as a fresh prompt candidate after a process restart.
                     continue
                 if self._reconcile_handler is None:
                     continue
                 try:
-                    outcome = await self._reconcile_handler(item)
+                    outcome = await self._reconcile_item(item)
                 except Exception:  # noqa: BLE001 - reconciliation must not stop the worker
                     logger.warning("queue item reconciliation handler failed", exc_info=True)
                     outcome = ReconciliationOutcome.UNAVAILABLE
@@ -337,6 +367,20 @@ class GenerationQueueWorker:
     def _is_stale(self, item: GenerationQueueItem, now: datetime) -> bool:
         grace = timedelta(seconds=self._settings.reconciliation_grace_seconds)
         return item.entry.updated_at + grace <= now
+
+
+def _has_prompt_mismatch(item: GenerationQueueItem) -> bool:
+    return (
+        item.generation.comfy_prompt_id is not None
+        and item.job.prompt_id is not None
+        and item.generation.comfy_prompt_id != item.job.prompt_id
+    )
+
+
+def _prompt_id(item: GenerationQueueItem) -> str | None:
+    if _has_prompt_mismatch(item):
+        return None
+    return item.job.prompt_id or item.generation.comfy_prompt_id
 
 
 class GenerationQueueRuntime:

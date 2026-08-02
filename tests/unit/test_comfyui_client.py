@@ -13,6 +13,7 @@ from runpod_sdxl_image_studio.adapters.comfyui.exceptions import (
     ComfyUIResponseError,
     ComfyUITimeoutError,
 )
+from runpod_sdxl_image_studio.adapters.comfyui.models import PromptHistoryStatus
 
 FIXTURE_DIR = Path(__file__).parents[1] / "fixtures" / "comfyui"
 
@@ -175,4 +176,19 @@ async def test_legacy_cancel_operations_accept_empty_success_body(
         await client.interrupt_prompt("prompt-1")
     assert route.called
     assert json.loads(route.calls[0].request.content) == payload
+    await client.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_prompt_history_404_is_typed_as_not_found() -> None:
+    respx.get("http://comfy.test:8188/history/prompt-1").mock(
+        return_value=httpx.Response(404, text="missing")
+    )
+    client = ComfyUIClient(base_url="http://comfy.test:8188")
+
+    history = await client.get_prompt_history("prompt-1")
+
+    assert history.status is PromptHistoryStatus.NOT_FOUND
+    assert history.exists is False
     await client.close()

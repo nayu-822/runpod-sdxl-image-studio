@@ -12,13 +12,13 @@ prompt ID の保存に失敗した場合は `ready` に戻しません。結果�
 
 ### 復旧と状態
 
-起動時および稼働中に prompt ID を持つ `queued` / `running` / `submitting` / `ambiguous` を reconciliation します。結果は `IN_PROGRESS`、`COMPLETED`、`FAILED`、`NOT_FOUND`、`UNAVAILABLE` に区別します。prompt ID がある Job は、どの結果でも `/prompt` へ再送信しません。`NOT_FOUND` のみ grace 期間経過後に監査用エラーコードで失敗扱いにします。`UNAVAILABLE` や `IN_PROGRESS` は状態を維持します。完了時は既存 Artifact を確認して冪等に主 Artifact と完了状態を更新します。
+起動時および稼働中に prompt ID を持つ `queued` / `running` / `submitting` / `ambiguous` を reconciliation します。結果は `IN_PROGRESS`、`COMPLETED`、`FAILED`、`CANCELLED`、`NOT_FOUND`、`UNAVAILABLE` に typed model として区別します。prompt ID がある Job は、どの結果でも `/prompt` へ再送信しません。`NOT_FOUND` のみ grace 期間経過後に監査用エラーコードで失敗扱いにします。`UNAVAILABLE` や `IN_PROGRESS` は状態を維持します。完了時は既存 Artifact を確認して冪等に主 Artifact と完了状態を更新します。
 
-0004適用済み DB に残る prompt ID なしの queued/running 状態不一致は、0005 migration で `migration_status_mismatch` として Generation と Job を原子的に failed にします。既存画像、Artifact、履歴、Preset は削除しません。
+0004適用済み DB の状態補正は、terminal state と主画像 Artifact を優先し、Generation と Job の prompt ID 不一致を `migration_prompt_id_mismatch` として Queue entry ごと `ambiguous` に隔離します。0005/0006適用済み DBには後続の0007 migrationを適用し、cancel requestだけで `cancelled` にせず、復元できない行を監査可能な状態に保持します。既存画像、Artifact、履歴、Preset は削除しません。
 
 ### キャンセルと再試行
 
-未claimの pending は `cancel_requested` 保存後に cancelled へ遷移できます。claim済み、submitting、queued、running は即時に terminal へせず、ComfyUI の対象 prompt の queue削除または interrupt 後、queue/history で停止を確認できた場合だけ cancelled にします。確認不能・接続失敗時は元の状態と `cancel_requested` を保持します。completed/failed/cancelled へのキャンセルは冪等です。
+未claimの pending は `cancel_requested` 保存後に cancelled へ遷移できます。claim済み、submitting、queued、running は即時に terminal へせず、ComfyUI の対象 prompt の queue削除または interrupt 後、queue/history で停止を確認できた場合だけ cancelled にします。history の `execution_interrupted` は cancelled として扱い、完了・失敗が先に確定していた場合はその terminal state を維持します。確認不能・接続失敗時は元の状態と `cancel_requested` を保持します。completed/failed/cancelled へのキャンセルは冪等です。
 
 単体 retry と failed-only batch retry は元 Generation/Batch との関連を持つ新規キュー項目です。同じ retry 要求を複数回受けても、0005 の NULL許容 partial unique index により既存結果を返し、新規項目を重複作成しません。Random seed、連番 seed、SQLite保存値の上限は `MAX_SEED = 2**63 - 1` に統一しています。
 

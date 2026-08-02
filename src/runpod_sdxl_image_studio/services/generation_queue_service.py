@@ -16,6 +16,7 @@ from runpod_sdxl_image_studio.config import Settings
 from runpod_sdxl_image_studio.domain.generation import GenerationStatus
 from runpod_sdxl_image_studio.domain.generation_queue import (
     BatchSeedStrategy,
+    CancellationOutcome,
     GenerationBatch,
     GenerationQueueItem,
     SubmissionState,
@@ -37,8 +38,17 @@ class CancellationResult:
     """Adapter-level result without leaking ComfyUI response details."""
 
     requested: bool
-    confirmed: bool
+    confirmed: bool = False
+    outcome: CancellationOutcome = CancellationOutcome.UNAVAILABLE
     message: str = ""
+
+    def __post_init__(self) -> None:
+        """Keep the Phase 4 boolean constructor compatible while adding outcome."""
+
+        if self.outcome is CancellationOutcome.UNAVAILABLE and self.confirmed:
+            object.__setattr__(self, "outcome", CancellationOutcome.CANCELLED)
+        elif self.outcome is CancellationOutcome.CANCELLED and not self.confirmed:
+            object.__setattr__(self, "confirmed", True)
 
 
 class GenerationQueueServiceError(RuntimeError):
@@ -151,20 +161,36 @@ class GenerationQueueService:
             }:
                 return requested
             if (
+                requested.job.prompt_id
+                and requested.generation.comfy_prompt_id is not None
+                and requested.job.prompt_id != requested.generation.comfy_prompt_id
+            ):
+                raise GenerationQueueServiceError(
+                    "GenerationとJobのprompt IDが一致しないためキャンセルできません。"
+                )
+            if (
                 requested.generation.status is GenerationStatus.PENDING
                 and requested.entry.worker_id is None
                 and requested.entry.submission_state is SubmissionState.READY
             ):
                 return self._repository.mark_cancelled(generation_id)
-            prompt_id = requested.job.prompt_id or requested.generation.comfy_prompt_id
+            prompt_id = _shared_prompt_id(requested)
             if not prompt_id:
                 return requested
             if self._cancellation_adapter is None:
                 raise GenerationQueueServiceError("実行中ジョブのキャンセルAdapterが未設定です。")
             result = await self._cancellation_adapter.cancel_prompt(prompt_id)
-            if not result.confirmed:
-                raise GenerationQueueServiceError("ComfyUIのキャンセル確認を取得できませんでした。")
-            return self._repository.mark_cancelled(generation_id)
+            if result.outcome is CancellationOutcome.CANCELLED:
+                return self._repository.mark_cancelled(generation_id)
+            if result.outcome in {
+                CancellationOutcome.COMPLETED,
+                CancellationOutcome.FAILED,
+            }:
+                current = self._repository.get_queue_item(generation_id)
+                return current or requested
+            raise GenerationQueueServiceError(
+                result.message or "ComfyUIのキャンセル状態を確認できませんでした。"
+            )
         except GenerationQueueServiceError:
             raise
         except (GenerationDispatchQueueRepositoryError, ValueError) as exc:
@@ -335,3 +361,13 @@ __all__ = [
     "MAX_SEED",
     "QueueEnqueueResult",
 ]
+
+
+def _shared_prompt_id(item: GenerationQueueItem) -> str | None:
+    """Return the only safe prompt ID, rejecting a Generation/Job mismatch."""
+
+    generation_prompt = item.generation.comfy_prompt_id
+    job_prompt = item.job.prompt_id
+    if generation_prompt is not None and job_prompt is not None and generation_prompt != job_prompt:
+        return None
+    return job_prompt or generation_prompt

@@ -10,6 +10,7 @@ from uuid import UUID
 
 from runpod_sdxl_image_studio.adapters.comfyui.client import ComfyUIClient
 from runpod_sdxl_image_studio.adapters.comfyui.exceptions import ComfyUIError
+from runpod_sdxl_image_studio.adapters.comfyui.models import PromptHistoryStatus
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_repository import (
     GenerationArtifactRepositoryProtocol,
     GenerationFailureRepositoryProtocol,
@@ -80,7 +81,9 @@ class GenerationRecoveryService:
                         messages.append(f"{job.generation_id}: stale pending")
                     continue
                 history = await self._client.get_prompt_history(job.prompt_id)
-                if history.is_failed:
+                if history.status is PromptHistoryStatus.INTERRUPTED:
+                    messages.append(f"{job.generation_id}: cancelled")
+                elif history.status is PromptHistoryStatus.FAILED:
                     self._mark_failed(
                         job.generation_id,
                         job.id,

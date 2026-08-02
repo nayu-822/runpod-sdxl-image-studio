@@ -2,11 +2,11 @@
 
 ## フェーズ4の実装状況
 
-永続 FIFO Queue、単一 worker の lease、Random/連番 batch seed、キャンセル確認、単体 retry、failed-only batch retry、起動時・定期 reconciliation、Queue filter、0004/0005 migration、Gradio二重操作防止、Fake/Mockによる自動テストを実装済みです。
+永続 FIFO Queue、単一 worker の lease、Random/連番 batch seed、キャンセル確認、単体 retry、failed-only batch retry、起動時・定期 reconciliation、Queue filter、0004/0005/0006/0007 migration、Gradio二重操作防止、Fake/Mockによる自動テストを実装済みです。キャンセル結果は `CANCELLED`、`COMPLETED`、`FAILED`、`IN_PROGRESS`、`NOT_FOUND`、`UNAVAILABLE` の typed outcome で扱い、history の `execution_interrupted` をキャンセル確定として処理します。
 
 送信状態は `ready → submitting → submitted` または `ambiguous` です。`cancel_requested` はキャンセル要求の保存状態であり、ComfyUI 側の停止確認後にのみ `cancelled` へ遷移します。prompt ID を持つ Job は再送信せず、`IN_PROGRESS` と `UNAVAILABLE` は失敗へ変更しません。`NOT_FOUND` のみ grace 期間後の失敗候補です。
 
-0005では既存0004 DBの状態不一致を backfill し、prompt IDがある行は安全な reconciliation 対象、prompt IDがなく実行継続できない行は `migration_status_mismatch` として Generation/Job を failed にします。既存の画像、Artifact、履歴、Presetは削除しません。
+0005/0006では既存DBの状態不一致を terminal state と Artifact の証拠に基づいて補正し、Generation と Job の prompt ID 不一致は `migration_prompt_id_mismatch` として Queue entry ごと `ambiguous` に隔離します。0005/0006適用済みDBには0007後続migrationを適用し、cancel requestだけで `cancelled` へ遷移させず、復元できない状態を監査可能に保持します。既存の画像、Artifact、履歴、Presetは削除しません。
 
 Queue 並べ替え、複数 worker/GPU、自動 retry、Phase 5アップスケール、外部画像metadata、Google Drive同期、ComfyUI汎用workflow editor、LoRA学習は未実装です。
 

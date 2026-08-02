@@ -1,12 +1,12 @@
-"""Reconcile Phase 4 pairs without turning terminal rows into resend candidates."""
+"""Repair rows already changed by the original Phase 4 normalization migrations."""
 
 from __future__ import annotations
 
 import sqlalchemy as sa
 from alembic import op
 
-revision = "0006_phase4_reconcile_existing_state"
-down_revision = "0005_phase4_submission_state_and_retry_idempotency"
+revision = "0007_phase4_terminal_state_repair"
+down_revision = "0006_phase4_reconcile_existing_state"
 branch_labels = None
 depends_on = None
 
@@ -47,25 +47,23 @@ def upgrade() -> None:
                 {"generation_id": row["generation_id"]},
             ).first()
         )
-        normalized = _classify(row, has_artifact)
-        _write_pair(bind, row, normalized)
+        result = _repair_row(row, has_artifact)
+        _write_row(bind, row, result)
 
 
 def downgrade() -> None:
     """Data repair is intentionally retained when the revision is downgraded."""
 
 
-def _classify(row: sa.RowMapping, has_artifact: bool) -> dict[str, object]:
+def _repair_row(row: sa.RowMapping, has_artifact: bool) -> dict[str, object]:
     generation_status = str(row["generation_status"])
     job_status = str(row["job_status"])
     generation_prompt = _prompt(row["generation_prompt"])
     job_prompt = _prompt(row["job_prompt"])
-    prompt = generation_prompt or job_prompt
     queue_state = str(row["submission_state"] or "ready")
+    prompt = generation_prompt or job_prompt
     has_cancel_request = (
-        row["job_cancel_requested"] is not None
-        or row["job_cancelled_at"] is not None
-        or row["queue_cancel_requested"] is not None
+        row["job_cancel_requested"] is not None or row["queue_cancel_requested"] is not None
     )
     if generation_prompt is not None and job_prompt is not None and generation_prompt != job_prompt:
         return _result(
@@ -74,28 +72,24 @@ def _classify(row: sa.RowMapping, has_artifact: bool) -> dict[str, object]:
             None,
             "ambiguous",
             "migration_prompt_id_mismatch",
-            "GenerationとJobのprompt IDが一致しません。",
             generation_prompt=generation_prompt,
             job_prompt=job_prompt,
         )
     if has_artifact and not {generation_status, job_status} & {"failed", "cancelled"}:
-        return _result("completed", "completed", prompt, "submitted", None, None)
-    if generation_status == job_status and generation_status in TERMINAL_STATES:
-        return _result(generation_status, job_status, prompt, _terminal_queue(queue_state, prompt))
-    terminal_states = {
-        status for status in (generation_status, job_status) if status in TERMINAL_STATES
-    }
-    if terminal_states:
-        target = (
-            "cancelled"
-            if "cancelled" in terminal_states
-            else "failed"
-            if "failed" in terminal_states
-            else "completed"
-        )
-        return _result(target, target, prompt, _terminal_queue(queue_state, prompt))
+        return _result("completed", "completed", prompt, "submitted")
     if row["job_cancelled_at"] is not None:
-        return _result("cancelled", "cancelled", prompt, _terminal_queue(queue_state, prompt))
+        return _result("cancelled", "cancelled", prompt, "submitted" if prompt else queue_state)
+    if generation_status == job_status == "completed":
+        return _result("completed", "completed", prompt, "submitted" if prompt else queue_state)
+    if generation_status == job_status == "cancelled":
+        return _result("cancelled", "cancelled", prompt, "submitted" if prompt else queue_state)
+    if generation_status == job_status == "failed":
+        return _result("failed", "failed", prompt, "submitted" if prompt else queue_state)
+    if (
+        any(value is not None for value in (row["generation_error_code"], row["job_error_code"]))
+        and not has_artifact
+    ):
+        return _result("failed", "failed", prompt, "ambiguous", "migration_status_mismatch")
     if (
         has_cancel_request
         and generation_status == job_status == "pending"
@@ -103,28 +97,21 @@ def _classify(row: sa.RowMapping, has_artifact: bool) -> dict[str, object]:
         and prompt is None
     ):
         return _result("cancelled", "cancelled", None, "ready")
-    if queue_state in {"submitting", "ambiguous"} or (has_cancel_request and prompt is None):
+    if has_cancel_request or queue_state in {"submitting", "ambiguous"}:
         return _result(
             generation_status,
             job_status,
             prompt,
             "ambiguous",
             "migration_status_ambiguous",
-            "送信結果またはキャンセル結果を安全に確定できません。",
         )
     if prompt is not None:
         target = "running" if "running" in {generation_status, job_status} else "queued"
         return _result(target, target, prompt, "submitted")
-    if generation_status == job_status == "pending" and queue_state == "ready":
-        return _result("pending", "pending", None, queue_state)
-    return _result(
-        "failed",
-        "failed",
-        None,
-        "ambiguous",
-        "migration_status_mismatch",
-        "GenerationとJobの状態を安全に復元できません。",
-    )
+    if generation_status in TERMINAL_STATES or job_status in TERMINAL_STATES:
+        target = "cancelled" if "cancelled" in {generation_status, job_status} else "failed"
+        return _result(target, target, prompt, queue_state)
+    return _result("failed", "failed", None, "ambiguous", "migration_status_mismatch")
 
 
 def _result(
@@ -133,7 +120,6 @@ def _result(
     prompt: str | None,
     queue_state: str,
     error_code: str | None = None,
-    error_summary: str | None = None,
     *,
     generation_prompt: str | None = None,
     job_prompt: str | None = None,
@@ -146,16 +132,19 @@ def _result(
         "job_prompt": prompt if job_prompt is None else job_prompt,
         "queue_state": queue_state,
         "error_code": error_code,
-        "error_summary": error_summary,
     }
 
 
-def _write_pair(bind: sa.Connection, row: sa.RowMapping, result: dict[str, object]) -> None:
+def _write_row(bind: sa.Connection, row: sa.RowMapping, result: dict[str, object]) -> None:
+    terminal_at = row["generation_updated_at"] or row["job_updated_at"] or row["queue_updated_at"]
     error_code = result["error_code"] or row["generation_error_code"] or row["job_error_code"]
     error_summary = (
-        result["error_summary"] or row["generation_error_summary"] or row["job_error_summary"]
+        "GenerationとJobのprompt IDが一致しません。"
+        if result["error_code"] == "migration_prompt_id_mismatch"
+        else "GenerationとJobの状態を安全に復元できません。"
+        if result["error_code"] in {"migration_status_mismatch", "migration_status_ambiguous"}
+        else row["generation_error_summary"] or row["job_error_summary"]
     )
-    terminal_at = row["generation_updated_at"] or row["job_updated_at"] or row["queue_updated_at"]
     for table, row_key, status_key in (
         ("generations", "generation_id", "generation_status"),
         ("generation_jobs", "job_id", "job_status"),
@@ -208,7 +197,3 @@ def _write_pair(bind: sa.Connection, row: sa.RowMapping, result: dict[str, objec
 
 def _prompt(value: object) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
-
-
-def _terminal_queue(queue_state: str, prompt: str | None) -> str:
-    return "submitted" if prompt is not None else queue_state

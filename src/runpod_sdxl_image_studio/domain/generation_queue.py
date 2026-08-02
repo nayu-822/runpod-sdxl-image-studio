@@ -33,6 +33,18 @@ class ReconciliationOutcome(StrEnum):
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
+    NOT_FOUND = "not_found"
+    UNAVAILABLE = "unavailable"
+
+
+class CancellationOutcome(StrEnum):
+    """Typed result of requesting and verifying a ComfyUI cancellation."""
+
+    CANCELLED = "cancelled"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    IN_PROGRESS = "in_progress"
     NOT_FOUND = "not_found"
     UNAVAILABLE = "unavailable"
 
@@ -84,6 +96,7 @@ class GenerationQueueItem:
 
 __all__ = [
     "BatchSeedStrategy",
+    "CancellationOutcome",
     "GenerationBatch",
     "GenerationQueueEntry",
     "GenerationQueueItem",

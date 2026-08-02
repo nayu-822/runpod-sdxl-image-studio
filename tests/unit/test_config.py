@@ -62,3 +62,19 @@ def test_settings_loading_does_not_create_directories(
     Settings(_env_file=None)
 
     assert not data_dir.exists()
+
+
+def test_metadata_request_wait_must_fit_inside_download_stale_threshold() -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            image_download_stale_after_seconds=40,
+            metadata_request_max_wait_seconds=40,
+        )
+
+    settings = Settings(
+        _env_file=None,
+        image_download_stale_after_seconds=120,
+        metadata_request_max_wait_seconds=40,
+    )
+    assert settings.image_download_stale_after_seconds == 120

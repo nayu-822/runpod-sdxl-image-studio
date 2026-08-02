@@ -157,7 +157,7 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
             scheduler = gr.Dropdown([], label="scheduler", interactive=False)
         with gr.Row():
             vae = gr.Dropdown(
-                [("Checkpoint内蔵VAE", None)],  # type: ignore[list-item]
+                [("Checkpoint内蔵VAE", None)],
                 value=None,
                 label="VAE",
                 interactive=True,
@@ -707,7 +707,7 @@ def _capability_updates(
             ]
             updates.append(
                 gr.Dropdown(
-                    choices=vae_choices,  # type: ignore[arg-type]
+                    choices=vae_choices,
                     value=current_value if current_value in available_choices else None,
                     label=component.label,
                     interactive=True,

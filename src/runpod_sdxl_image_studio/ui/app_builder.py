@@ -264,6 +264,12 @@ def build_app(
 
     async def reconcile_queue_item(item: GenerationQueueItem) -> ReconciliationOutcome:
         queue_item = item
+        if (
+            queue_item.job.prompt_id is not None
+            and queue_item.generation.comfy_prompt_id is not None
+            and queue_item.job.prompt_id != queue_item.generation.comfy_prompt_id
+        ):
+            return ReconciliationOutcome.UNAVAILABLE
         prompt_id = queue_item.job.prompt_id or queue_item.generation.comfy_prompt_id
         if not prompt_id:
             return ReconciliationOutcome.UNAVAILABLE

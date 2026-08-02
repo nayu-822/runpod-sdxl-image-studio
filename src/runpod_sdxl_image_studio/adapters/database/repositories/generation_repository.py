@@ -842,16 +842,16 @@ class GenerationJobRepository(GenerationJobRepositoryProtocol):
                     if status is GenerationStatus.RUNNING and row.started_at is None:
                         row.started_at = datetime.now(UTC)
                 if "prompt_id" in values:
-                    row.comfy_prompt_id = values["prompt_id"]  # type: ignore[assignment]
+                    row.comfy_prompt_id = values["prompt_id"]
                 if "value" in values:
-                    row.progress_value = values["value"]  # type: ignore[assignment]
-                    row.progress_maximum = values["maximum"]  # type: ignore[assignment]
-                    row.current_node = values["node"]  # type: ignore[assignment]
+                    row.progress_value = values["value"]
+                    row.progress_maximum = values["maximum"]
+                    row.current_node = values["node"]
                 if "completed_at" in values:
-                    row.completed_at = values["completed_at"]  # type: ignore[assignment]
+                    row.completed_at = values["completed_at"]
                 if "error_code" in values:
-                    row.error_code = values["error_code"]  # type: ignore[assignment]
-                    row.error_summary = values["error_summary"]  # type: ignore[assignment]
+                    row.error_code = values["error_code"]
+                    row.error_summary = values["error_summary"]
                 row.updated_at = datetime.now(UTC)
                 session.flush()
                 return _job_domain(row)

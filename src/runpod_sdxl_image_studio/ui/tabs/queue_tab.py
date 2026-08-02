@@ -29,26 +29,26 @@ def build_queue_tab() -> tuple[
     gr.Button,
     gr.Button,
 ]:
-    gr.Markdown("## Generation Queue")
+    gr.Markdown("## 生成キュー")
     with gr.Row():
-        refresh = gr.Button("Refresh queue", variant="primary")
+        refresh = gr.Button("キューを更新", variant="primary")
         status = gr.Dropdown(
-            [("all", ""), *((item.value, item.value) for item in GenerationStatus)],
+            [("すべて", ""), *((_status_label(item), item.value) for item in GenerationStatus)],
             value="",
-            label="Status",
+            label="状態",
         )
-        batch_filter = gr.Textbox(label="Batch ID", placeholder="optional UUID")
-    jobs = gr.Dropdown([], label="Jobs", allow_custom_value=False)
-    detail = gr.Markdown("Select a job")
+        batch_filter = gr.Textbox(label="バッチ ID", placeholder="任意のUUID")
+    jobs = gr.Dropdown([], label="ジョブ", allow_custom_value=False)
+    detail = gr.Markdown("ジョブを選択してください")
     with gr.Row():
-        cancel = gr.Button("Cancel selected job")
-        retry = gr.Button("Retry selected job")
-        retry_batch = gr.Button("Retry failed batch")
-    ambiguous_prompt_id = gr.Textbox(label="Ambiguous prompt ID", visible=False, interactive=False)
+        cancel = gr.Button("選択ジョブをキャンセル")
+        retry = gr.Button("選択ジョブを再試行")
+        retry_batch = gr.Button("失敗バッチを再試行")
+    ambiguous_prompt_id = gr.Textbox(label="曖昧なprompt ID", visible=False, interactive=False)
     with gr.Row():
-        ambiguous_link = gr.Button("Link prompt ID", visible=False, interactive=False)
+        ambiguous_link = gr.Button("prompt IDを紐付け", visible=False, interactive=False)
         ambiguous_fail = gr.Button(
-            "Confirm prompt absent as failed",
+            "prompt不在を確認して失敗確定",
             visible=False,
             interactive=False,
             variant="stop",
@@ -80,7 +80,7 @@ def make_queue_refresh_handler(
             items = service.list_jobs(statuses=statuses, batch_id=batch_id)
             choices = [(_queue_label(item), str(item.generation.id)) for item in items]
             return gr.Dropdown(choices=choices, value=choices[0][1] if choices else None), (
-                f"{len(choices)} jobs"
+                f"{len(choices)}件のジョブ"
             )
         except (GenerationQueueServiceError, ValueError) as exc:
             return gr.skip(), str(exc)
@@ -93,15 +93,15 @@ def make_queue_detail_handler(
 ) -> Callable[[str | None], tuple[str, object, object, object]]:
     def handler(selected: str | None) -> tuple[str, object, object, object]:
         if not selected:
-            return ("Select a job", *_ambiguous_controls(None))
+            return ("ジョブを選択してください", *_ambiguous_controls(None))
         try:
             item = service.get_job_detail(UUID(selected))
             return (
-                _queue_detail(item) if item is not None else "Job was not found",
+                _queue_detail(item) if item is not None else "ジョブが見つかりませんでした",
                 *_ambiguous_controls(item),
             )
         except (GenerationQueueServiceError, ValueError):
-            return ("Job detail could not be loaded", *_ambiguous_controls(None))
+            return ("ジョブ詳細を読み込めませんでした", *_ambiguous_controls(None))
 
     return handler
 
@@ -111,13 +111,13 @@ def make_queue_cancel_handler(
 ) -> Callable[[str | None], Awaitable[tuple[object, str]]]:
     async def handler(selected: str | None) -> tuple[object, str]:
         if not selected:
-            return gr.Button(interactive=True), "Select a job to cancel"
+            return gr.Button(interactive=True), "キャンセルするジョブを選択してください"
         try:
             item = await service.cancel(UUID(selected))
             message = (
-                "Cancellation completed"
+                "キャンセルが完了しました"
                 if item.generation.status is GenerationStatus.CANCELLED
-                else "Cancellation requested; the worker will confirm it"
+                else "キャンセルを要求しました。workerが状態を確認します"
             )
             return gr.Button(interactive=True), message
         except (GenerationQueueServiceError, ValueError) as exc:
@@ -131,10 +131,12 @@ def make_queue_retry_handler(
 ) -> Callable[[str | None], tuple[object, str]]:
     def handler(selected: str | None) -> tuple[object, str]:
         if not selected:
-            return gr.Button(interactive=True), "Select a job to retry"
+            return gr.Button(interactive=True), "再試行するジョブを選択してください"
         try:
             result = service.retry(UUID(selected))
-            return gr.Button(interactive=True), f"Retry queued: sequence={result.queue_position}"
+            return gr.Button(
+                interactive=True
+            ), f"再試行をキューへ追加しました: 順序={result.queue_position}"
         except (GenerationQueueServiceError, ValueError) as exc:
             return gr.Button(interactive=True), str(exc)
 
@@ -146,13 +148,17 @@ def make_queue_retry_batch_handler(
 ) -> Callable[[str | None], tuple[object, str]]:
     def handler(selected: str | None) -> tuple[object, str]:
         if not selected:
-            return gr.Button(interactive=True), "Select a batch job"
+            return gr.Button(interactive=True), "バッチのジョブを選択してください"
         try:
             item = service.get_job_detail(UUID(selected))
             if item is None or item.entry.batch_id is None:
-                return gr.Button(interactive=True), "Select a batch job"
+                return gr.Button(interactive=True), "バッチのジョブを選択してください"
             result = service.retry_failed_batch(item.entry.batch_id)
-            message = "No failed jobs" if result is None else f"Queued {len(result.items)} retries"
+            message = (
+                "失敗ジョブはありません"
+                if result is None
+                else f"{len(result.items)}件の再試行をキューへ追加しました"
+            )
             return gr.Button(interactive=True), message
         except (GenerationQueueServiceError, ValueError) as exc:
             return gr.Button(interactive=True), str(exc)
@@ -166,13 +172,13 @@ def make_queue_ambiguous_link_handler(
     def handler(selected: str | None, prompt_id: str | None) -> tuple[object, object, object, str]:
         try:
             if not selected:
-                raise GenerationQueueServiceError("Select an ambiguous job")
+                raise GenerationQueueServiceError("曖昧なジョブを選択してください")
             item = service.link_ambiguous_prompt(UUID(selected), prompt_id or "")
             return (
                 gr.Textbox(value="", visible=False, interactive=False),
                 gr.Button(visible=False, interactive=False),
                 gr.Button(visible=False, interactive=False),
-                f"Prompt linked: `{item.job.prompt_id}`",
+                f"promptを紐付けました: `{item.job.prompt_id}`",
             )
         except (GenerationQueueServiceError, ValueError) as exc:
             return gr.skip(), gr.Button(interactive=True), gr.Button(interactive=True), str(exc)
@@ -186,13 +192,13 @@ def make_queue_ambiguous_fail_handler(
     def handler(selected: str | None) -> tuple[object, object, object, str]:
         try:
             if not selected:
-                raise GenerationQueueServiceError("Select an ambiguous job")
+                raise GenerationQueueServiceError("曖昧なジョブを選択してください")
             item = service.fail_ambiguous_prompt(UUID(selected))
             return (
                 gr.Textbox(value="", visible=False, interactive=False),
                 gr.Button(visible=False, interactive=False),
                 gr.Button(visible=False, interactive=False),
-                f"Prompt absence confirmed; job failed: `{item.generation.id}`",
+                f"prompt不在を確認し、ジョブを失敗確定しました: `{item.generation.id}`",
             )
         except (GenerationQueueServiceError, ValueError) as exc:
             return gr.skip(), gr.Button(interactive=True), gr.Button(interactive=True), str(exc)
@@ -202,35 +208,46 @@ def make_queue_ambiguous_fail_handler(
 
 def _queue_label(queue_item: GenerationQueueItem) -> str:
     return (
-        f"#{queue_item.entry.sequence} {queue_item.generation.status.value} "
+        f"#{queue_item.entry.sequence} {_status_label(queue_item.generation.status)} "
         f"seed={queue_item.generation.settings_snapshot.seed} {queue_item.generation.id}"
     )
 
 
+def _status_label(status: GenerationStatus) -> str:
+    return {
+        GenerationStatus.PENDING: "待機中",
+        GenerationStatus.QUEUED: "キュー済み",
+        GenerationStatus.RUNNING: "実行中",
+        GenerationStatus.COMPLETED: "完了",
+        GenerationStatus.FAILED: "失敗",
+        GenerationStatus.CANCELLED: "キャンセル済み",
+    }[status]
+
+
 def _queue_detail(item: GenerationQueueItem | None) -> str:
     if item is None:
-        return "Job was not found"
+        return "ジョブが見つかりませんでした"
     snapshot = item.generation.settings_snapshot
-    batch = f"\nBatch: `{item.batch.name}` index={item.entry.batch_index}" if item.batch else ""
-    cancel = "\nCancellation requested" if item.entry.cancel_requested_at else ""
-    error = f"\nError: `{item.generation.error_summary}`" if item.generation.error_summary else ""
+    batch = f"\nバッチ: `{item.batch.name}` 番号={item.entry.batch_index}" if item.batch else ""
+    cancel = "\nキャンセル要求済み" if item.entry.cancel_requested_at else ""
+    error = f"\nエラー: `{item.generation.error_summary}`" if item.generation.error_summary else ""
     ambiguous = (
-        "\n**Ambiguous prompt is never resent automatically; use an explicit resolution action.**"
+        "\n**曖昧なpromptは自動再送信されません。明示的な解決操作を使用してください。**"
         if item.entry.submission_state.value == "ambiguous"
         else ""
     )
     return (
-        f"**Sequence:** `{item.entry.sequence}` **Status:** `{item.generation.status.value}`\n"
+        f"**順序:** `{item.entry.sequence}` **状態:** `{item.generation.status.value}`\n"
         f"Generation: `{item.generation.id}` Job: `{item.job.id}`{batch}{cancel}\n"
-        f"Submission: `{item.entry.submission_state.value}` "
+        f"送信状態: `{item.entry.submission_state.value}` "
         f"token=`{item.entry.submission_token or '-'}` "
-        f"started=`{item.entry.submission_started_at or '-'}`\n"
-        f"Prompt IDs: generation=`{item.generation.comfy_prompt_id or '-'}` "
+        f"開始=`{item.entry.submission_started_at or '-'}`\n"
+        f"prompt ID: generation=`{item.generation.comfy_prompt_id or '-'}` "
         f"job=`{item.job.prompt_id or '-'}`{ambiguous}\n"
         f"Checkpoint: `{snapshot.checkpoint_name}` Seed: `{snapshot.seed}` "
-        f"Size: `{snapshot.width}x{snapshot.height}` LoRA: `{len(snapshot.loras)}`\n"
-        f"Progress: `{item.job.progress_value}/{item.job.progress_maximum}` "
-        f"Node: `{item.job.current_node or '-'}`{error}"
+        f"サイズ: `{snapshot.width}x{snapshot.height}` LoRA: `{len(snapshot.loras)}`\n"
+        f"進捗: `{item.job.progress_value}/{item.job.progress_maximum}` "
+        f"ノード: `{item.job.current_node or '-'}`{error}"
     )
 
 

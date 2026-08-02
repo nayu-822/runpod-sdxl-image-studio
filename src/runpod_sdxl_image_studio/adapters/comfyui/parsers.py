@@ -14,6 +14,7 @@ from runpod_sdxl_image_studio.adapters.comfyui.models import (
     ComfyUIOutputImage,
     ComfyUISystemStats,
     PromptHistory,
+    PromptHistoryStatus,
     QueuedPrompt,
 )
 
@@ -138,15 +139,21 @@ def parse_prompt_history(payload: Mapping[str, object], prompt_id: str) -> Promp
 
     prompt_entry = payload.get(prompt_id)
     if not isinstance(prompt_entry, Mapping):
-        return PromptHistory(prompt_id, False, False, (), None, False)
+        return PromptHistory(
+            prompt_id,
+            False,
+            False,
+            (),
+            None,
+            False,
+            PromptHistoryStatus.NOT_FOUND,
+        )
 
     status_payload = _mapping_value(prompt_entry, "status") or {}
     status_string = _optional_string(status_payload.get("status_str"))
-    is_failed = status_string in {"error", "failed"}
-    is_completed = bool(status_payload.get("completed")) or status_string in {
-        "success",
-        "completed",
-    }
+    status = _parse_history_status(status_payload, status_string)
+    is_failed = status is PromptHistoryStatus.FAILED
+    is_completed = status is PromptHistoryStatus.COMPLETED
     outputs_payload = _mapping_value(prompt_entry, "outputs") or {}
     outputs: list[ComfyUIOutputImage] = []
     for node_output in outputs_payload.values():
@@ -166,7 +173,49 @@ def parse_prompt_history(payload: Mapping[str, object], prompt_id: str) -> Promp
             outputs.append(ComfyUIOutputImage(filename, subfolder, output_type))
 
     error_message = "ComfyUIで画像生成に失敗しました" if is_failed else None
-    return PromptHistory(prompt_id, is_completed, is_failed, tuple(outputs), error_message)
+    return PromptHistory(
+        prompt_id,
+        is_completed,
+        is_failed,
+        tuple(outputs),
+        error_message,
+        True,
+        status,
+    )
+
+
+def _parse_history_status(
+    status_payload: Mapping[str, object], status_string: str | None
+) -> PromptHistoryStatus:
+    """Map known ComfyUI status and message names without exposing raw JSON."""
+
+    if _contains_interruption(status_payload.get("messages")):
+        return PromptHistoryStatus.INTERRUPTED
+    normalized = status_string.casefold() if status_string is not None else None
+    if normalized in {"success", "completed"} or bool(status_payload.get("completed")):
+        return PromptHistoryStatus.COMPLETED
+    if normalized in {"error", "failed"}:
+        return PromptHistoryStatus.FAILED
+    if normalized in {"pending", "running", "executing", "in_progress"}:
+        return PromptHistoryStatus.IN_PROGRESS
+    if normalized in {"execution_interrupted", "interrupted", "cancelled", "canceled"}:
+        return PromptHistoryStatus.INTERRUPTED
+    return PromptHistoryStatus.UNKNOWN
+
+
+def _contains_interruption(value: object) -> bool:
+    if isinstance(value, str):
+        return value.casefold() in {
+            "execution_interrupted",
+            "interrupted",
+            "cancelled",
+            "canceled",
+        }
+    if isinstance(value, Mapping):
+        return any(_contains_interruption(child) for child in value.values())
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return any(_contains_interruption(child) for child in value)
+    return False
 
 
 def _extract_choices(

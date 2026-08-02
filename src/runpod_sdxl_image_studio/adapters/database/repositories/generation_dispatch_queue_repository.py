@@ -153,6 +153,13 @@ class GenerationDispatchQueueRepositoryProtocol(Protocol):
         now: datetime | None = None,
     ) -> GenerationQueueItem: ...
 
+    def mark_prompt_id_mismatch(
+        self,
+        generation_id: UUID,
+        *,
+        now: datetime | None = None,
+    ) -> GenerationQueueItem: ...
+
 
 class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtocol):
     """Atomic queue persistence that does not depend on ``FOR UPDATE``."""
@@ -388,7 +395,7 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
                             lease_expires_at=lease_until,
                             updated_at=timestamp,
                         )
-                    ).rowcount  # type: ignore[attr-defined]
+                    ).rowcount
                     if claimed != 1:
                         continue
                     job = session.get(GenerationJobModel, candidate.job_id)
@@ -676,7 +683,14 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
                 if generation is None or job is None:
                     raise GenerationDispatchQueueRepositoryError("queue entry is orphaned")
                 status = GenerationStatus(generation.status)
-                if status in {GenerationStatus.COMPLETED, GenerationStatus.FAILED}:
+                job_status = GenerationStatus(job.status)
+                if status in {
+                    GenerationStatus.COMPLETED,
+                    GenerationStatus.FAILED,
+                } or job_status in {
+                    GenerationStatus.COMPLETED,
+                    GenerationStatus.FAILED,
+                }:
                     return _queue_item(session, entry, generation, job)
                 if status is GenerationStatus.CANCELLED:
                     return _queue_item(session, entry, generation, job)
@@ -925,6 +939,42 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
         except (SQLAlchemyError, ValueError) as exc:
             raise GenerationDispatchQueueRepositoryError(
                 "queue reconciliation failure could not be persisted"
+            ) from exc
+
+    def mark_prompt_id_mismatch(
+        self,
+        generation_id: UUID,
+        *,
+        now: datetime | None = None,
+    ) -> GenerationQueueItem:
+        """Quarantine a pair whose persisted prompt IDs cannot be reconciled safely."""
+
+        timestamp = _utc(now or datetime.now(UTC))
+        try:
+            with session_scope(self._session_factory) as session:
+                entry, generation, job = _load_queue_rows(session, generation_id)
+                entry.submission_state = SubmissionState.AMBIGUOUS.value
+                generation.error_code = "migration_prompt_id_mismatch"
+                generation.error_summary = "GenerationとJobのprompt IDが一致しません。"
+                generation.updated_at = timestamp
+                job.error_code = "migration_prompt_id_mismatch"
+                job.error_summary = "GenerationとJobのprompt IDが一致しません。"
+                job.updated_at = timestamp
+                entry.worker_id = None
+                entry.claimed_at = None
+                entry.lease_expires_at = None
+                entry.updated_at = timestamp
+                job.worker_id = None
+                job.claimed_at = None
+                job.lease_expires_at = None
+                job.updated_at = timestamp
+                session.flush()
+                return _queue_item(session, entry, generation, job)
+        except GenerationDispatchQueueRepositoryError:
+            raise
+        except (SQLAlchemyError, ValueError) as exc:
+            raise GenerationDispatchQueueRepositoryError(
+                "prompt ID mismatch could not be quarantined"
             ) from exc
 
 
