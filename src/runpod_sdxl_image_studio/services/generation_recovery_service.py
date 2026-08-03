@@ -24,6 +24,7 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_reposito
 )
 from runpod_sdxl_image_studio.config import Settings, get_settings
 from runpod_sdxl_image_studio.domain.generation import Generation, GenerationErrorCode
+from runpod_sdxl_image_studio.domain.generation_queue import OptionalArtifactRepairOutcome
 from runpod_sdxl_image_studio.domain.job import GenerationJob
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,10 @@ class CompletedPromptHandler(Protocol):
     def __call__(self, generation_id: UUID, prompt_id: str) -> Awaitable[bool]: ...
 
 
+class CompletedOptionalArtifactRepairHandler(Protocol):
+    def __call__(self, generation_id: UUID) -> OptionalArtifactRepairOutcome: ...
+
+
 class GenerationRecoveryService:
     def __init__(
         self,
@@ -50,6 +55,7 @@ class GenerationRecoveryService:
         completed_prompt_handler: CompletedPromptHandler | None = None,
         failure_repository: GenerationFailureRepositoryProtocol | None = None,
         cancellation_repository: GenerationCancellationRepositoryProtocol | None = None,
+        completed_optional_artifact_handler: CompletedOptionalArtifactRepairHandler | None = None,
     ) -> None:
         app_settings = settings or get_settings()
         self._client = client
@@ -60,6 +66,7 @@ class GenerationRecoveryService:
         self._reconciliation_grace_seconds = app_settings.reconciliation_grace_seconds
         self._max_items = app_settings.recovery_max_items
         self._completed_prompt_handler = completed_prompt_handler
+        self._completed_optional_artifact_handler = completed_optional_artifact_handler
         self._failure_repository = failure_repository
         self._cancellation_repository = cancellation_repository
 
@@ -181,6 +188,37 @@ class GenerationRecoveryService:
                     "Recovery warning generation=%s error=%s", job.generation_id, type(exc).__name__
                 )
                 messages.append(f"{job.generation_id}: 状態を維持しました")
+        if self._completed_optional_artifact_handler is not None:
+            remaining = max(0, self._max_items - len(jobs))
+            if remaining > 0:
+                try:
+                    completed_ids = (
+                        self._generation_repository.list_completed_optional_artifact_repairs(
+                            remaining
+                        )
+                    )
+                except GenerationRepositoryError as exc:
+                    logger.warning(
+                        "Completed optional artifact candidates could not be read error=%s",
+                        type(exc).__name__,
+                    )
+                    completed_ids = ()
+                for generation_id in completed_ids:
+                    try:
+                        outcome = self._completed_optional_artifact_handler(generation_id)
+                    except Exception as exc:  # noqa: BLE001 - one repair must not stop recovery
+                        logger.warning(
+                            "Completed optional artifact repair failed generation=%s error=%s",
+                            generation_id,
+                            type(exc).__name__,
+                        )
+                        continue
+                    if outcome is OptionalArtifactRepairOutcome.REPAIRED:
+                        messages.append(f"{generation_id}: optional artifacts repaired")
+                    elif outcome is OptionalArtifactRepairOutcome.DEFERRED:
+                        messages.append(f"{generation_id}: optional artifacts deferred")
+                    elif outcome is OptionalArtifactRepairOutcome.UNAVAILABLE:
+                        messages.append(f"{generation_id}: optional artifacts unavailable")
         return tuple(messages)
 
     def _is_prompt_missing_stale(

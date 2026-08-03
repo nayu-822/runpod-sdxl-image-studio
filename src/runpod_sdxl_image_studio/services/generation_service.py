@@ -65,7 +65,10 @@ from runpod_sdxl_image_studio.domain.generation import (
     StoredImage,
 )
 from runpod_sdxl_image_studio.domain.generation_artifact import ArtifactType, GenerationArtifact
-from runpod_sdxl_image_studio.domain.generation_queue import ReconciliationOutcome
+from runpod_sdxl_image_studio.domain.generation_queue import (
+    OptionalArtifactRepairOutcome,
+    ReconciliationOutcome,
+)
 from runpod_sdxl_image_studio.domain.generation_settings import (
     MAX_SEED,
     RANDOM_SEED,
@@ -228,6 +231,115 @@ class GenerationService:
         """Return a result while the process is alive."""
 
         return self._results.get(generation_id)
+
+    def repair_optional_artifacts(self, generation_id: UUID) -> OptionalArtifactRepairOutcome:
+        """Repair missing metadata or thumbnails for one already completed generation."""
+
+        if (
+            self._generation_repository is None
+            or self._job_repository is None
+            or self._artifact_repository is None
+        ):
+            return OptionalArtifactRepairOutcome.UNAVAILABLE
+        try:
+            generation = self._generation_repository.get_by_id(generation_id)
+            job = self._job_repository.get_by_generation(generation_id)
+            if generation is None or job is None:
+                return OptionalArtifactRepairOutcome.UNAVAILABLE
+            artifacts = self._artifact_repository.list_by_generation(generation_id)
+        except (GenerationRepositoryError, OSError, ValueError) as exc:
+            logger.warning(
+                "Optional artifact repair lookup failed generation=%s error=%s",
+                generation_id,
+                type(exc).__name__,
+            )
+            return OptionalArtifactRepairOutcome.UNAVAILABLE
+
+        existing_types = {artifact.artifact_type for artifact in artifacts}
+        missing_types = {ArtifactType.METADATA, ArtifactType.THUMBNAIL} - existing_types
+        if not missing_types:
+            return OptionalArtifactRepairOutcome.ALREADY_COMPLETE
+        if (
+            generation.status is not GenerationStatus.COMPLETED
+            or job.status is not GenerationStatus.COMPLETED
+            or generation.completed_at is None
+            or job.completed_at is None
+            or _utc(generation.completed_at) != _utc(job.completed_at)
+        ):
+            return OptionalArtifactRepairOutcome.DEFERRED
+
+        primary_artifact = next(
+            (artifact for artifact in artifacts if artifact.artifact_type is ArtifactType.IMAGE),
+            None,
+        )
+        if primary_artifact is None:
+            return OptionalArtifactRepairOutcome.DEFERRED
+        try:
+            stored_image = self._stored_image_from_artifact(primary_artifact)
+            settings = generation.settings_snapshot.to_generation_settings()
+            upscale_snapshot = None
+            if generation.kind is GenerationKind.UPSCALE:
+                if self._upscale_settings_repository is None:
+                    return OptionalArtifactRepairOutcome.DEFERRED
+                upscale_snapshot = self._upscale_settings_repository.get_by_generation(
+                    generation_id
+                )
+                if upscale_snapshot is None:
+                    return OptionalArtifactRepairOutcome.DEFERRED
+            self._persist_optional_artifacts(
+                job,
+                settings,
+                stored_image,
+                generation.completed_at,
+                generation.kind,
+                generation.parent_generation_id,
+                existing_artifacts=artifacts,
+                persisted_upscale_snapshot=upscale_snapshot,
+                load_upscale_settings=False,
+            )
+            repaired_artifacts = self._artifact_repository.list_by_generation(generation_id)
+        except (
+            GenerationRepositoryError,
+            OSError,
+            StorageError,
+            UpscaleEnqueueError,
+            UpscaleSettingsRepositoryError,
+            ValueError,
+        ) as exc:
+            logger.warning(
+                "Optional artifact repair deferred generation=%s error=%s",
+                generation_id,
+                type(exc).__name__,
+            )
+            return OptionalArtifactRepairOutcome.DEFERRED
+
+        repaired_types = {artifact.artifact_type for artifact in repaired_artifacts}
+        return (
+            OptionalArtifactRepairOutcome.REPAIRED
+            if missing_types <= repaired_types
+            else OptionalArtifactRepairOutcome.DEFERRED
+        )
+
+    def _stored_image_from_artifact(self, artifact: GenerationArtifact) -> StoredImage:
+        if (
+            artifact.width is None
+            or artifact.height is None
+            or artifact.size_bytes <= 0
+            or not artifact.mime_type
+        ):
+            raise UpscaleEnqueueError(
+                "optional_artifact_primary_invalid",
+                "primary image artifact metadata is incomplete",
+            )
+        verified = verify_source_artifact(artifact, self._settings)
+        return StoredImage(
+            path=verified.path,
+            sha256=verified.sha256,
+            size_bytes=artifact.size_bytes,
+            width=verified.width,
+            height=verified.height,
+            mime_type=artifact.mime_type,
+        )
 
     async def reconcile_prompt(self, generation_id: UUID, prompt_id: str) -> ReconciliationOutcome:
         """Reconcile one existing prompt without ever submitting it again."""
@@ -1128,21 +1240,28 @@ class GenerationService:
         created_at: datetime,
         kind: GenerationKind,
         parent_generation_id: UUID | None,
+        *,
+        existing_artifacts: tuple[GenerationArtifact, ...] | None = None,
+        persisted_upscale_snapshot: UpscaleSettingsSnapshot | None = None,
+        load_upscale_settings: bool = True,
     ) -> None:
         if self._artifact_repository is None:
             return
-        try:
-            existing_types = {
-                artifact.artifact_type
-                for artifact in self._artifact_repository.list_by_generation(job.generation_id)
-            }
-        except Exception as exc:  # noqa: BLE001 - optional metadata must not change completion
-            logger.warning(
-                "Optional artifact lookup warning generation=%s error=%s",
-                job.generation_id,
-                type(exc).__name__,
-            )
-            return
+        if existing_artifacts is None:
+            try:
+                existing_types = {
+                    artifact.artifact_type
+                    for artifact in self._artifact_repository.list_by_generation(job.generation_id)
+                }
+            except Exception as exc:  # noqa: BLE001 - optional metadata must not change completion
+                logger.warning(
+                    "Optional artifact lookup warning generation=%s error=%s",
+                    job.generation_id,
+                    type(exc).__name__,
+                )
+                return
+        else:
+            existing_types = {artifact.artifact_type for artifact in existing_artifacts}
         image_path = image.path
         if self._metadata_storage is not None:
             if ArtifactType.METADATA in existing_types:
@@ -1157,15 +1276,17 @@ class GenerationService:
                         parent_generation_id,
                         created_at,
                     )
-                    if (
-                        kind is GenerationKind.UPSCALE
-                        and self._upscale_settings_repository is not None
-                    ):
-                        upscale_snapshot = self._upscale_settings_repository.get_by_generation(
-                            job.generation_id
-                        )
-                        if upscale_snapshot is not None:
-                            payload["upscale"] = upscale_snapshot.model_dump(mode="json")
+                    if kind is GenerationKind.UPSCALE and load_upscale_settings:
+                        if self._upscale_settings_repository is None:
+                            upscale_snapshot = None
+                        else:
+                            upscale_snapshot = self._upscale_settings_repository.get_by_generation(
+                                job.generation_id
+                            )
+                    else:
+                        upscale_snapshot = persisted_upscale_snapshot
+                    if upscale_snapshot is not None:
+                        payload["upscale"] = upscale_snapshot.model_dump(mode="json")
                     sidecar_path = self._metadata_storage.save_for_image(image_path, payload)
                     self._artifact_repository.add(
                         GenerationArtifact(
@@ -1285,6 +1406,10 @@ class GenerationService:
 
 def _resolve_seed(seed: int) -> int:
     return secrets.randbelow(MAX_SEED + 1) if seed == RANDOM_SEED else seed
+
+
+def _utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
 def _validate_generation(

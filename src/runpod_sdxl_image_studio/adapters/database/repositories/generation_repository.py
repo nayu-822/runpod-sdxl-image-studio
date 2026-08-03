@@ -77,6 +77,8 @@ class GenerationRepositoryProtocol(Protocol):
 
     def get_by_prompt_id(self, prompt_id: str) -> Generation | None: ...
 
+    def list_completed_optional_artifact_repairs(self, limit: int = 50) -> tuple[UUID, ...]: ...
+
     def list_history(self, query: GenerationHistoryFilter) -> GenerationHistoryPage: ...
 
     def set_favorite(self, generation_id: UUID, favorite: bool) -> Generation: ...
@@ -196,6 +198,45 @@ class GenerationRepository(GenerationRepositoryProtocol):
                 return _generation_domain(row) if row is not None else None
         except (SQLAlchemyError, SnapshotError) as exc:
             raise GenerationRepositoryError("generation could not be read") from exc
+
+    def list_completed_optional_artifact_repairs(self, limit: int = 50) -> tuple[UUID, ...]:
+        """Find completed pairs with a primary image and a missing optional artifact."""
+
+        bounded_limit = min(max(1, limit), 100)
+        primary_exists = exists().where(
+            GenerationArtifactModel.generation_id == GenerationModel.id,
+            GenerationArtifactModel.artifact_type == ArtifactType.IMAGE.value,
+        )
+        metadata_exists = exists().where(
+            GenerationArtifactModel.generation_id == GenerationModel.id,
+            GenerationArtifactModel.artifact_type == ArtifactType.METADATA.value,
+        )
+        thumbnail_exists = exists().where(
+            GenerationArtifactModel.generation_id == GenerationModel.id,
+            GenerationArtifactModel.artifact_type == ArtifactType.THUMBNAIL.value,
+        )
+        try:
+            with session_scope(self._session_factory) as session:
+                rows = session.scalars(
+                    select(GenerationModel.id)
+                    .join(
+                        GenerationJobModel,
+                        GenerationJobModel.generation_id == GenerationModel.id,
+                    )
+                    .where(
+                        GenerationModel.status == GenerationStatus.COMPLETED.value,
+                        GenerationJobModel.status == GenerationStatus.COMPLETED.value,
+                        primary_exists,
+                        or_(~metadata_exists, ~thumbnail_exists),
+                    )
+                    .order_by(GenerationModel.completed_at.asc(), GenerationModel.id.asc())
+                    .limit(bounded_limit)
+                ).all()
+                return tuple(UUID(row) for row in rows)
+        except (SQLAlchemyError, ValueError) as exc:
+            raise GenerationRepositoryError(
+                "completed optional artifact repairs could not be read"
+            ) from exc
 
     def list_history(self, query: GenerationHistoryFilter) -> GenerationHistoryPage:
         offset = max(0, query.offset)

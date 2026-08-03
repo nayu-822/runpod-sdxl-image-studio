@@ -298,6 +298,7 @@ def build_app(
         artifact_repository,
         app_settings,
         completed_prompt_handler=generation_service.recover_prompt,
+        completed_optional_artifact_handler=generation_service.repair_optional_artifacts,
         failure_repository=failure_repository,
         cancellation_repository=GenerationCancellationRepository(session_factory),
     )

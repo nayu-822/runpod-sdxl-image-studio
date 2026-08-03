@@ -38,6 +38,15 @@ class ReconciliationOutcome(StrEnum):
     UNAVAILABLE = "unavailable"
 
 
+class OptionalArtifactRepairOutcome(StrEnum):
+    """Outcome of repairing optional artifacts for a completed generation."""
+
+    REPAIRED = "repaired"
+    ALREADY_COMPLETE = "already_complete"
+    DEFERRED = "deferred"
+    UNAVAILABLE = "unavailable"
+
+
 class CancellationOutcome(StrEnum):
     """Typed result of requesting and verifying a ComfyUI cancellation."""
 
@@ -100,6 +109,7 @@ __all__ = [
     "GenerationBatch",
     "GenerationQueueEntry",
     "GenerationQueueItem",
+    "OptionalArtifactRepairOutcome",
     "ReconciliationOutcome",
     "SubmissionState",
 ]

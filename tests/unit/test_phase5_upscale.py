@@ -31,6 +31,7 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_progress
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_repository import (
     GenerationArtifactRepository,
     GenerationCompletionRepository,
+    GenerationFailureRepository,
     GenerationJobRepository,
     GenerationQueueRepository,
     GenerationRepository,
@@ -52,6 +53,7 @@ from runpod_sdxl_image_studio.adapters.storage.local_storage import LocalStorage
 from runpod_sdxl_image_studio.config import Settings
 from runpod_sdxl_image_studio.domain.generation import GenerationKind, GenerationStatus
 from runpod_sdxl_image_studio.domain.generation_artifact import ArtifactType, GenerationArtifact
+from runpod_sdxl_image_studio.domain.generation_queue import OptionalArtifactRepairOutcome
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
 from runpod_sdxl_image_studio.domain.job import GenerationJob
@@ -69,6 +71,9 @@ from runpod_sdxl_image_studio.domain.upscale_snapshot import (
 )
 from runpod_sdxl_image_studio.services.generation_persistence import (
     GenerationPersistenceRepositories,
+)
+from runpod_sdxl_image_studio.services.generation_recovery_service import (
+    GenerationRecoveryService,
 )
 from runpod_sdxl_image_studio.services.generation_service import GenerationService
 from runpod_sdxl_image_studio.services.upscale_enqueue_service import (
@@ -350,6 +355,7 @@ def test_optional_upscale_artifact_failures_do_not_reopen_completed_state(
         parent_generation_id=parent_id,
         created_at=now,
     )
+    GenerationQueueRepository(factory).mark_queued(child_id, child_job_id, "upscale-prompt")
     output = storage.store_image(_png(), child_id, now, kind=GenerationKind.UPSCALE)
     job = GenerationJob(
         generation_id=child_id,
@@ -434,12 +440,29 @@ def test_optional_upscale_artifact_failures_do_not_reopen_completed_state(
     class UpscaleRepository:
         calls = 0
 
+        snapshot = UpscaleSettingsSnapshot.from_settings(
+            UpscaleSettings(
+                method=UpscaleMethod.IMAGE,
+                sizing_mode=UpscaleSizingMode.FACTOR,
+                scale_factor=2,
+                upscaler_name="4x.pth",
+                workflow_template_id="sdxl_image_upscale",
+            ),
+            source_generation_id=parent_id,
+            source_artifact_id=parent_artifact.id,
+            source_sha256=parent_path.sha256,
+            source_width=parent_path.width,
+            source_height=parent_path.height,
+            target_width=1024,
+            target_height=1024,
+        )
+
         def get_by_generation(self, generation_id: UUID) -> object | None:
             del generation_id
             self.calls += 1
             if failure_kind == "settings":
                 raise UpscaleSettingsRepositoryError("settings failure")
-            return None
+            return self.snapshot
 
         def get_by_source_artifact(self, source_artifact_id: UUID) -> tuple[object, ...]:
             del source_artifact_id
@@ -453,16 +476,16 @@ def test_optional_upscale_artifact_failures_do_not_reopen_completed_state(
             self.calls += 1
             raise AssertionError("optional artifact failure must not persist generation failure")
 
-    metadata_storage = (
-        MetadataStorage() if failure_kind not in {"thumbnail", "thumbnail_artifact"} else None
-    )
+    metadata_storage = None if failure_kind == "thumbnail" else MetadataStorage()
     thumbnail_storage = (
         ThumbnailStorage()
         if failure_kind
         in {
+            "metadata_artifact",
             "thumbnail",
             "thumbnail_artifact",
             "artifact_lookup",
+            "artifact_lookup_recovery",
         }
         else None
     )
@@ -569,11 +592,11 @@ def test_optional_upscale_artifact_failures_do_not_reopen_completed_state(
             for artifact in persisted_artifacts
             if artifact.artifact_type is not ArtifactType.IMAGE
         }
-        expected_optional_types = (
-            {ArtifactType.METADATA, ArtifactType.THUMBNAIL}
-            if failure_kind == "artifact_lookup"
-            else set()
-        )
+        expected_optional_types = {
+            "metadata_artifact": {ArtifactType.THUMBNAIL},
+            "thumbnail_artifact": {ArtifactType.METADATA},
+            "artifact_lookup": {ArtifactType.METADATA, ArtifactType.THUMBNAIL},
+        }.get(failure_kind, set())
         assert optional_types == expected_optional_types
         if failure_kind == "artifact_lookup":
             assert (
@@ -615,25 +638,16 @@ def test_optional_upscale_artifact_failures_do_not_reopen_completed_state(
             first_sidecar_path: Path | None = None
             first_sidecar_payload: dict[str, object] | None = None
             first_sidecar_sha: str | None = None
-            if failure_kind == "metadata_artifact":
-                first_sidecar_path = output.path.with_suffix(".json")
-                first_sidecar_payload = json.loads(first_sidecar_path.read_text(encoding="utf-8"))
-                first_sidecar_sha = hashlib.sha256(first_sidecar_path.read_bytes()).hexdigest()
-            service._persist_optional_artifacts(  # noqa: SLF001 - verify retry after optional failure
-                job,
-                child_settings,
-                output,
-                completed_at,
-                GenerationKind.UPSCALE,
-                parent_id,
+            first_sidecar_path = output.path.with_suffix(".json")
+            first_sidecar_payload = json.loads(first_sidecar_path.read_text(encoding="utf-8"))
+            first_sidecar_sha = hashlib.sha256(first_sidecar_path.read_bytes()).hexdigest()
+            assert (
+                service.repair_optional_artifacts(child_id)
+                is OptionalArtifactRepairOutcome.REPAIRED
             )
-            service._persist_optional_artifacts(  # noqa: SLF001 - verify retry idempotency
-                job,
-                child_settings,
-                output,
-                completed_at,
-                GenerationKind.UPSCALE,
-                parent_id,
+            assert (
+                service.repair_optional_artifacts(child_id)
+                is OptionalArtifactRepairOutcome.ALREADY_COMPLETE
             )
             retried_artifacts = actual_artifacts.list_by_generation(child_id)
             assert len([a for a in retried_artifacts if a.artifact_type is ArtifactType.IMAGE]) == 1
@@ -643,41 +657,28 @@ def test_optional_upscale_artifact_failures_do_not_reopen_completed_state(
             thumbnail_artifacts = [
                 a for a in retried_artifacts if a.artifact_type is ArtifactType.THUMBNAIL
             ]
-            if failure_kind == "metadata_artifact":
-                assert len(metadata_artifacts) == 1
-                assert not thumbnail_artifacts
-                sidecar_path = output.path.with_suffix(".json")
-                sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
-                assert first_sidecar_path == sidecar_path
-                assert first_sidecar_payload == sidecar
-                assert first_sidecar_sha == hashlib.sha256(sidecar_path.read_bytes()).hexdigest()
-                assert datetime.fromisoformat(sidecar["completed_at"]) == completed_at
-                assert (
-                    metadata_artifacts[0].sha256
-                    == hashlib.sha256(sidecar_path.read_bytes()).hexdigest()
-                )
-            else:
-                assert not metadata_artifacts
-                assert len(thumbnail_artifacts) == 1
-                thumbnail_path = tmp_path / thumbnail_artifacts[0].local_path
-                assert (
-                    thumbnail_artifacts[0].sha256
-                    == hashlib.sha256(thumbnail_path.read_bytes()).hexdigest()
-                )
+            assert len(metadata_artifacts) == 1
+            assert len(thumbnail_artifacts) == 1
+            sidecar_path = output.path.with_suffix(".json")
+            sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+            assert first_sidecar_path == sidecar_path
+            assert first_sidecar_payload == sidecar
+            assert first_sidecar_sha == hashlib.sha256(sidecar_path.read_bytes()).hexdigest()
+            assert datetime.fromisoformat(sidecar["completed_at"]) == completed_at
+            assert (
+                metadata_artifacts[0].sha256
+                == hashlib.sha256(sidecar_path.read_bytes()).hexdigest()
+            )
+            thumbnail_path = tmp_path / thumbnail_artifacts[0].local_path
+            assert (
+                thumbnail_artifacts[0].sha256
+                == hashlib.sha256(thumbnail_path.read_bytes()).hexdigest()
+            )
         elif failure_kind == "artifact_lookup":
             optional_save_counts = (counters["metadata_save"], counters["thumbnail_save"])
             artifact_add_count = counters["artifact_add"]
             assert optional_save_counts == (0, 0)
             assert artifact_add_count == 0
-            for _ in range(2):
-                service._persist_optional_artifacts(  # noqa: SLF001 - lookup recovery is deferred
-                    job,
-                    child_settings,
-                    output,
-                    resolved_generation.completed_at,
-                    GenerationKind.UPSCALE,
-                    parent_id,
-                )
             assert (counters["metadata_save"], counters["thumbnail_save"]) == optional_save_counts
             assert counters["artifact_add"] == artifact_add_count
             recovered_artifacts = actual_artifacts.list_by_generation(child_id)
@@ -693,23 +694,13 @@ def test_optional_upscale_artifact_failures_do_not_reopen_completed_state(
                 == 1
             )
         elif failure_kind == "artifact_lookup_recovery":
-            completed_at = resolved_generation.completed_at
-            assert completed_at is not None
-            service._persist_optional_artifacts(  # noqa: SLF001 - lookup recovery retry
-                job,
-                child_settings,
-                output,
-                completed_at,
-                GenerationKind.UPSCALE,
-                parent_id,
+            assert (
+                service.repair_optional_artifacts(child_id)
+                is OptionalArtifactRepairOutcome.REPAIRED
             )
-            service._persist_optional_artifacts(  # noqa: SLF001 - lookup recovery idempotency
-                job,
-                child_settings,
-                output,
-                completed_at,
-                GenerationKind.UPSCALE,
-                parent_id,
+            assert (
+                service.repair_optional_artifacts(child_id)
+                is OptionalArtifactRepairOutcome.ALREADY_COMPLETE
             )
             recovered_artifacts = actual_artifacts.list_by_generation(child_id)
             assert (
@@ -720,6 +711,147 @@ def test_optional_upscale_artifact_failures_do_not_reopen_completed_state(
                 == 1
             )
             assert counters["metadata_save"] == 1
-            assert counters["artifact_add"] == 1
+            assert counters["artifact_add"] == 2
     finally:
         engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_repairs_completed_optional_artifacts_without_comfyui(
+    tmp_path: Path,
+) -> None:
+    """The existing reconciliation entrypoint repairs completed records only."""
+
+    now = datetime(2026, 8, 3, 12, 0, tzinfo=UTC)
+    settings = Settings(_env_file=None, data_dir=tmp_path)
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    factory = create_session_factory(engine)
+    generations = GenerationRepository(factory)
+    jobs = GenerationJobRepository(factory)
+    artifacts = GenerationArtifactRepository(factory)
+    completion = GenerationCompletionRepository(factory)
+    start = GenerationStartRepository(factory)
+    generation_id, job_id = uuid4(), uuid4()
+    generation, pending_job = start.create_pending(
+        GenerationSettingsSnapshot.from_settings(_settings()),
+        generation_id=generation_id,
+        job_id=job_id,
+        kind=GenerationKind.STANDARD,
+        parent_generation_id=None,
+        created_at=now,
+    )
+    GenerationQueueRepository(factory).mark_queued(generation_id, job_id, "prompt-completed")
+    stored = LocalStorageAdapter(settings).store_image(_png((8, 4)), generation_id, now)
+    assert pending_job.id == job_id
+
+    job = GenerationJob(
+        generation_id=generation_id,
+        id=job_id,
+        status=pending_job.status,
+        prompt_id="prompt-completed",
+        created_at=pending_job.created_at,
+        stored_image=stored,
+    )
+
+    class FailingFirstLookupArtifactRepository:
+        calls = 0
+
+        def list_by_generation(
+            self, requested_generation_id: UUID
+        ) -> tuple[GenerationArtifact, ...]:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("transient artifact lookup failure")
+            return artifacts.list_by_generation(requested_generation_id)
+
+        def add(self, artifact: GenerationArtifact) -> GenerationArtifact:
+            return artifacts.add(artifact)
+
+    initial_artifacts = FailingFirstLookupArtifactRepository()
+
+    def build_service(artifact_repository: object) -> GenerationService:
+        return GenerationService(
+            object(),
+            object(),
+            object(),
+            LocalStorageAdapter(settings),
+            lambda: None,  # type: ignore[arg-type]
+            settings,
+            persistence=GenerationPersistenceRepositories(
+                generation=generations,
+                job=jobs,
+                artifact=artifact_repository,  # type: ignore[arg-type]
+                start=start,
+                queue=GenerationQueueRepository(factory),
+                progress=GenerationProgressRepository(factory),
+                completion=completion,
+                failure=GenerationFailureRepository(factory),
+            ),
+            metadata_storage=GenerationMetadataStorage(tmp_path),
+            thumbnail_storage=HistoryThumbnailStorage(settings),
+        )
+
+    initial_service = build_service(initial_artifacts)
+    initial_service._complete_job(  # noqa: SLF001 - exercise completion before restart
+        job,
+        _settings(),
+        now,
+        GenerationKind.STANDARD,
+        None,
+    )
+    assert initial_artifacts.calls == 1
+
+    before_generation = generations.get_by_id(generation_id)
+    before_job = jobs.get_by_generation(generation_id)
+    assert before_generation is not None
+    assert before_job is not None
+    assert before_generation.status is GenerationStatus.COMPLETED
+    assert before_job.status is GenerationStatus.COMPLETED
+    assert before_generation.completed_at is not None
+    assert before_job.completed_at == before_generation.completed_at
+    assert len(artifacts.list_by_generation(generation_id)) == 1
+
+    class Client:
+        calls = 0
+
+        async def get_remote_prompt_status(self, prompt_id: str) -> object:
+            self.calls += 1
+            raise AssertionError(f"completed repair must not query ComfyUI: {prompt_id}")
+
+        async def get_prompt_history(self, prompt_id: str) -> object:
+            self.calls += 1
+            raise AssertionError(f"completed repair must not read history: {prompt_id}")
+
+    service = build_service(artifacts)
+    client = Client()
+    recovery = GenerationRecoveryService(
+        client,  # type: ignore[arg-type]
+        generations,
+        jobs,
+        artifacts,
+        settings,
+        completed_optional_artifact_handler=service.repair_optional_artifacts,
+    )
+
+    first_messages = await recovery.recover(now)
+    assert f"{generation_id}: optional artifacts repaired" in first_messages
+    assert client.calls == 0
+    repaired = artifacts.list_by_generation(generation_id)
+    assert len([item for item in repaired if item.artifact_type is ArtifactType.IMAGE]) == 1
+    assert len([item for item in repaired if item.artifact_type is ArtifactType.METADATA]) == 1
+    assert len([item for item in repaired if item.artifact_type is ArtifactType.THUMBNAIL]) == 1
+    metadata = next(item for item in repaired if item.artifact_type is ArtifactType.METADATA)
+    sidecar = json.loads((tmp_path / metadata.local_path).read_text(encoding="utf-8"))
+    assert datetime.fromisoformat(sidecar["completed_at"]) == before_generation.completed_at
+    assert stored.path.exists()
+
+    second_messages = await recovery.recover(now)
+    assert second_messages == ()
+    assert client.calls == 0
+    assert len(artifacts.list_by_generation(generation_id)) == 3
+    after_generation = generations.get_by_id(generation_id)
+    after_job = jobs.get_by_generation(generation_id)
+    assert after_generation == before_generation
+    assert after_job == before_job
+    engine.dispose()
