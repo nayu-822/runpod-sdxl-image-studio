@@ -247,7 +247,7 @@ class GenerationService:
             if generation is None or job is None:
                 return OptionalArtifactRepairOutcome.UNAVAILABLE
             artifacts = self._artifact_repository.list_by_generation(generation_id)
-        except (GenerationRepositoryError, OSError, ValueError) as exc:
+        except Exception as exc:  # noqa: BLE001 - typed outcome must contain read failures
             logger.warning(
                 "Optional artifact repair lookup failed generation=%s error=%s",
                 generation_id,
@@ -298,14 +298,7 @@ class GenerationService:
                 load_upscale_settings=False,
             )
             repaired_artifacts = self._artifact_repository.list_by_generation(generation_id)
-        except (
-            GenerationRepositoryError,
-            OSError,
-            StorageError,
-            UpscaleEnqueueError,
-            UpscaleSettingsRepositoryError,
-            ValueError,
-        ) as exc:
+        except Exception as exc:  # noqa: BLE001 - one repair must not alter terminal state
             logger.warning(
                 "Optional artifact repair deferred generation=%s error=%s",
                 generation_id,
