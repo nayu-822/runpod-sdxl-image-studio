@@ -1142,14 +1142,21 @@ class GenerationService:
                 job.generation_id,
                 type(exc).__name__,
             )
-            existing_types = set()
+            return
         image_path = image.path
         if self._metadata_storage is not None:
             if ArtifactType.METADATA in existing_types:
                 pass
             else:
                 try:
-                    payload = _sidecar_payload(job, settings, image, kind, parent_generation_id)
+                    payload = _sidecar_payload(
+                        job,
+                        settings,
+                        image,
+                        kind,
+                        parent_generation_id,
+                        created_at,
+                    )
                     if (
                         kind is GenerationKind.UPSCALE
                         and self._upscale_settings_repository is not None
@@ -1369,26 +1376,26 @@ def _generation_error_code(error: Exception) -> str:
 def _sidecar_payload(
     job: GenerationJob,
     settings: GenerationSettings,
-    image: object,
+    image: StoredImage,
     kind: GenerationKind,
     parent_generation_id: UUID | None,
+    completed_at: datetime,
 ) -> dict[str, object]:
-    stored = image
     return {
         "schema_version": 1,
         "generation_id": str(job.generation_id),
         "kind": kind.value,
         "parent_generation_id": str(parent_generation_id) if parent_generation_id else None,
         "created_at": job.created_at.isoformat() if job.created_at else None,
-        "completed_at": datetime.now(UTC).isoformat(),
+        "completed_at": completed_at.isoformat(),
         "settings": GenerationSettingsSnapshot.from_settings(settings).model_dump(mode="json"),
         "workflow_template_id": settings.workflow_template_id,
         "workflow_template_version": settings.workflow_template_version,
         "comfy_prompt_id": job.prompt_id,
         "image": {
-            "sha256": stored.sha256,  # type: ignore[attr-defined]
-            "width": stored.width,  # type: ignore[attr-defined]
-            "height": stored.height,  # type: ignore[attr-defined]
-            "mime_type": stored.mime_type,  # type: ignore[attr-defined]
+            "sha256": image.sha256,
+            "width": image.width,
+            "height": image.height,
+            "mime_type": image.mime_type,
         },
     }
