@@ -316,13 +316,16 @@ def build_app(
             return ReconciliationOutcome.UNAVAILABLE
         return await generation_service.reconcile_prompt(queue_item.generation.id, prompt_id)
 
+    async def repair_one_optional_artifact() -> tuple[str, ...]:
+        return await recovery_service.repair_completed_optional_artifacts(1)
+
     queue_worker = GenerationQueueWorker(
         dispatch_queue_repository,
         execution_service,
         app_settings,
         reconcile_handler=reconcile_queue_item,
         cancellation_adapter=cancellation_adapter,
-        completed_optional_artifact_handler=recovery_service.repair_completed_optional_artifacts,
+        completed_optional_artifact_handler=repair_one_optional_artifact,
     )
     queue_runtime = GenerationQueueRuntime(queue_worker)
     queue_service.set_wake_callback(queue_runtime.wake)

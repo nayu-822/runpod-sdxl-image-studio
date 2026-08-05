@@ -17,6 +17,23 @@ def test_default_settings_are_valid_and_path_values_are_paths() -> None:
     assert isinstance(settings.data_dir, Path)
     assert isinstance(settings.workflow_dir, Path)
     assert settings.max_upscale_factor == 4.0
+    assert settings.optional_artifact_repair_batch_size == 2
+
+
+def test_optional_artifact_repair_batch_is_small_and_bounded_by_recovery_limit() -> None:
+    settings = Settings(_env_file=None, optional_artifact_repair_batch_size=10)
+    assert settings.optional_artifact_repair_batch_size == 10
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, optional_artifact_repair_batch_size=0)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, optional_artifact_repair_batch_size=11)
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            recovery_max_items=1,
+            optional_artifact_repair_batch_size=2,
+        )
 
 
 def test_environment_variables_override_settings(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -107,6 +107,7 @@ class GenerationQueueWorker:
         self._thread: threading.Thread | None = None
         self._fail_closed = False
         self._last_reconciled_at = 0.0
+        self._optional_artifact_maintenance_task: asyncio.Task[None] | None = None
 
     def start(self) -> None:
         """Start one daemon thread; callers own the worker lifecycle explicitly."""
@@ -152,6 +153,7 @@ class GenerationQueueWorker:
                 )
                 self._wake_requested.clear()
         finally:
+            await self._stop_optional_artifact_maintenance()
             logger.info("generation worker stopped worker_id=%s", self.worker_id)
 
     async def run_once(self) -> bool:
@@ -351,16 +353,42 @@ class GenerationQueueWorker:
                     )
         except GenerationDispatchQueueRepositoryError:
             logger.warning("generation worker reconciliation failed", exc_info=True)
-        if self._completed_optional_artifact_handler is not None:
-            try:
-                await self._completed_optional_artifact_handler()
-            except Exception as exc:  # noqa: BLE001 - maintenance must not stop the worker
-                logger.warning(
-                    "completed optional artifact maintenance failed worker_id=%s error=%s",
-                    self.worker_id,
-                    type(exc).__name__,
-                    exc_info=True,
-                )
+        self._schedule_optional_artifact_maintenance()
+
+    def _schedule_optional_artifact_maintenance(self) -> None:
+        if self._completed_optional_artifact_handler is None:
+            return
+        if (
+            self._optional_artifact_maintenance_task is not None
+            and not self._optional_artifact_maintenance_task.done()
+        ):
+            return
+        self._optional_artifact_maintenance_task = asyncio.create_task(
+            self._run_optional_artifact_maintenance()
+        )
+
+    async def _run_optional_artifact_maintenance(self) -> None:
+        assert self._completed_optional_artifact_handler is not None
+        try:
+            await self._completed_optional_artifact_handler()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - maintenance must not stop the worker
+            logger.warning(
+                "completed optional artifact maintenance failed worker_id=%s error=%s",
+                self.worker_id,
+                type(exc).__name__,
+                exc_info=True,
+            )
+
+    async def _stop_optional_artifact_maintenance(self) -> None:
+        task = self._optional_artifact_maintenance_task
+        self._optional_artifact_maintenance_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
     async def _heartbeat(self, sequence: int) -> None:
         while True:

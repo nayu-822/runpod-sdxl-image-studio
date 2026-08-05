@@ -227,7 +227,8 @@ def test_reconciliation_outcome_in_progress_does_not_fail_prompt_job() -> None:
     engine.dispose()
 
 
-def test_worker_runs_optional_artifact_maintenance_after_queue_reconciliation(
+@pytest.mark.asyncio
+async def test_worker_runs_optional_artifact_maintenance_after_queue_reconciliation(
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -258,7 +259,10 @@ def test_worker_runs_optional_artifact_maintenance_after_queue_reconciliation(
         completed_optional_artifact_handler=maintain,
     )
 
-    asyncio.run(worker.reconcile())
+    await worker.reconcile()
+    maintenance_task = worker._optional_artifact_maintenance_task  # noqa: SLF001
+    assert maintenance_task is not None
+    await maintenance_task
 
     assert events == ["prompt", "optional"]
     assert any(

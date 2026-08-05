@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Protocol, TypeVar
 from uuid import UUID
 
 from runpod_sdxl_image_studio.adapters.comfyui.client import ComfyUIClient
@@ -33,6 +33,7 @@ from runpod_sdxl_image_studio.domain.generation_queue import (
 from runpod_sdxl_image_studio.domain.job import GenerationJob
 
 logger = logging.getLogger(__name__)
+_ThreadResult = TypeVar("_ThreadResult")
 
 RECONCILIATION_PROMPT_MISSING_CODE = "reconciliation_prompt_missing"
 RECONCILIATION_PROMPT_MISSING_SUMMARY = (
@@ -70,6 +71,7 @@ class GenerationRecoveryService:
         self._stale_seconds = app_settings.stale_pending_seconds
         self._reconciliation_grace_seconds = app_settings.reconciliation_grace_seconds
         self._max_items = app_settings.recovery_max_items
+        self._optional_repair_batch_size = app_settings.optional_artifact_repair_batch_size
         self._completed_prompt_handler = completed_prompt_handler
         self._completed_optional_artifact_handler = completed_optional_artifact_handler
         self._failure_repository = failure_repository
@@ -84,26 +86,49 @@ class GenerationRecoveryService:
 
         if self._completed_optional_artifact_handler is None:
             return ()
-        bounded_limit = self._max_items if limit is None else min(max(0, limit), self._max_items)
+        bounded_limit = (
+            self._optional_repair_batch_size
+            if limit is None
+            else min(max(0, limit), self._optional_repair_batch_size)
+        )
         if bounded_limit == 0:
             return ()
 
-        await asyncio.to_thread(self._optional_repair_gate.acquire)
+        if not self._optional_repair_gate.acquire(blocking=False):
+            return ()
+        defer_gate_release = False
         try:
-            candidates = self._list_optional_artifact_candidates(bounded_limit)
+            try:
+                candidates = await self._run_thread_operation(
+                    self._list_optional_artifact_candidates,
+                    bounded_limit,
+                )
+            except asyncio.CancelledError:
+                defer_gate_release = True
+                raise
             if candidates == () and self._optional_repair_after is not None:
                 self._optional_repair_after = None
-                candidates = self._list_optional_artifact_candidates(bounded_limit)
+                try:
+                    candidates = await self._run_thread_operation(
+                        self._list_optional_artifact_candidates,
+                        bounded_limit,
+                    )
+                except asyncio.CancelledError:
+                    defer_gate_release = True
+                    raise
             if candidates is None:
                 return ()
             messages: list[str] = []
             for candidate in candidates:
                 self._optional_repair_after = candidate
                 try:
-                    outcome = await asyncio.to_thread(
+                    outcome = await self._run_thread_operation(
                         self._completed_optional_artifact_handler,
                         candidate.generation_id,
                     )
+                except asyncio.CancelledError:
+                    defer_gate_release = True
+                    raise
                 except Exception as exc:  # noqa: BLE001 - one candidate must not stop repair
                     logger.warning(
                         "Completed optional artifact repair failed generation=%s error=%s",
@@ -119,6 +144,30 @@ class GenerationRecoveryService:
                 elif outcome is OptionalArtifactRepairOutcome.UNAVAILABLE:
                     messages.append(f"{candidate.generation_id}: optional artifacts unavailable")
             return tuple(messages)
+        finally:
+            if not defer_gate_release:
+                self._optional_repair_gate.release()
+
+    async def _run_thread_operation(
+        self,
+        operation: Callable[..., _ThreadResult],
+        *args: object,
+    ) -> _ThreadResult:
+        task = asyncio.create_task(asyncio.to_thread(operation, *args))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            asyncio.create_task(self._release_optional_repair_gate_after(task))
+            raise
+
+    async def _release_optional_repair_gate_after(
+        self,
+        operation: asyncio.Task[_ThreadResult],
+    ) -> None:
+        try:
+            await asyncio.shield(operation)
+        except BaseException:  # noqa: BLE001 - release the gate for every worker outcome
+            pass
         finally:
             self._optional_repair_gate.release()
 
@@ -260,7 +309,11 @@ class GenerationRecoveryService:
                 messages.append(f"{job.generation_id}: 状態を維持しました")
         remaining = max(0, self._max_items - len(jobs))
         if remaining > 0:
-            messages.extend(await self.repair_completed_optional_artifacts(remaining))
+            messages.extend(
+                await self.repair_completed_optional_artifacts(
+                    min(remaining, self._optional_repair_batch_size)
+                )
+            )
         return tuple(messages)
 
     def _is_prompt_missing_stale(

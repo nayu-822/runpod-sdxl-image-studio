@@ -113,6 +113,10 @@ class Settings(BaseSettings):
     )
     stale_pending_seconds: int = Field(300, validation_alias="IMAGE_STUDIO_STALE_PENDING_SECONDS")
     recovery_max_items: int = Field(50, validation_alias="IMAGE_STUDIO_RECOVERY_MAX_ITEMS")
+    optional_artifact_repair_batch_size: int = Field(
+        2,
+        validation_alias="IMAGE_STUDIO_OPTIONAL_ARTIFACT_REPAIR_BATCH_SIZE",
+    )
     queue_poll_interval_seconds: float = Field(
         2.0, validation_alias="IMAGE_STUDIO_QUEUE_POLL_INTERVAL_SECONDS"
     )
@@ -199,6 +203,7 @@ class Settings(BaseSettings):
         "history_thumbnail_max_edge",
         "stale_pending_seconds",
         "recovery_max_items",
+        "optional_artifact_repair_batch_size",
         "queue_max_pending_jobs",
         "batch_max_items",
     )
@@ -229,6 +234,13 @@ class Settings(BaseSettings):
             raise ValueError("recovery_max_items must not exceed 100")
         return value
 
+    @field_validator("optional_artifact_repair_batch_size")
+    @classmethod
+    def validate_optional_artifact_repair_batch_size(cls, value: int) -> int:
+        if value > 10:
+            raise ValueError("optional_artifact_repair_batch_size must not exceed 10")
+        return value
+
     @field_validator(
         "queue_poll_interval_seconds",
         "queue_lease_seconds",
@@ -257,6 +269,10 @@ class Settings(BaseSettings):
     def validate_queue_lease(self) -> Settings:
         if self.queue_lease_seconds <= self.queue_heartbeat_seconds:
             raise ValueError("queue_lease_seconds must be greater than queue_heartbeat_seconds")
+        if self.optional_artifact_repair_batch_size > self.recovery_max_items:
+            raise ValueError(
+                "optional_artifact_repair_batch_size must not exceed recovery_max_items"
+            )
         metadata_wait = max(
             self.metadata_request_max_wait_seconds,
             self.metadata_connect_timeout_seconds

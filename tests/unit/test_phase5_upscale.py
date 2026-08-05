@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
+import threading
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
@@ -865,6 +867,9 @@ async def test_reconciliation_repairs_completed_optional_artifacts_without_comfy
         completed_optional_artifact_handler=recovery.repair_completed_optional_artifacts,
     )
     await worker.reconcile()
+    maintenance_task = worker._optional_artifact_maintenance_task  # noqa: SLF001
+    assert maintenance_task is not None
+    await maintenance_task
 
     first_messages = await recovery.recover(now)
     assert first_messages == ()
@@ -948,7 +953,11 @@ async def test_optional_artifact_reconciliation_rotates_past_deferred_candidates
         repository,  # type: ignore[arg-type]
         JobRepository(),  # type: ignore[arg-type]
         object(),  # type: ignore[arg-type]
-        Settings(_env_file=None, recovery_max_items=1),
+        Settings(
+            _env_file=None,
+            recovery_max_items=1,
+            optional_artifact_repair_batch_size=1,
+        ),
         completed_optional_artifact_handler=handler,
     )
 
@@ -970,3 +979,120 @@ async def test_optional_artifact_reconciliation_rotates_past_deferred_candidates
         and call.kwargs.get("exc_info") is True
         for call in warning.warning.call_args_list
     )
+
+
+@pytest.mark.asyncio
+async def test_optional_artifact_repair_gate_skips_busy_requests_and_recovers() -> None:
+    generation_id = uuid4()
+    candidate = OptionalArtifactRepairCandidate(
+        generation_id,
+        datetime(2026, 8, 5, 13, 0, tzinfo=UTC),
+    )
+
+    class CandidateRepository:
+        def list_completed_optional_artifact_repairs(
+            self,
+            limit: int = 50,
+            *,
+            after_completed_at: datetime | None = None,
+            after_generation_id: UUID | None = None,
+        ) -> tuple[OptionalArtifactRepairCandidate, ...]:
+            del limit, after_completed_at, after_generation_id
+            return (candidate,)
+
+    started = threading.Event()
+    release = threading.Event()
+    handled = 0
+
+    def handler(requested_generation_id: UUID) -> OptionalArtifactRepairOutcome:
+        nonlocal handled
+        assert requested_generation_id == generation_id
+        handled += 1
+        started.set()
+        release.wait(timeout=5)
+        return OptionalArtifactRepairOutcome.REPAIRED
+
+    recovery = GenerationRecoveryService(
+        object(),  # type: ignore[arg-type]
+        CandidateRepository(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        Settings(
+            _env_file=None,
+            optional_artifact_repair_batch_size=1,
+        ),
+        completed_optional_artifact_handler=handler,
+    )
+
+    first = asyncio.create_task(recovery.repair_completed_optional_artifacts())
+    assert await asyncio.to_thread(started.wait, 5)
+
+    busy = asyncio.create_task(recovery.repair_completed_optional_artifacts())
+    assert await asyncio.wait_for(busy, timeout=0.2) == ()
+
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    release.set()
+    third_messages: tuple[str, ...] = ()
+    for _ in range(50):
+        third_messages = await recovery.repair_completed_optional_artifacts()
+        if third_messages:
+            break
+        await asyncio.sleep(0.01)
+    assert third_messages == (f"{generation_id}: optional artifacts repaired",)
+    assert handled == 2
+
+
+@pytest.mark.asyncio
+async def test_queue_claim_is_not_blocked_by_optional_artifact_maintenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    factory = create_session_factory(engine)
+    repository = GenerationDispatchQueueRepository(factory)
+    item = repository.enqueue_single(GenerationSettingsSnapshot.from_settings(_settings()))
+    events: list[str] = []
+    original_claim = repository.claim_next
+
+    def claim_next(*args: object, **kwargs: object) -> object:
+        events.append("claim")
+        return original_claim(*args, **kwargs)
+
+    monkeypatch.setattr(repository, "claim_next", claim_next)
+
+    async def maintain() -> tuple[str, ...]:
+        events.append("maintenance")
+        await asyncio.sleep(0.01)
+        return ()
+
+    class FakeExecution:
+        async def execute_persisted(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+            events.append("execute")
+
+    worker = GenerationQueueWorker(
+        repository,
+        FakeExecution(),
+        Settings(_env_file=None),
+        completed_optional_artifact_handler=maintain,
+    )
+
+    await worker.reconcile()
+    maintenance_task = worker._optional_artifact_maintenance_task  # noqa: SLF001
+    assert maintenance_task is not None
+    assert await worker.run_once() is True
+    await maintenance_task
+
+    assert events[0] == "claim"
+    assert events.count("maintenance") == 1
+    assert events.count("execute") == 1
+    queued = repository.get_queue_item(item.generation.id)
+    assert queued is not None
+    assert queued.generation.id == item.generation.id
+    engine.dispose()
