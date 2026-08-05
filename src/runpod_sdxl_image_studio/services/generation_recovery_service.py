@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
 from collections.abc import Awaitable
 from datetime import UTC, datetime
 from typing import Protocol
@@ -24,7 +26,10 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_reposito
 )
 from runpod_sdxl_image_studio.config import Settings, get_settings
 from runpod_sdxl_image_studio.domain.generation import Generation, GenerationErrorCode
-from runpod_sdxl_image_studio.domain.generation_queue import OptionalArtifactRepairOutcome
+from runpod_sdxl_image_studio.domain.generation_queue import (
+    OptionalArtifactRepairCandidate,
+    OptionalArtifactRepairOutcome,
+)
 from runpod_sdxl_image_studio.domain.job import GenerationJob
 
 logger = logging.getLogger(__name__)
@@ -69,6 +74,71 @@ class GenerationRecoveryService:
         self._completed_optional_artifact_handler = completed_optional_artifact_handler
         self._failure_repository = failure_repository
         self._cancellation_repository = cancellation_repository
+        self._optional_repair_after: OptionalArtifactRepairCandidate | None = None
+        self._optional_repair_gate = threading.Lock()
+
+    async def repair_completed_optional_artifacts(
+        self, limit: int | None = None
+    ) -> tuple[str, ...]:
+        """Repair a bounded, fair slice of completed generations off the event loop."""
+
+        if self._completed_optional_artifact_handler is None:
+            return ()
+        bounded_limit = self._max_items if limit is None else min(max(0, limit), self._max_items)
+        if bounded_limit == 0:
+            return ()
+
+        await asyncio.to_thread(self._optional_repair_gate.acquire)
+        try:
+            candidates = self._list_optional_artifact_candidates(bounded_limit)
+            if candidates == () and self._optional_repair_after is not None:
+                self._optional_repair_after = None
+                candidates = self._list_optional_artifact_candidates(bounded_limit)
+            if candidates is None:
+                return ()
+            messages: list[str] = []
+            for candidate in candidates:
+                self._optional_repair_after = candidate
+                try:
+                    outcome = await asyncio.to_thread(
+                        self._completed_optional_artifact_handler,
+                        candidate.generation_id,
+                    )
+                except Exception as exc:  # noqa: BLE001 - one candidate must not stop repair
+                    logger.warning(
+                        "Completed optional artifact repair failed generation=%s error=%s",
+                        candidate.generation_id,
+                        type(exc).__name__,
+                        exc_info=True,
+                    )
+                    continue
+                if outcome is OptionalArtifactRepairOutcome.REPAIRED:
+                    messages.append(f"{candidate.generation_id}: optional artifacts repaired")
+                elif outcome is OptionalArtifactRepairOutcome.DEFERRED:
+                    messages.append(f"{candidate.generation_id}: optional artifacts deferred")
+                elif outcome is OptionalArtifactRepairOutcome.UNAVAILABLE:
+                    messages.append(f"{candidate.generation_id}: optional artifacts unavailable")
+            return tuple(messages)
+        finally:
+            self._optional_repair_gate.release()
+
+    def _list_optional_artifact_candidates(
+        self, limit: int
+    ) -> tuple[OptionalArtifactRepairCandidate, ...] | None:
+        cursor = self._optional_repair_after
+        try:
+            return self._generation_repository.list_completed_optional_artifact_repairs(
+                limit,
+                after_completed_at=cursor.completed_at if cursor is not None else None,
+                after_generation_id=cursor.generation_id if cursor is not None else None,
+            )
+        except Exception as exc:  # noqa: BLE001 - maintenance must be retried later
+            logger.warning(
+                "Completed optional artifact candidate lookup failed error=%s",
+                type(exc).__name__,
+                exc_info=True,
+            )
+            return None
 
     async def recover(self, now: datetime | None = None) -> tuple[str, ...]:
         timestamp = _utc(now or datetime.now(UTC))
@@ -188,37 +258,9 @@ class GenerationRecoveryService:
                     "Recovery warning generation=%s error=%s", job.generation_id, type(exc).__name__
                 )
                 messages.append(f"{job.generation_id}: 状態を維持しました")
-        if self._completed_optional_artifact_handler is not None:
-            remaining = max(0, self._max_items - len(jobs))
-            if remaining > 0:
-                try:
-                    completed_ids = (
-                        self._generation_repository.list_completed_optional_artifact_repairs(
-                            remaining
-                        )
-                    )
-                except GenerationRepositoryError as exc:
-                    logger.warning(
-                        "Completed optional artifact candidates could not be read error=%s",
-                        type(exc).__name__,
-                    )
-                    completed_ids = ()
-                for generation_id in completed_ids:
-                    try:
-                        outcome = self._completed_optional_artifact_handler(generation_id)
-                    except Exception as exc:  # noqa: BLE001 - one repair must not stop recovery
-                        logger.warning(
-                            "Completed optional artifact repair failed generation=%s error=%s",
-                            generation_id,
-                            type(exc).__name__,
-                        )
-                        continue
-                    if outcome is OptionalArtifactRepairOutcome.REPAIRED:
-                        messages.append(f"{generation_id}: optional artifacts repaired")
-                    elif outcome is OptionalArtifactRepairOutcome.DEFERRED:
-                        messages.append(f"{generation_id}: optional artifacts deferred")
-                    elif outcome is OptionalArtifactRepairOutcome.UNAVAILABLE:
-                        messages.append(f"{generation_id}: optional artifacts unavailable")
+        remaining = max(0, self._max_items - len(jobs))
+        if remaining > 0:
+            messages.extend(await self.repair_completed_optional_artifacts(remaining))
         return tuple(messages)
 
     def _is_prompt_missing_stale(

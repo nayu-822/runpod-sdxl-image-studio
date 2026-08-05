@@ -322,6 +322,7 @@ def build_app(
         app_settings,
         reconcile_handler=reconcile_queue_item,
         cancellation_adapter=cancellation_adapter,
+        completed_optional_artifact_handler=recovery_service.repair_completed_optional_artifacts,
     )
     queue_runtime = GenerationQueueRuntime(queue_worker)
     queue_service.set_wake_callback(queue_runtime.wake)

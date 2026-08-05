@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import gradio as gr
 import pytest
@@ -55,6 +57,7 @@ from runpod_sdxl_image_studio.domain.generation_queue import (
 )
 from runpod_sdxl_image_studio.domain.generation_settings import MAX_SEED, GenerationSettings
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
+from runpod_sdxl_image_studio.jobs import generation_queue_worker as worker_module
 from runpod_sdxl_image_studio.jobs.generation_queue_worker import GenerationQueueWorker
 from runpod_sdxl_image_studio.services.generation_errors import PromptPersistenceError
 from runpod_sdxl_image_studio.services.generation_queue_service import (
@@ -221,6 +224,48 @@ def test_reconciliation_outcome_in_progress_does_not_fail_prompt_job() -> None:
     reconciled = repository.get_queue_item(item.generation.id)
     assert reconciled is not None
     assert reconciled.generation.status is GenerationStatus.QUEUED
+    engine.dispose()
+
+
+def test_worker_runs_optional_artifact_maintenance_after_queue_reconciliation(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caplog.set_level(
+        logging.WARNING, logger="runpod_sdxl_image_studio.jobs.generation_queue_worker"
+    )
+    warning = Mock()
+    monkeypatch.setattr(worker_module, "logger", warning)
+    engine, factory = _database()
+    repository = GenerationDispatchQueueRepository(factory)
+    item = repository.enqueue_single(GenerationSettingsSnapshot.from_settings(_settings()))
+    GenerationQueueRepository(factory).mark_queued(item.generation.id, item.job.id, "prompt-live")
+    events: list[str] = []
+
+    async def reconcile(_item: object) -> ReconciliationOutcome:
+        events.append("prompt")
+        return ReconciliationOutcome.IN_PROGRESS
+
+    async def maintain() -> tuple[str, ...]:
+        events.append("optional")
+        raise RuntimeError("maintenance failure")
+
+    worker = GenerationQueueWorker(
+        repository,
+        object(),
+        Settings(_env_file=None, reconciliation_grace_seconds=60),
+        reconcile_handler=reconcile,
+        completed_optional_artifact_handler=maintain,
+    )
+
+    asyncio.run(worker.reconcile())
+
+    assert events == ["prompt", "optional"]
+    assert any(
+        call.kwargs.get("exc_info") is True
+        and call.args[0] == "completed optional artifact maintenance failed worker_id=%s error=%s"
+        for call in warning.warning.call_args_list
+    )
     engine.dispose()
 
 

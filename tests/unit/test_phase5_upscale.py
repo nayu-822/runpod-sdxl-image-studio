@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
+from unittest.mock import Mock
 from uuid import UUID, uuid4
 
 import httpx
@@ -14,6 +16,7 @@ import pytest
 import respx
 from PIL import Image
 from sqlalchemy import create_engine, inspect
+from sqlalchemy.pool import StaticPool
 
 from runpod_sdxl_image_studio.adapters.catalog.upscaler_catalog import UpscalerCatalog
 from runpod_sdxl_image_studio.adapters.comfyui.client import ComfyUIClient
@@ -53,7 +56,10 @@ from runpod_sdxl_image_studio.adapters.storage.local_storage import LocalStorage
 from runpod_sdxl_image_studio.config import Settings
 from runpod_sdxl_image_studio.domain.generation import GenerationKind, GenerationStatus
 from runpod_sdxl_image_studio.domain.generation_artifact import ArtifactType, GenerationArtifact
-from runpod_sdxl_image_studio.domain.generation_queue import OptionalArtifactRepairOutcome
+from runpod_sdxl_image_studio.domain.generation_queue import (
+    OptionalArtifactRepairCandidate,
+    OptionalArtifactRepairOutcome,
+)
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
 from runpod_sdxl_image_studio.domain.job import GenerationJob
@@ -69,6 +75,8 @@ from runpod_sdxl_image_studio.domain.upscale_snapshot import (
     UpscaleSettingsSnapshot,
     UpscaleSnapshotError,
 )
+from runpod_sdxl_image_studio.jobs.generation_queue_worker import GenerationQueueWorker
+from runpod_sdxl_image_studio.services import generation_recovery_service as recovery_module
 from runpod_sdxl_image_studio.services.generation_persistence import (
     GenerationPersistenceRepositories,
 )
@@ -724,7 +732,11 @@ async def test_reconciliation_repairs_completed_optional_artifacts_without_comfy
 
     now = datetime(2026, 8, 3, 12, 0, tzinfo=UTC)
     settings = Settings(_env_file=None, data_dir=tmp_path)
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
     generations = GenerationRepository(factory)
@@ -811,6 +823,18 @@ async def test_reconciliation_repairs_completed_optional_artifacts_without_comfy
     assert before_generation.completed_at is not None
     assert before_job.completed_at == before_generation.completed_at
     assert len(artifacts.list_by_generation(generation_id)) == 1
+    candidate_page = generations.list_completed_optional_artifact_repairs(1)
+    assert len(candidate_page) == 1
+    assert candidate_page[0].generation_id == generation_id
+    assert candidate_page[0].completed_at == before_generation.completed_at
+    assert (
+        generations.list_completed_optional_artifact_repairs(
+            1,
+            after_completed_at=candidate_page[0].completed_at,
+            after_generation_id=candidate_page[0].generation_id,
+        )
+        == ()
+    )
 
     class Client:
         calls = 0
@@ -834,8 +858,16 @@ async def test_reconciliation_repairs_completed_optional_artifacts_without_comfy
         completed_optional_artifact_handler=service.repair_optional_artifacts,
     )
 
+    worker = GenerationQueueWorker(
+        GenerationDispatchQueueRepository(factory),
+        object(),
+        settings,
+        completed_optional_artifact_handler=recovery.repair_completed_optional_artifacts,
+    )
+    await worker.reconcile()
+
     first_messages = await recovery.recover(now)
-    assert f"{generation_id}: optional artifacts repaired" in first_messages
+    assert first_messages == ()
     assert client.calls == 0
     repaired = artifacts.list_by_generation(generation_id)
     assert len([item for item in repaired if item.artifact_type is ArtifactType.IMAGE]) == 1
@@ -855,3 +887,86 @@ async def test_reconciliation_repairs_completed_optional_artifacts_without_comfy
     assert after_generation == before_generation
     assert after_job == before_job
     engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_optional_artifact_reconciliation_rotates_past_deferred_candidates(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caplog.set_level(
+        logging.WARNING,
+        logger="runpod_sdxl_image_studio.services.generation_recovery_service",
+    )
+    warning = Mock()
+    monkeypatch.setattr(recovery_module, "logger", warning)
+    first_id, second_id = uuid4(), uuid4()
+    completed_at = datetime(2026, 8, 5, 12, 0, tzinfo=UTC)
+    candidates = (
+        OptionalArtifactRepairCandidate(first_id, completed_at),
+        OptionalArtifactRepairCandidate(second_id, completed_at),
+    )
+
+    class CandidateRepository:
+        calls: list[tuple[int, datetime | None, UUID | None]] = []
+
+        def list_completed_optional_artifact_repairs(
+            self,
+            limit: int = 50,
+            *,
+            after_completed_at: datetime | None = None,
+            after_generation_id: UUID | None = None,
+        ) -> tuple[OptionalArtifactRepairCandidate, ...]:
+            self.calls.append((limit, after_completed_at, after_generation_id))
+            if after_generation_id is None:
+                return candidates[:limit]
+            if after_generation_id == first_id:
+                return candidates[1:2]
+            return ()
+
+    class JobRepository:
+        def list_recoverable(self, limit: int = 50) -> tuple[object, ...]:
+            del limit
+            return ()
+
+    repository = CandidateRepository()
+    handled: list[UUID] = []
+    first_attempts = 0
+
+    def handler(generation_id: UUID) -> OptionalArtifactRepairOutcome:
+        nonlocal first_attempts
+        handled.append(generation_id)
+        if generation_id == first_id:
+            first_attempts += 1
+            if first_attempts == 1:
+                return OptionalArtifactRepairOutcome.DEFERRED
+            raise RuntimeError("unexpected maintenance failure")
+        return OptionalArtifactRepairOutcome.REPAIRED
+
+    recovery = GenerationRecoveryService(
+        object(),  # type: ignore[arg-type]
+        repository,  # type: ignore[arg-type]
+        JobRepository(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        Settings(_env_file=None, recovery_max_items=1),
+        completed_optional_artifact_handler=handler,
+    )
+
+    first_messages = await recovery.repair_completed_optional_artifacts()
+    second_messages = await recovery.repair_completed_optional_artifacts()
+    third_messages = await recovery.repair_completed_optional_artifacts()
+
+    assert first_messages == (f"{first_id}: optional artifacts deferred",)
+    assert second_messages == (f"{second_id}: optional artifacts repaired",)
+    assert third_messages == ()
+    assert handled == [first_id, second_id, first_id]
+    assert repository.calls[0] == (1, None, None)
+    assert repository.calls[1] == (1, completed_at, first_id)
+    assert repository.calls[2] == (1, completed_at, second_id)
+    assert repository.calls[3] == (1, None, None)
+    assert any(
+        call.args[0] == "Completed optional artifact repair failed generation=%s error=%s"
+        and call.args[1] == first_id
+        and call.kwargs.get("exc_info") is True
+        for call in warning.warning.call_args_list
+    )

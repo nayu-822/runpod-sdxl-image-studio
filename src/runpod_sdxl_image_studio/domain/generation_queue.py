@@ -47,6 +47,14 @@ class OptionalArtifactRepairOutcome(StrEnum):
     UNAVAILABLE = "unavailable"
 
 
+@dataclass(frozen=True)
+class OptionalArtifactRepairCandidate:
+    """Cursor material for one completed generation missing optional artifacts."""
+
+    generation_id: UUID
+    completed_at: datetime
+
+
 class CancellationOutcome(StrEnum):
     """Typed result of requesting and verifying a ComfyUI cancellation."""
 
@@ -109,6 +117,7 @@ __all__ = [
     "GenerationBatch",
     "GenerationQueueEntry",
     "GenerationQueueItem",
+    "OptionalArtifactRepairCandidate",
     "OptionalArtifactRepairOutcome",
     "ReconciliationOutcome",
     "SubmissionState",

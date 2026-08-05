@@ -252,6 +252,7 @@ class GenerationService:
                 "Optional artifact repair lookup failed generation=%s error=%s",
                 generation_id,
                 type(exc).__name__,
+                exc_info=True,
             )
             return OptionalArtifactRepairOutcome.UNAVAILABLE
 
@@ -303,6 +304,7 @@ class GenerationService:
                 "Optional artifact repair deferred generation=%s error=%s",
                 generation_id,
                 type(exc).__name__,
+                exc_info=True,
             )
             return OptionalArtifactRepairOutcome.DEFERRED
 

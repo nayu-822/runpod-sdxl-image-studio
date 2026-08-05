@@ -35,6 +35,7 @@ from runpod_sdxl_image_studio.domain.generation_history import (
     GenerationHistoryQuery,
     GenerationHistorySort,
 )
+from runpod_sdxl_image_studio.domain.generation_queue import OptionalArtifactRepairCandidate
 from runpod_sdxl_image_studio.domain.generation_snapshot import (
     GenerationSettingsSnapshot,
     SnapshotError,
@@ -77,7 +78,13 @@ class GenerationRepositoryProtocol(Protocol):
 
     def get_by_prompt_id(self, prompt_id: str) -> Generation | None: ...
 
-    def list_completed_optional_artifact_repairs(self, limit: int = 50) -> tuple[UUID, ...]: ...
+    def list_completed_optional_artifact_repairs(
+        self,
+        limit: int = 50,
+        *,
+        after_completed_at: datetime | None = None,
+        after_generation_id: UUID | None = None,
+    ) -> tuple[OptionalArtifactRepairCandidate, ...]: ...
 
     def list_history(self, query: GenerationHistoryFilter) -> GenerationHistoryPage: ...
 
@@ -199,7 +206,13 @@ class GenerationRepository(GenerationRepositoryProtocol):
         except (SQLAlchemyError, SnapshotError) as exc:
             raise GenerationRepositoryError("generation could not be read") from exc
 
-    def list_completed_optional_artifact_repairs(self, limit: int = 50) -> tuple[UUID, ...]:
+    def list_completed_optional_artifact_repairs(
+        self,
+        limit: int = 50,
+        *,
+        after_completed_at: datetime | None = None,
+        after_generation_id: UUID | None = None,
+    ) -> tuple[OptionalArtifactRepairCandidate, ...]:
         """Find completed pairs with a primary image and a missing optional artifact."""
 
         bounded_limit = min(max(1, limit), 100)
@@ -217,8 +230,8 @@ class GenerationRepository(GenerationRepositoryProtocol):
         )
         try:
             with session_scope(self._session_factory) as session:
-                rows = session.scalars(
-                    select(GenerationModel.id)
+                statement = (
+                    select(GenerationModel.id, GenerationModel.completed_at)
                     .join(
                         GenerationJobModel,
                         GenerationJobModel.generation_id == GenerationModel.id,
@@ -226,13 +239,38 @@ class GenerationRepository(GenerationRepositoryProtocol):
                     .where(
                         GenerationModel.status == GenerationStatus.COMPLETED.value,
                         GenerationJobModel.status == GenerationStatus.COMPLETED.value,
+                        GenerationModel.completed_at.is_not(None),
+                        GenerationJobModel.completed_at.is_not(None),
+                        GenerationModel.completed_at == GenerationJobModel.completed_at,
                         primary_exists,
                         or_(~metadata_exists, ~thumbnail_exists),
                     )
-                    .order_by(GenerationModel.completed_at.asc(), GenerationModel.id.asc())
-                    .limit(bounded_limit)
+                )
+                if after_completed_at is not None and after_generation_id is not None:
+                    cursor_time = _utc(after_completed_at)
+                    statement = statement.where(
+                        or_(
+                            GenerationModel.completed_at > cursor_time,
+                            and_(
+                                GenerationModel.completed_at == cursor_time,
+                                GenerationModel.id > str(after_generation_id),
+                            ),
+                        )
+                    )
+                elif after_completed_at is not None or after_generation_id is not None:
+                    raise ValueError("optional artifact repair cursor must be complete")
+                rows = session.execute(
+                    statement.order_by(
+                        GenerationModel.completed_at.asc(), GenerationModel.id.asc()
+                    ).limit(bounded_limit)
                 ).all()
-                return tuple(UUID(row) for row in rows)
+                return tuple(
+                    OptionalArtifactRepairCandidate(
+                        generation_id=UUID(row.id),
+                        completed_at=_utc(row.completed_at) or datetime.now(UTC),
+                    )
+                    for row in rows
+                )
         except (SQLAlchemyError, ValueError) as exc:
             raise GenerationRepositoryError(
                 "completed optional artifact repairs could not be read"

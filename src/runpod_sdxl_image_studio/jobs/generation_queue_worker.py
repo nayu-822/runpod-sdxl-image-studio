@@ -37,6 +37,7 @@ from runpod_sdxl_image_studio.services.generation_service import (
 logger = logging.getLogger(__name__)
 ProgressReporter = Callable[[GenerationProgress], None]
 ReconcileHandler = Callable[[GenerationQueueItem], Awaitable[ReconciliationOutcome]]
+CompletedOptionalArtifactMaintenanceHandler = Callable[[], Awaitable[tuple[str, ...]]]
 
 
 class CancellationAdapter(Protocol):
@@ -90,6 +91,8 @@ class GenerationQueueWorker:
         reconcile_handler: ReconcileHandler | None = None,
         cancellation_adapter: CancellationAdapter | None = None,
         progress_reporter: ProgressReporter | None = None,
+        completed_optional_artifact_handler: CompletedOptionalArtifactMaintenanceHandler
+        | None = None,
     ) -> None:
         self._repository = repository
         self._execution_service = execution_service
@@ -98,6 +101,7 @@ class GenerationQueueWorker:
         self._reconcile_handler = reconcile_handler
         self._cancellation_adapter = cancellation_adapter
         self._progress_reporter = progress_reporter
+        self._completed_optional_artifact_handler = completed_optional_artifact_handler
         self._stop_requested = threading.Event()
         self._wake_requested = threading.Event()
         self._thread: threading.Thread | None = None
@@ -347,6 +351,16 @@ class GenerationQueueWorker:
                     )
         except GenerationDispatchQueueRepositoryError:
             logger.warning("generation worker reconciliation failed", exc_info=True)
+        if self._completed_optional_artifact_handler is not None:
+            try:
+                await self._completed_optional_artifact_handler()
+            except Exception as exc:  # noqa: BLE001 - maintenance must not stop the worker
+                logger.warning(
+                    "completed optional artifact maintenance failed worker_id=%s error=%s",
+                    self.worker_id,
+                    type(exc).__name__,
+                    exc_info=True,
+                )
 
     async def _heartbeat(self, sequence: int) -> None:
         while True:
