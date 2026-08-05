@@ -273,6 +273,39 @@ async def test_worker_runs_optional_artifact_maintenance_after_queue_reconciliat
     engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_worker_stop_cancels_optional_artifact_maintenance() -> None:
+    engine, factory = _database()
+    repository = GenerationDispatchQueueRepository(factory)
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def maintain() -> tuple[str, ...]:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    worker = GenerationQueueWorker(
+        repository,
+        object(),
+        Settings(_env_file=None),
+        completed_optional_artifact_handler=maintain,
+    )
+
+    await worker.reconcile()
+    maintenance_task = worker._optional_artifact_maintenance_task  # noqa: SLF001
+    assert maintenance_task is not None
+    await started.wait()
+    await worker._stop_optional_artifact_maintenance()  # noqa: SLF001
+
+    assert cancelled.is_set()
+    assert worker._optional_artifact_maintenance_task is None  # noqa: SLF001
+    engine.dispose()
+
+
 @pytest.mark.parametrize("stale", [False, True])
 def test_worker_only_fails_true_not_found_after_grace(stale: bool) -> None:
     engine, factory = _database()
