@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -19,6 +20,13 @@ from runpod_sdxl_image_studio.services.upscale_enqueue_service import (
     UpscaleEnqueueError,
     UpscaleEnqueueService,
 )
+
+logger = logging.getLogger(__name__)
+
+_UPSCALE_INPUT_ERROR = "入力内容または親画像を確認してください。"
+_PARENT_SELECTION_ERROR = "親画像を選択できません。完了済みの画像を指定してください。"
+_RESULT_ERROR = "アップスケール結果を表示できません。"
+_INTERNAL_ERROR = "アップスケール処理中に内部エラーが発生しました。"
 
 
 @dataclass(frozen=True)
@@ -145,8 +153,11 @@ def make_parent_selection_handler(
                 str(selection.preview_path),
                 f"親画像を選択しました: `{selection.generation_id}`",
             )
-        except (ValueError, UpscaleEnqueueError) as exc:
-            return "", None, f"親画像を選択できません: {exc}"
+        except (ValueError, UpscaleEnqueueError):
+            return "", None, _PARENT_SELECTION_ERROR
+        except Exception:  # noqa: BLE001 - UI must not expose internal exception details
+            logger.exception("Upscale parent selection failed")
+            return "", None, _INTERNAL_ERROR
 
     return handler
 
@@ -165,7 +176,10 @@ def make_upscale_result_handler(
                 f"アップスケール結果を表示しました: `{result.result_generation_id}`",
             )
         except (ValueError, UpscaleEnqueueError):
-            return None, [], ""
+            return None, [], _RESULT_ERROR
+        except Exception:  # noqa: BLE001 - UI must not expose internal exception details
+            logger.exception("Upscale result lookup failed")
+            return None, [], _INTERNAL_ERROR
 
     return handler
 
@@ -215,8 +229,11 @@ def make_upscale_enqueue_details_handler(
                 f"`{item.generation.settings_snapshot.width} x "
                 f"{item.generation.settings_snapshot.height}`"
             )
-        except Exception as exc:  # noqa: BLE001 - restore the button on every safe error
-            return gr.Button(interactive=True), f"アップスケールを追加できませんでした: {exc}"
+        except (ValueError, UpscaleEnqueueError):
+            return gr.Button(interactive=True), _UPSCALE_INPUT_ERROR
+        except Exception:  # noqa: BLE001 - restore the button without exposing internals
+            logger.exception("Upscale enqueue details failed")
+            return gr.Button(interactive=True), _INTERNAL_ERROR
 
     return handler
 
@@ -248,8 +265,11 @@ def make_upscale_enqueue_handler(
             return gr.Button(
                 interactive=True
             ), f"キューへ追加しました（順序 {item.entry.sequence}）。"
-        except Exception as exc:  # noqa: BLE001 - every safe UI path restores the button
-            return gr.Button(interactive=True), f"アップスケールを追加できませんでした: {exc}"
+        except (ValueError, UpscaleEnqueueError):
+            return gr.Button(interactive=True), _UPSCALE_INPUT_ERROR
+        except Exception:  # noqa: BLE001 - restore the button without exposing internals
+            logger.exception("Upscale enqueue failed")
+            return gr.Button(interactive=True), _INTERNAL_ERROR
 
     return handler
 
@@ -283,8 +303,11 @@ def make_upscale_plan_handler(
                 f"（親 {plan.source_width} × {plan.source_height}、"
                 f"負荷: `{plan.load_level.value}`）"
             )
-        except (ValueError, UpscaleEnqueueError) as exc:
-            return f"サイズ計画を確認できません: {exc}"
+        except (ValueError, UpscaleEnqueueError):
+            return _UPSCALE_INPUT_ERROR
+        except Exception:  # noqa: BLE001 - UI must not expose internal exception details
+            logger.exception("Upscale plan failed")
+            return _INTERNAL_ERROR
 
     return handler
 

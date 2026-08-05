@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import Mock
 from uuid import UUID, uuid4
 
+import gradio as gr
 import httpx
 import pytest
 import respx
@@ -22,6 +23,7 @@ from sqlalchemy.pool import StaticPool
 
 from runpod_sdxl_image_studio.adapters.catalog.upscaler_catalog import UpscalerCatalog
 from runpod_sdxl_image_studio.adapters.comfyui.client import ComfyUIClient
+from runpod_sdxl_image_studio.adapters.comfyui.models import ComfyUICapabilities
 from runpod_sdxl_image_studio.adapters.comfyui.upscale_workflow_adapter import (
     UpscaleWorkflowAdapter,
 )
@@ -65,6 +67,8 @@ from runpod_sdxl_image_studio.domain.generation_queue import (
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
 from runpod_sdxl_image_studio.domain.job import GenerationJob
+from runpod_sdxl_image_studio.domain.lora import LoraSetting
+from runpod_sdxl_image_studio.domain.system_status import CapabilityRefreshResult
 from runpod_sdxl_image_studio.domain.upscale import (
     UpscaleLoadLevel,
     UpscaleMethod,
@@ -79,9 +83,11 @@ from runpod_sdxl_image_studio.domain.upscale_snapshot import (
 )
 from runpod_sdxl_image_studio.jobs.generation_queue_worker import GenerationQueueWorker
 from runpod_sdxl_image_studio.services import generation_recovery_service as recovery_module
+from runpod_sdxl_image_studio.services import generation_service as generation_module
 from runpod_sdxl_image_studio.services.generation_persistence import (
     GenerationPersistenceRepositories,
 )
+from runpod_sdxl_image_studio.services.generation_queue_service import GenerationQueueService
 from runpod_sdxl_image_studio.services.generation_recovery_service import (
     GenerationRecoveryService,
 )
@@ -90,6 +96,7 @@ from runpod_sdxl_image_studio.services.upscale_enqueue_service import (
     UpscaleEnqueueError,
     UpscaleEnqueueService,
 )
+from runpod_sdxl_image_studio.ui.tabs import upscale_tab as upscale_ui
 from runpod_sdxl_image_studio.workflows.loader import load_workflow_template
 
 
@@ -242,6 +249,380 @@ def test_upscale_enqueue_rejects_source_mutation_before_generation_creation(tmp_
 
         verify_source_artifact(artifact, settings)
     assert error.value.code == "upscale_source_changed"
+
+
+def test_upscale_retry_preserves_parent_snapshots_and_does_not_resubmit_prompt(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(_env_file=None, data_dir=tmp_path)
+    storage = LocalStorageAdapter(settings)
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    factory = create_session_factory(engine)
+    generations = GenerationRepository(factory)
+    artifacts = GenerationArtifactRepository(factory)
+    completion = GenerationCompletionRepository(factory)
+    start = GenerationStartRepository(factory)
+    dispatch = GenerationDispatchQueueRepository(factory)
+    queue = GenerationQueueRepository(factory)
+    failure = GenerationFailureRepository(factory)
+    upscale_repository = UpscaleSettingsRepository(factory)
+    parent_id, parent_job_id = uuid4(), uuid4()
+    now = datetime.now(UTC)
+    source = storage.store_image(_png(), parent_id, now)
+    parent_artifact = GenerationArtifact(
+        id=uuid4(),
+        generation_id=parent_id,
+        artifact_type=ArtifactType.IMAGE,
+        local_path=storage.relative_path(source.path),
+        sha256=source.sha256,
+        size_bytes=source.size_bytes,
+        width=source.width,
+        height=source.height,
+        mime_type=source.mime_type,
+        created_at=now,
+    )
+    start.create_pending(
+        GenerationSettingsSnapshot.from_settings(_settings()),
+        generation_id=parent_id,
+        job_id=parent_job_id,
+        kind=GenerationKind.STANDARD,
+        parent_generation_id=None,
+        created_at=now,
+    )
+    artifacts.add(parent_artifact)
+    completion.complete_generation(parent_id, parent_job_id, parent_artifact, now)
+    enqueue = UpscaleEnqueueService(
+        generations,
+        artifacts,
+        dispatch,
+        settings,
+        catalog=UpscalerCatalog(("4x.pth",)),
+    )
+    original = enqueue.enqueue(
+        parent_id,
+        UpscaleSettings(
+            method=UpscaleMethod.IMAGE,
+            sizing_mode=UpscaleSizingMode.FACTOR,
+            scale_factor=2,
+            upscaler_name="4x.pth",
+        ),
+    )
+    queue.mark_queued(original.generation.id, original.job.id, "old-upscale-prompt")
+    original_snapshot = original.generation.settings_snapshot
+    original_upscale = upscale_repository.get_by_generation(original.generation.id)
+    assert original_upscale is not None
+    failure.fail_generation(
+        original.generation.id,
+        original.job.id,
+        error_code="upscale_output_invalid",
+        error_summary="アップスケール出力画像を検証できません。",
+        failed_at=now,
+    )
+
+    service = GenerationQueueService(
+        dispatch,
+        settings,
+        upscale_settings_repository=upscale_repository,
+    )
+    first = service.retry(original.generation.id).item
+    second = service.retry(original.generation.id).item
+
+    assert first.generation.id == second.generation.id
+    assert first.generation.kind is GenerationKind.UPSCALE
+    assert first.generation.parent_generation_id == parent_id
+    assert first.generation.retry_of_generation_id == original.generation.id
+    assert first.generation.retry_attempt == original.generation.retry_attempt + 1
+    assert first.generation.settings_snapshot == original_snapshot
+    retry_upscale = upscale_repository.get_by_generation(first.generation.id)
+    assert retry_upscale is not None
+    assert retry_upscale == original_upscale
+    assert first.job.prompt_id is None
+    assert dispatch.get_queue_item(original.generation.id).job.prompt_id == "old-upscale-prompt"  # type: ignore[union-attr]
+    engine.dispose()
+
+
+def test_upscale_ui_catalog_visibility_and_safe_handlers() -> None:
+    with gr.Blocks():
+        missing_catalog = upscale_ui.build_upscale_tab(None)
+    with gr.Blocks():
+        empty_catalog = upscale_ui.build_upscale_tab(())
+    assert "未取得" in missing_catalog.catalog_message.value
+    assert "0件" in empty_catalog.catalog_message.value
+
+    visibility = upscale_ui.make_upscale_visibility_handler()
+    image_updates = visibility(UpscaleMethod.IMAGE.value)
+    latent_updates = visibility(UpscaleMethod.LATENT.value)
+    assert image_updates[0]["visible"] is True
+    assert image_updates[1]["visible"] is False
+    assert latent_updates[0]["visible"] is False
+    assert latent_updates[1]["visible"] is True
+
+    generation_id = uuid4()
+    service = Mock()
+    service.latest_completed_generation_id.return_value = generation_id
+    service.select_parent.return_value = Mock(
+        generation_id=generation_id,
+        preview_path=Path("generations/source.png"),
+    )
+    latest_result = upscale_ui.make_latest_parent_selection_handler(service)()
+    assert latest_result[0] == str(generation_id)
+    assert Path(latest_result[1]) == Path("generations/source.png")
+    assert len(latest_result) == 3
+
+    service.comparison_for_generation.return_value = Mock(
+        result_generation_id=generation_id,
+        result_path=Path("generations/upscaled.png"),
+        gallery=(("generations/source.png", "parent"), ("generations/upscaled.png", "upscaled")),
+    )
+    comparison = upscale_ui.make_upscale_result_handler(service)(str(generation_id))
+    assert Path(comparison[0]) == Path("generations/upscaled.png")
+    assert len(comparison[1]) == 2
+    assert len(comparison) == 3
+
+    service.select_parent.side_effect = UpscaleEnqueueError(
+        "upscale_parent_not_completed", "secret internal details"
+    )
+    parent_result = upscale_ui.make_parent_selection_handler(service)(str(generation_id))
+    assert len(parent_result) == 3
+    assert "secret" not in parent_result[2]
+    assert "完了済み" in parent_result[2]
+
+    service.select_parent.side_effect = RuntimeError("secret internal details")
+    unexpected_parent_result = upscale_ui.make_parent_selection_handler(service)(str(generation_id))
+    assert len(unexpected_parent_result) == 3
+    assert "secret" not in unexpected_parent_result[2]
+    assert "内部エラー" in unexpected_parent_result[2]
+
+    service.comparison_for_generation.side_effect = UpscaleEnqueueError(
+        "upscale_result_not_completed", "secret internal details"
+    )
+    result = upscale_ui.make_upscale_result_handler(service)(str(generation_id))
+    assert len(result) == 3
+    assert "secret" not in result[2]
+    assert result[0] is None
+    assert result[1] == []
+
+    service.comparison_for_generation.side_effect = RuntimeError("secret internal details")
+    unexpected_result = upscale_ui.make_upscale_result_handler(service)(str(generation_id))
+    assert len(unexpected_result) == 3
+    assert "secret" not in unexpected_result[2]
+    assert "内部エラー" in unexpected_result[2]
+
+
+def test_upscale_ui_enqueue_and_plan_handlers_restore_button_on_all_errors() -> None:
+    service = Mock()
+    inputs = (
+        str(uuid4()),
+        UpscaleMethod.IMAGE.value,
+        UpscaleSizingMode.FACTOR.value,
+        2,
+        1024,
+        1024,
+        "4x.pth",
+        0.35,
+    )
+
+    service.enqueue.side_effect = UpscaleEnqueueError("upscale_parent_not_completed", "secret")
+    enqueue_result = upscale_ui.make_upscale_enqueue_handler(service)(*inputs)
+    assert len(enqueue_result) == 2
+    assert enqueue_result[0].interactive is True
+    assert "secret" not in enqueue_result[1]
+
+    service.enqueue.side_effect = RuntimeError("secret")
+    unexpected_enqueue_result = upscale_ui.make_upscale_enqueue_details_handler(service)(*inputs)
+    assert len(unexpected_enqueue_result) == 2
+    assert unexpected_enqueue_result[0].interactive is True
+    assert "secret" not in unexpected_enqueue_result[1]
+    assert "内部エラー" in unexpected_enqueue_result[1]
+
+    service.plan.side_effect = UpscaleEnqueueError("upscale_parent_not_completed", "secret")
+    plan_result = upscale_ui.make_upscale_plan_handler(service)(*inputs)
+    assert "secret" not in plan_result
+    assert "入力内容" in plan_result
+
+    service.plan.side_effect = RuntimeError("secret")
+    unexpected_plan_result = upscale_ui.make_upscale_plan_handler(service)(*inputs)
+    assert "secret" not in unexpected_plan_result
+    assert "内部エラー" in unexpected_plan_result
+
+
+@pytest.mark.parametrize(
+    ("method", "missing_capability"),
+    [
+        (UpscaleMethod.IMAGE, "capabilities"),
+        (UpscaleMethod.IMAGE, "required_node"),
+        (UpscaleMethod.IMAGE, "remote_model"),
+        (UpscaleMethod.IMAGE, "local_model"),
+        (UpscaleMethod.LATENT, "checkpoint"),
+        (UpscaleMethod.LATENT, "sampler"),
+        (UpscaleMethod.LATENT, "scheduler"),
+        (UpscaleMethod.LATENT, "lora"),
+        (UpscaleMethod.LATENT, "lora_node"),
+        (UpscaleMethod.LATENT, "vae"),
+        (UpscaleMethod.LATENT, "vae_node"),
+        (UpscaleMethod.LATENT, "latent_node"),
+    ],
+)
+def test_upscale_preflight_rejects_missing_capabilities_before_submission(
+    method: UpscaleMethod,
+    missing_capability: str,
+) -> None:
+    loras = (LoraSetting(name="style.safetensors", order=0),)
+    source_settings = _settings().model_copy(
+        update={
+            "vae_name": "vae.safetensors",
+            "loras": loras,
+        }
+    )
+    snapshot = UpscaleSettingsSnapshot.from_settings(
+        UpscaleSettings(
+            method=method,
+            sizing_mode=UpscaleSizingMode.FACTOR,
+            scale_factor=2,
+            upscaler_name="4x.pth" if method is UpscaleMethod.IMAGE else None,
+            denoise=0.35 if method is UpscaleMethod.LATENT else None,
+            workflow_template_id=(
+                "sdxl_image_upscale" if method is UpscaleMethod.IMAGE else "sdxl_latent_upscale"
+            ),
+        ),
+        source_generation_id=uuid4(),
+        source_artifact_id=uuid4(),
+        source_sha256="a" * 64,
+        source_width=512,
+        source_height=512,
+        target_width=1024,
+        target_height=1024,
+    )
+    image_nodes = {
+        "LoadImage",
+        "UpscaleModelLoader",
+        "ImageUpscaleWithModel",
+        "ImageScale",
+        "SaveImage",
+    }
+    latent_nodes = {
+        "LoadImage",
+        "CheckpointLoaderSimple",
+        "CLIPTextEncode",
+        "VAEEncode",
+        "LatentUpscale",
+        "KSampler",
+        "VAEDecode",
+        "SaveImage",
+        "LoraLoader",
+        "VAELoader",
+    }
+    all_capabilities = ComfyUICapabilities(
+        checkpoints=("sdxl.safetensors",),
+        vaes=("vae.safetensors",),
+        samplers=("euler",),
+        schedulers=("normal",),
+        loras=("style.safetensors",),
+        upscale_models=("4x.pth",),
+        available_node_classes=frozenset(image_nodes | latent_nodes),
+        warnings=(),
+    )
+    capabilities = all_capabilities
+    if missing_capability == "capabilities":
+        capabilities_result = CapabilityRefreshResult(False, "unavailable", None)
+    else:
+        if missing_capability == "remote_model":
+            capabilities = capabilities.__class__(**capabilities.__dict__ | {"upscale_models": ()})
+        elif missing_capability == "checkpoint":
+            capabilities = capabilities.__class__(**capabilities.__dict__ | {"checkpoints": ()})
+        elif missing_capability == "sampler":
+            capabilities = capabilities.__class__(**capabilities.__dict__ | {"samplers": ()})
+        elif missing_capability == "scheduler":
+            capabilities = capabilities.__class__(**capabilities.__dict__ | {"schedulers": ()})
+        elif missing_capability == "lora":
+            capabilities = capabilities.__class__(**capabilities.__dict__ | {"loras": ()})
+        elif missing_capability == "vae":
+            capabilities = capabilities.__class__(**capabilities.__dict__ | {"vaes": ()})
+        elif missing_capability == "required_node":
+            capabilities = capabilities.__class__(
+                **capabilities.__dict__ | {"available_node_classes": frozenset()}
+            )
+        elif missing_capability in {"lora_node", "vae_node", "latent_node"}:
+            nodes = set(capabilities.available_node_classes)
+            nodes.remove(
+                {
+                    "lora_node": "LoraLoader",
+                    "vae_node": "VAELoader",
+                    "latent_node": "LatentUpscale",
+                }[missing_capability]
+            )
+            capabilities = capabilities.__class__(
+                **capabilities.__dict__ | {"available_node_classes": frozenset(nodes)}
+            )
+        elif missing_capability == "local_model":
+            pass
+        capabilities_result = CapabilityRefreshResult(True, "ok", capabilities)
+
+    async def capability_provider() -> CapabilityRefreshResult:
+        return capabilities_result
+
+    service = GenerationService(
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        capability_provider,
+        Settings(_env_file=None),
+        upscaler_catalog=UpscalerCatalog(())
+        if missing_capability == "local_model"
+        else UpscalerCatalog(("4x.pth",)),
+    )
+
+    with pytest.raises(UpscaleEnqueueError) as error:
+        source_snapshot = GenerationSettingsSnapshot.from_settings(source_settings)
+        asyncio.run(service._preflight_upscale(snapshot, source_snapshot))  # noqa: SLF001
+
+    expected_codes = {
+        "capabilities": "upscale_capabilities_unavailable",
+        "required_node": "upscale_required_node_missing",
+        "remote_model": "upscale_model_missing",
+        "local_model": "upscale_model_missing",
+        "checkpoint": "upscale_checkpoint_missing",
+        "sampler": "upscale_sampler_missing",
+        "scheduler": "upscale_scheduler_missing",
+        "lora": "upscale_lora_missing",
+        "lora_node": "upscale_lora_missing",
+        "vae": "upscale_vae_missing",
+        "vae_node": "upscale_required_node_missing",
+        "latent_node": "upscale_required_node_missing",
+    }
+    assert error.value.code == expected_codes[missing_capability]
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "upscale_output_dimension_mismatch",
+        "upscale_output_invalid",
+        "upscale_settings_missing",
+        "upscale_capabilities_unavailable",
+        "upscale_required_node_missing",
+        "upscale_checkpoint_missing",
+        "upscale_sampler_missing",
+        "upscale_scheduler_missing",
+        "upscale_lora_missing",
+        "upscale_vae_missing",
+        "upscale_model_missing",
+    ],
+)
+def test_upscale_failure_summaries_are_stable_and_do_not_expose_details(code: str) -> None:
+    error = UpscaleEnqueueError(code, "secret path=/tmp/internal response body")
+    first = generation_module._safe_generation_error(error)  # noqa: SLF001
+    second = generation_module._safe_generation_error(error)  # noqa: SLF001
+    assert first == second
+    assert first
+    assert "secret" not in first
+    assert "/tmp" not in first
 
 
 def test_upscale_workflows_are_fixed_and_bind_only_typed_values() -> None:

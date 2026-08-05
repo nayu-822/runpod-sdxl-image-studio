@@ -103,6 +103,14 @@ logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[GenerationProgress], None]
 CancelCheck = Callable[[], bool]
 
+_RECONCILIATION_UPSCALE_FAILURE_CODES = frozenset(
+    {
+        "upscale_output_dimension_mismatch",
+        "upscale_output_invalid",
+        "upscale_settings_missing",
+    }
+)
+
 
 class HistoryTimeoutError(ComfyUIPromptError):
     """履歴のポーリングが設定された試行回数に達した。"""
@@ -401,7 +409,7 @@ class GenerationService:
                 try:
                     persisted_upscale = self._validate_upscale_output(generation_id, image_bytes)
                 except UpscaleEnqueueError as exc:
-                    if exc.code == "upscale_output_dimension_mismatch":
+                    if exc.code in _RECONCILIATION_UPSCALE_FAILURE_CODES:
                         return self._fail_reconciled_upscale(job, exc)
                     raise
             stored_image = self._storage.store_image(
@@ -411,7 +419,7 @@ class GenerationService:
                 try:
                     self._ensure_stored_upscale_dimensions(stored_image, persisted_upscale)
                 except UpscaleEnqueueError as exc:
-                    if exc.code == "upscale_output_dimension_mismatch":
+                    if exc.code in _RECONCILIATION_UPSCALE_FAILURE_CODES:
                         return self._fail_reconciled_upscale(job, exc)
                     raise
             recovery_job = GenerationJob(
@@ -462,7 +470,7 @@ class GenerationService:
     def _fail_reconciled_upscale(
         self, job: GenerationJob, error: UpscaleEnqueueError
     ) -> ReconciliationOutcome:
-        self._mark_failed_pair(job, error.code, str(error))
+        self._mark_failed_pair(job, error.code, _safe_upscale_error(error))
         return ReconciliationOutcome.FAILED
 
     @staticmethod
@@ -964,12 +972,7 @@ class GenerationService:
         image_bytes = await self._client.get_output_image(history.outputs[0])
         persisted_upscale = None
         if kind is GenerationKind.UPSCALE:
-            try:
-                persisted_upscale = self._validate_upscale_output(job.generation_id, image_bytes)
-            except UpscaleEnqueueError as exc:
-                if exc.code == "upscale_output_dimension_mismatch":
-                    self._mark_failed_pair(job, exc.code, str(exc))
-                raise
+            persisted_upscale = self._validate_upscale_output(job.generation_id, image_bytes)
         job.stored_image = self._storage.store_image(
             image_bytes,
             job.generation_id,
@@ -993,11 +996,7 @@ class GenerationService:
                     "ComfyUIのアップスケール出力寸法が要求値と一致しません。",
                 )
         if persisted_upscale is not None and job.stored_image is not None:
-            try:
-                self._ensure_stored_upscale_dimensions(job.stored_image, persisted_upscale)
-            except UpscaleEnqueueError as exc:
-                self._mark_failed_pair(job, exc.code, str(exc))
-                raise
+            self._ensure_stored_upscale_dimensions(job.stored_image, persisted_upscale)
         self._complete_job(job, settings, created_at, kind, parent_generation_id)
 
     async def _preflight_upscale(
@@ -1446,6 +1445,8 @@ def _safe_generation_error(
     *,
     original_error: Exception | None = None,
 ) -> str:
+    if isinstance(error, UpscaleEnqueueError):
+        return _safe_upscale_error(error)
     if isinstance(error, GenerationPersistenceError):
         if isinstance(error, FailurePersistenceError) and original_error is not None:
             return "生成に失敗しました。加えて、履歴の失敗状態を完全に保存できませんでした。"
@@ -1463,6 +1464,23 @@ def _safe_generation_error(
     if isinstance(error, TimeoutError):
         return "画像生成が制限時間を超えました。"
     return "画像生成に失敗しました。"
+
+
+def _safe_upscale_error(error: UpscaleEnqueueError) -> str:
+    messages = {
+        "upscale_output_dimension_mismatch": "アップスケール出力の寸法が要求値と一致しません。",
+        "upscale_output_invalid": "アップスケール出力画像を検証できません。",
+        "upscale_settings_missing": "アップスケール設定を確認できません。",
+        "upscale_capabilities_unavailable": "ComfyUIの機能情報を取得できません。",
+        "upscale_required_node_missing": "アップスケールに必要なComfyUIノードがありません。",
+        "upscale_checkpoint_missing": "アップスケールに必要なcheckpointがありません。",
+        "upscale_sampler_missing": "アップスケールに必要なsamplerがありません。",
+        "upscale_scheduler_missing": "アップスケールに必要なschedulerがありません。",
+        "upscale_lora_missing": "アップスケールに必要なLoRAがありません。",
+        "upscale_vae_missing": "アップスケールに必要なVAEがありません。",
+        "upscale_model_missing": "アップスケールモデルがありません。",
+    }
+    return messages.get(error.code, "アップスケール処理を完了できません。")
 
 
 def _generation_error_code(error: Exception) -> str:
