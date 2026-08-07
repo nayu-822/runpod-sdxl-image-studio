@@ -443,4 +443,18 @@ ComfyUI input upload、送信前capability検証、出力寸法検証、upscaled
 ただし、実GPU・実ComfyUIを使った運用確認は未実施です。Fake/SQLite/Alembicによる自動テストで検証し、実環境では
 capability不足時のfailed確定、再起動後のhistory復旧、誤寸法出力のfailed確定、元画像非上書き、UIの親画像選択と比較を手動確認する必要があります。
 
-未実装としてPhase 6、複数worker、queue並べ替え、自動retry、Google Drive同期、汎用workflow editorは引き続き対象外です。
+未実装として複数worker、queue並べ替え、自動retry、Google Drive同期、汎用workflow editorは引き続き対象外です。
+
+## フェーズ6の完了状況
+
+フェーズ6を実装済みです。PNG/WebPの安全な検証とcanonical PNG保存、SHA-256・寸法・形式の記録、ComfyUI既知prompt graphと
+本アプリsidecar schema v1の候補解析、raw metadata保持、未解決項目のpreview、明示的なmodel mapping、SQLite `metadata_imports`
+repository、0010 migrationを追加しました。workflow metadataはraw-onlyで保持し、実行・eval・exec・pickle・shellは行いません。
+
+previewからの生成条件適用は明示操作に限定し、外部画像はmetadataなしでも画像アップスケールへ利用できます。Latentアップスケールは
+完全に解決済みのGenerationSettingsだけを受け付け、Queue投入を既存のSQLite transactionへ接続しました。外部sourceのpath、hash、
+寸法、PNG形式はworker実行直前とretry時にも再検証し、変更時は `metadata_import_source_changed` で失敗確定します。
+
+実ComfyUI、実GPU、実RunPod、実Google Driveを使った手動確認は未実施です。自動テストではFake/SQLite/Alembicでparser、storage、
+mapping、外部source provenance、migrationの安全なdowngrade、既存Queue経路を検証します。Phase 7、複数worker、Queue並べ替え、自動retry、
+Google Drive同期、汎用workflow editorは対象外です。

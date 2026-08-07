@@ -32,7 +32,7 @@ prompt ID の保存に失敗した場合は `ready` に戻しません。結果�
 
 単体 retry と failed-only batch retry は元 Generation/Batch との関連を持つ新規キュー項目です。同じ retry 要求を複数回受けても、0005 の NULL許容 partial unique index により既存結果を返し、新規項目を重複作成しません。Random seed、連番 seed、SQLite保存値の上限は `MAX_SEED = 2**63 - 1` に統一しています。
 
-Queue 並べ替え、複数 worker/GPU、自動 retry、Phase 5アップスケール、外部画像metadata、Google Drive同期、汎用workflow editor、LoRA学習は今回の対象外です。
+Queue 並べ替え、複数 worker/GPU、自動 retry、Google Drive同期、汎用workflow editor、LoRA学習は今回の対象外です。
 
 ## フェーズ3A: 生成履歴・スナップショット・再生成
 
@@ -435,3 +435,22 @@ alembic upgrade head
 alembic downgrade -1
 alembic upgrade head
 ```
+
+## Phase 6: 外部画像 metadata インポート
+
+「外部metadata」タブから PNG または WebP と、任意の sidecar JSON をアップロードできます。画像は検証後に
+`<IMAGE_STUDIO_DATA_DIR>/imports/YYYY-MM-DD/images/<uuid>.png` へcanonical PNGとして保存され、元ファイル名、入力SHA-256、保存後SHA-256、サイズ、raw metadataはSQLiteへ記録されます。
+
+ComfyUIの既知の `prompt` graph と本アプリの sidecar schema v1だけを候補へ変換します。`workflow` はraw表示・保存だけで、実行やworkflow選択には使用しません。候補に未解決項目や不足モデルがある場合は、previewで明示的なmodel mappingを確定するまで生成へ適用できません。
+
+生成条件への適用はpreview後の明示操作だけで行われ、適用自体は生成もQueue投入も行いません。外部画像はmetadataがなくても画像アップスケールへ適用できます。Latentアップスケールには完全に解決済みのmetadataが必要です。
+
+Phase 6 migration確認:
+
+```bash
+alembic upgrade head
+alembic downgrade -1
+alembic upgrade head
+```
+
+`generation_upscale_settings` は既存のGeneration Artifact sourceを維持しつつ、外部画像では `source_import_id` とSHA-256を保存します。workerは実行直前にcanonical画像のpath、hash、形式、寸法を再検証し、変更時は `metadata_import_source_changed` として失敗確定します。

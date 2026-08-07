@@ -32,6 +32,7 @@ _INTERNAL_ERROR = "アップスケール処理中に内部エラーが発生し�
 @dataclass(frozen=True)
 class UpscaleTabComponents:
     parent_generation_id: Any
+    source_import_id: Any
     latest_button: Any
     source_preview: Any
     method: Any
@@ -70,6 +71,11 @@ def build_upscale_tab(
         )
     with gr.Row():
         parent_id = gr.Textbox(label="親Generation ID", placeholder="completed generation UUID")
+        source_import_id = gr.Textbox(
+            label="外部Import ID",
+            placeholder="metadata import UUID（外部画像用）",
+            visible=False,
+        )
         source_preview = gr.Image(label="親画像", interactive=False, type="filepath")
     method = gr.Radio(
         [
@@ -98,6 +104,7 @@ def build_upscale_tab(
     comparison = gr.Gallery(label="親画像と結果の比較", columns=2, rows=1)
     return UpscaleTabComponents(
         parent_id,
+        source_import_id,
         gr.Button("最新の完了画像を選択"),
         source_preview,
         method,
@@ -208,6 +215,7 @@ def make_upscale_enqueue_details_handler(
         target_height: float | None,
         upscaler_name: str | None,
         denoise: float | None,
+        source_import_id: str | None = None,
     ) -> tuple[Any, str]:
         try:
             settings = _settings_from_inputs(
@@ -219,8 +227,21 @@ def make_upscale_enqueue_details_handler(
                 upscaler_name,
                 denoise,
             )
-            parent_id = UUID(parent_generation_id.strip())
-            item = service.enqueue(parent_id, settings)
+            import_id = (
+                UUID(source_import_id.strip())
+                if source_import_id and source_import_id.strip()
+                else None
+            )
+            parent_id = (
+                UUID(parent_generation_id.strip())
+                if parent_generation_id and parent_generation_id.strip()
+                else None
+            )
+            item = (
+                service.enqueue_import(import_id, settings)
+                if import_id is not None
+                else service.enqueue(parent_id, settings)  # type: ignore[arg-type]
+            )
             return gr.Button(interactive=True), (
                 f"Generation ID: `{item.generation.id}`\n\n"
                 f"Queue順序: `{item.entry.sequence}`\n\n"
@@ -250,6 +271,7 @@ def make_upscale_enqueue_handler(
         target_height: float | None,
         upscaler_name: str | None,
         denoise: float | None,
+        source_import_id: str | None = None,
     ) -> tuple[Any, str]:
         try:
             settings = _settings_from_inputs(
@@ -261,7 +283,21 @@ def make_upscale_enqueue_handler(
                 upscaler_name,
                 denoise,
             )
-            item = service.enqueue(UUID(parent_generation_id.strip()), settings)
+            import_id = (
+                UUID(source_import_id.strip())
+                if source_import_id and source_import_id.strip()
+                else None
+            )
+            parent_id = (
+                UUID(parent_generation_id.strip())
+                if parent_generation_id and parent_generation_id.strip()
+                else None
+            )
+            item = (
+                service.enqueue_import(import_id, settings)
+                if import_id is not None
+                else service.enqueue(parent_id, settings)  # type: ignore[arg-type]
+            )
             return gr.Button(
                 interactive=True
             ), f"キューへ追加しました（順序 {item.entry.sequence}）。"
@@ -286,6 +322,7 @@ def make_upscale_plan_handler(
         target_height: float | None,
         upscaler_name: str | None,
         denoise: float | None,
+        source_import_id: str | None = None,
     ) -> str:
         try:
             settings = _settings_from_inputs(
@@ -297,7 +334,21 @@ def make_upscale_plan_handler(
                 upscaler_name,
                 denoise,
             )
-            plan = service.plan(UUID(parent_generation_id.strip()), settings)
+            import_id = (
+                UUID(source_import_id.strip())
+                if source_import_id and source_import_id.strip()
+                else None
+            )
+            parent_id = (
+                UUID(parent_generation_id.strip())
+                if parent_generation_id and parent_generation_id.strip()
+                else None
+            )
+            plan = (
+                service.plan_import(import_id, settings)
+                if import_id is not None
+                else service.plan(parent_id, settings)  # type: ignore[arg-type]
+            )
             return (
                 f"予定サイズ: **{plan.target_width} × {plan.target_height}**  "
                 f"（親 {plan.source_width} × {plan.source_height}、"

@@ -227,6 +227,7 @@ def make_check_connection_handler(
     timezone_name: str,
     generation: GenerationTabComponents,
     catalog_service: LoraCatalogService | None = None,
+    capabilities_callback: Callable[[ComfyUICapabilities | None], None] | None = None,
 ) -> Callable[..., Awaitable[tuple[object, ...]]]:
     """Create an async handler that obtains status through the service."""
 
@@ -241,6 +242,8 @@ def make_check_connection_handler(
         lora_category: str | None = None,
     ) -> tuple[object, ...]:
         status = await service.get_status()
+        if capabilities_callback is not None:
+            capabilities_callback(status.capabilities)
         catalog_choices = _catalog_choices(catalog_service, status.capabilities)
         catalog_categories = _catalog_categories(catalog_service)
         updates = _capability_updates(
@@ -265,6 +268,7 @@ def make_refresh_handler(
     service: ComfyUIService,
     generation: GenerationTabComponents,
     catalog_service: LoraCatalogService | None = None,
+    capabilities_callback: Callable[[ComfyUICapabilities | None], None] | None = None,
 ) -> Callable[..., Awaitable[tuple[object, ...]]]:
     """Create an async handler for capability-only refreshes."""
 
@@ -280,7 +284,11 @@ def make_refresh_handler(
     ) -> tuple[object, ...]:
         refresh_result = await service.refresh_capabilities()
         if not refresh_result.is_success or refresh_result.capabilities is None:
+            if capabilities_callback is not None:
+                capabilities_callback(None)
             return (refresh_result.message,) + _preserve_updates(generation)
+        if capabilities_callback is not None:
+            capabilities_callback(refresh_result.capabilities)
         updates = _capability_updates(
             refresh_result.capabilities,
             (checkpoint, vae, sampler, scheduler, upscaler),

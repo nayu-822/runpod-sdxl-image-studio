@@ -21,6 +21,10 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_reposito
     GenerationRepositoryError,
     GenerationRepositoryProtocol,
 )
+from runpod_sdxl_image_studio.adapters.database.repositories.metadata_import_repository import (
+    MetadataImportRepositoryProtocol,
+)
+from runpod_sdxl_image_studio.adapters.storage.imported_image_storage import ImportedImageStorage
 from runpod_sdxl_image_studio.config import Settings
 from runpod_sdxl_image_studio.domain.generation import GenerationKind, GenerationStatus
 from runpod_sdxl_image_studio.domain.generation_artifact import GenerationArtifact
@@ -29,6 +33,13 @@ from runpod_sdxl_image_studio.domain.generation_history import (
     GenerationHistorySort,
 )
 from runpod_sdxl_image_studio.domain.generation_queue import GenerationQueueItem
+from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
+from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
+from runpod_sdxl_image_studio.domain.metadata_import import (
+    ImportedImage,
+    MetadataImportError,
+    MetadataImportStatus,
+)
 from runpod_sdxl_image_studio.domain.upscale import (
     UpscaleLoadLevel,
     UpscaleSettings,
@@ -36,7 +47,10 @@ from runpod_sdxl_image_studio.domain.upscale import (
     resolve_output_size,
     validate_upscaler_name,
 )
-from runpod_sdxl_image_studio.domain.upscale_snapshot import UpscaleSettingsSnapshot
+from runpod_sdxl_image_studio.domain.upscale_snapshot import (
+    UpscaleSettingsSnapshot,
+    UpscaleSourceKind,
+)
 
 
 class UpscaleEnqueueError(RuntimeError):
@@ -86,12 +100,16 @@ class UpscaleEnqueueService:
         settings: Settings,
         *,
         catalog: UpscalerCatalog | None = None,
+        metadata_import_repository: MetadataImportRepositoryProtocol | None = None,
+        imported_image_storage: ImportedImageStorage | None = None,
     ) -> None:
         self._generations = generation_repository
         self._artifacts = artifact_repository
         self._queue = queue_repository
         self._settings = settings
         self._catalog = catalog or UpscalerCatalog.scan(settings.upscaler_dir)
+        self._metadata_import_repository = metadata_import_repository
+        self._imported_image_storage = imported_image_storage
 
     def latest_completed_generation_id(self) -> UUID | None:
         page = self._generations.list_history(
@@ -289,6 +307,156 @@ class UpscaleEnqueueService:
             raise UpscaleEnqueueError("upscale_workflow_error", str(exc)) from exc
 
     enqueue_upscale = enqueue
+
+    def plan_import(self, import_id: UUID, upscale_settings: UpscaleSettings) -> UpscalePlan:
+        imported = self._verified_import(import_id)
+        self._validate_import_method(imported.id, upscale_settings)
+        return self._plan_for_dimensions(
+            upscale_settings, imported.image_width, imported.image_height
+        )
+
+    def enqueue_import(
+        self, import_id: UUID, upscale_settings: UpscaleSettings
+    ) -> GenerationQueueItem:
+        imported = self._verified_import(import_id)
+        self._validate_import_method(imported.id, upscale_settings)
+        size = self._plan_for_dimensions(
+            upscale_settings, imported.image_width, imported.image_height
+        )
+        workflow_id = (
+            "sdxl_image_upscale"
+            if upscale_settings.method.value == "image"
+            else "sdxl_latent_upscale"
+        )
+        effective_upscale = upscale_settings.model_copy(
+            update={"workflow_template_id": workflow_id, "workflow_template_version": "1.0"}
+        )
+        if upscale_settings.method.value == "latent":
+            record = self._metadata_import_repository.get_by_id(import_id)  # type: ignore[union-attr]
+            if (
+                record is None
+                or record.metadata_status is not MetadataImportStatus.READY
+                or record.candidate is None
+            ):
+                raise UpscaleEnqueueError(
+                    "metadata_import_unresolved",
+                    "latent upscale requires complete imported metadata",
+                )
+            try:
+                source_settings = record.candidate.to_generation_settings()
+            except MetadataImportError as exc:
+                raise UpscaleEnqueueError(exc.code, str(exc)) from exc
+        else:
+            source_settings = GenerationSettings(
+                positive_prompt="",
+                negative_prompt="",
+                seed=0,
+                width=size.source_width,
+                height=size.source_height,
+                steps=1,
+                cfg_scale=0.0,
+                sampler_name="euler",
+                scheduler_name="normal",
+                checkpoint_name="__metadata_import_image_source__",
+            )
+        upscale_snapshot = UpscaleSettingsSnapshot.from_settings(
+            effective_upscale,
+            source_kind=UpscaleSourceKind.METADATA_IMPORT,
+            source_import_id=import_id,
+            source_sha256=imported.stored_image_sha256,
+            source_width=imported.image_width,
+            source_height=imported.image_height,
+            target_width=size.target_width,
+            target_height=size.target_height,
+        )
+        generation_snapshot = GenerationSettingsSnapshot.from_settings(
+            source_settings.model_copy(
+                update={
+                    "width": size.target_width,
+                    "height": size.target_height,
+                    "workflow_template_id": workflow_id,
+                    "workflow_template_version": "1.0",
+                }
+            )
+        )
+        try:
+            return self._queue.enqueue_upscale(
+                generation_snapshot,
+                upscale_snapshot,
+                parent_generation_id=None,
+                source_artifact_id=None,
+                source_import_id=import_id,
+                pending_limit=self._settings.queue_max_pending_jobs,
+            )
+        except GenerationDispatchQueueRepositoryError as exc:
+            raise UpscaleEnqueueError("upscale_workflow_error", str(exc)) from exc
+
+    def _verified_import(self, import_id: UUID) -> ImportedImage:
+        if self._metadata_import_repository is None or self._imported_image_storage is None:
+            raise UpscaleEnqueueError(
+                "metadata_import_unavailable", "metadata import source is unavailable"
+            )
+        imported_record = self._metadata_import_repository.get_by_id(import_id)
+        if imported_record is None:
+            raise UpscaleEnqueueError(
+                "metadata_import_source_changed", "metadata import source was not found"
+            )
+        try:
+            self._imported_image_storage.verify(imported_record.imported_image)
+        except Exception as exc:  # noqa: BLE001 - stable enqueue error boundary
+            code = getattr(exc, "code", "metadata_import_source_changed")
+            raise UpscaleEnqueueError(code, "metadata import source could not be verified") from exc
+        return imported_record.imported_image
+
+    def _validate_import_method(self, import_id: UUID, upscale_settings: UpscaleSettings) -> None:
+        if upscale_settings.method.value != "latent":
+            return
+        record = self._metadata_import_repository.get_by_id(import_id)  # type: ignore[union-attr]
+        if (
+            record is None
+            or record.metadata_status is not MetadataImportStatus.READY
+            or record.candidate is None
+            or not record.candidate.is_generation_ready
+        ):
+            raise UpscaleEnqueueError(
+                "metadata_import_unresolved",
+                "latent upscale requires complete imported metadata",
+            )
+
+    def _plan_for_dimensions(
+        self, upscale_settings: UpscaleSettings, source_width: int, source_height: int
+    ) -> UpscalePlan:
+        if upscale_settings.method.value == "image":
+            model_name = validate_upscaler_name(upscale_settings.upscaler_name)
+            if not self._catalog.contains(model_name):
+                raise UpscaleEnqueueError(
+                    "upscale_model_missing", "指定されたupscalerが取得済みではありません。"
+                )
+        try:
+            size = resolve_output_size(
+                upscale_settings,
+                source_width,
+                source_height,
+                max_width=self._settings.max_width,
+                max_height=self._settings.max_height,
+                max_pixels=self._settings.max_pixels,
+                max_upscale_factor=self._settings.max_upscale_factor,
+            )
+        except ValueError as exc:
+            raise UpscaleEnqueueError("upscale_limit_exceeded", str(exc)) from exc
+        return UpscalePlan(
+            source_width,
+            source_height,
+            size.width,
+            size.height,
+            estimate_load_level(
+                upscale_settings.method,
+                source_width,
+                source_height,
+                size.width,
+                size.height,
+            ),
+        )
 
 
 def verify_source_artifact(

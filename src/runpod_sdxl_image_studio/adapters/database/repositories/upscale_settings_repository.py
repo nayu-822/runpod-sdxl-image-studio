@@ -14,6 +14,7 @@ from runpod_sdxl_image_studio.adapters.database.models import GenerationUpscaleS
 from runpod_sdxl_image_studio.domain.upscale_snapshot import (
     UpscaleSettingsSnapshot,
     UpscaleSnapshotError,
+    UpscaleSourceKind,
 )
 
 
@@ -26,6 +27,10 @@ class UpscaleSettingsRepositoryProtocol(Protocol):
 
     def get_by_source_artifact(
         self, source_artifact_id: UUID
+    ) -> tuple[UpscaleSettingsSnapshot, ...]: ...
+
+    def get_by_source_import(
+        self, source_import_id: UUID
     ) -> tuple[UpscaleSettingsSnapshot, ...]: ...
 
 
@@ -57,11 +62,31 @@ class UpscaleSettingsRepository(UpscaleSettingsRepositoryProtocol):
         except (SQLAlchemyError, UpscaleSnapshotError) as exc:
             raise UpscaleSettingsRepositoryError("upscale settings could not be read") from exc
 
+    def get_by_source_import(self, source_import_id: UUID) -> tuple[UpscaleSettingsSnapshot, ...]:
+        try:
+            with session_scope(self._session_factory) as session:
+                rows = session.scalars(
+                    select(GenerationUpscaleSettingsModel)
+                    .where(GenerationUpscaleSettingsModel.source_import_id == str(source_import_id))
+                    .order_by(GenerationUpscaleSettingsModel.created_at.asc())
+                ).all()
+                return tuple(_snapshot(row) for row in rows)
+        except (SQLAlchemyError, UpscaleSnapshotError) as exc:
+            raise UpscaleSettingsRepositoryError("upscale settings could not be read") from exc
+
 
 def _snapshot(row: GenerationUpscaleSettingsModel) -> UpscaleSettingsSnapshot:
     snapshot = UpscaleSettingsSnapshot.from_json(row.settings_snapshot_json)
-    if snapshot.source_artifact_id != UUID(row.source_artifact_id):
-        raise UpscaleSnapshotError("upscale settings source does not match its row")
+    row_source_kind = getattr(row, "source_kind", UpscaleSourceKind.GENERATION_ARTIFACT)
+    if snapshot.source_kind.value != row_source_kind:
+        raise UpscaleSnapshotError("upscale settings source kind does not match its row")
+    if snapshot.source_kind is UpscaleSourceKind.GENERATION_ARTIFACT:
+        if row.source_artifact_id is None or snapshot.source_artifact_id != UUID(
+            row.source_artifact_id
+        ):
+            raise UpscaleSnapshotError("upscale settings source does not match its row")
+    elif row.source_import_id is None or snapshot.source_import_id != UUID(row.source_import_id):
+        raise UpscaleSnapshotError("upscale settings import source does not match its row")
     return snapshot
 
 

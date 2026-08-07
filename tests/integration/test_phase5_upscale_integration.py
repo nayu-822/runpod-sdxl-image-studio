@@ -121,6 +121,7 @@ def test_phase5_migration_runs_from_empty_and_phase4_database(tmp_path: Path) ->
     assert {tuple(key["constrained_columns"]) for key in foreign_keys} == {
         ("generation_id",),
         ("source_artifact_id",),
+        ("source_import_id",),
     }
     assert len(migration_inspector.get_check_constraints("generation_upscale_settings")) >= 4
     engine.dispose()
@@ -205,6 +206,9 @@ def test_phase5_migration_runs_from_empty_and_phase4_database(tmp_path: Path) ->
             ).scalar_one()
             == job_id
         )
+    command.downgrade(_alembic_config(phase4_url), "-1")
+    assert not inspect(engine).has_table("metadata_imports")
+    assert inspect(engine).has_table("generation_upscale_settings")
     command.downgrade(_alembic_config(phase4_url), "-1")
     assert not inspect(engine).has_table("generation_upscale_settings")
     command.upgrade(_alembic_config(phase4_url), "head")

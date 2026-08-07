@@ -20,6 +20,7 @@ from runpod_sdxl_image_studio.adapters.database.models import (
     GenerationModel,
     GenerationQueueEntryModel,
     GenerationUpscaleSettingsModel,
+    MetadataImportModel,
 )
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_repository import (
     _generation_domain,
@@ -96,8 +97,9 @@ class GenerationDispatchQueueRepositoryProtocol(Protocol):
         snapshot: GenerationSettingsSnapshot,
         upscale_snapshot: UpscaleSettingsSnapshot,
         *,
-        parent_generation_id: UUID,
-        source_artifact_id: UUID,
+        parent_generation_id: UUID | None,
+        source_artifact_id: UUID | None = None,
+        source_import_id: UUID | None = None,
         generation_id: UUID | None = None,
         job_id: UUID | None = None,
         retry_of_generation_id: UUID | None = None,
@@ -280,8 +282,9 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
         snapshot: GenerationSettingsSnapshot,
         upscale_snapshot: UpscaleSettingsSnapshot,
         *,
-        parent_generation_id: UUID,
-        source_artifact_id: UUID,
+        parent_generation_id: UUID | None,
+        source_artifact_id: UUID | None = None,
+        source_import_id: UUID | None = None,
         generation_id: UUID | None = None,
         job_id: UUID | None = None,
         retry_of_generation_id: UUID | None = None,
@@ -297,6 +300,10 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
             raise GenerationDispatchQueueRepositoryError("upscale parent does not match snapshot")
         if upscale_snapshot.source_artifact_id != source_artifact_id:
             raise GenerationDispatchQueueRepositoryError("upscale artifact does not match snapshot")
+        if upscale_snapshot.source_import_id != source_import_id:
+            raise GenerationDispatchQueueRepositoryError("upscale import does not match snapshot")
+        if (source_artifact_id is None) == (source_import_id is None):
+            raise GenerationDispatchQueueRepositoryError("exactly one upscale source is required")
         timestamp = _utc(enqueued_at or datetime.now(UTC))
         generation_id = generation_id or uuid4()
         job_id = job_id or uuid4()
@@ -317,25 +324,45 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
                     if existing is not None:
                         return _queue_item_from_entry(session, existing)
                 _check_pending_capacity(session, pending_limit, 1)
-                parent = session.get(GenerationModel, str(parent_generation_id))
-                if parent is None or parent.status != GenerationStatus.COMPLETED.value:
-                    raise GenerationDispatchQueueRepositoryError("upscale parent is not completed")
-                artifact = session.get(GenerationArtifactModel, str(source_artifact_id))
-                if artifact is None or artifact.generation_id != str(parent_generation_id):
-                    raise GenerationDispatchQueueRepositoryError(
-                        "upscale source artifact was not found"
-                    )
-                if artifact.artifact_type != ArtifactType.IMAGE.value:
-                    raise GenerationDispatchQueueRepositoryError(
-                        "upscale source artifact is not an image"
-                    )
-                if (
-                    artifact.width != upscale_snapshot.source_width
-                    or artifact.height != upscale_snapshot.source_height
-                ):
-                    raise GenerationDispatchQueueRepositoryError(
-                        "upscale source dimensions do not match"
-                    )
+                if source_artifact_id is not None:
+                    if parent_generation_id is None:
+                        raise GenerationDispatchQueueRepositoryError(
+                            "generation source requires a parent"
+                        )
+                    parent = session.get(GenerationModel, str(parent_generation_id))
+                    if parent is None or parent.status != GenerationStatus.COMPLETED.value:
+                        raise GenerationDispatchQueueRepositoryError(
+                            "upscale parent is not completed"
+                        )
+                    artifact = session.get(GenerationArtifactModel, str(source_artifact_id))
+                    if artifact is None or artifact.generation_id != str(parent_generation_id):
+                        raise GenerationDispatchQueueRepositoryError(
+                            "upscale source artifact was not found"
+                        )
+                    if artifact.artifact_type != ArtifactType.IMAGE.value:
+                        raise GenerationDispatchQueueRepositoryError(
+                            "upscale source artifact is not an image"
+                        )
+                    if (
+                        artifact.width != upscale_snapshot.source_width
+                        or artifact.height != upscale_snapshot.source_height
+                    ):
+                        raise GenerationDispatchQueueRepositoryError(
+                            "upscale source dimensions do not match"
+                        )
+                else:
+                    imported = session.get(MetadataImportModel, str(source_import_id))
+                    if imported is None or imported.image_mime_type != "image/png":
+                        raise GenerationDispatchQueueRepositoryError(
+                            "upscale import source was not found"
+                        )
+                    if (
+                        imported.image_width != upscale_snapshot.source_width
+                        or imported.image_height != upscale_snapshot.source_height
+                    ):
+                        raise GenerationDispatchQueueRepositoryError(
+                            "upscale import source dimensions do not match"
+                        )
                 generation, job = _insert_generation_and_job(
                     session,
                     snapshot,
@@ -350,7 +377,13 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
                 session.add(
                     GenerationUpscaleSettingsModel(
                         generation_id=str(generation_id),
-                        source_artifact_id=str(source_artifact_id),
+                        source_kind=upscale_snapshot.source_kind.value,
+                        source_artifact_id=(
+                            str(source_artifact_id) if source_artifact_id is not None else None
+                        ),
+                        source_import_id=(
+                            str(source_import_id) if source_import_id is not None else None
+                        ),
                         method=upscale_snapshot.method.value,
                         sizing_mode=upscale_snapshot.sizing_mode.value,
                         scale_factor=upscale_snapshot.requested_scale_factor,

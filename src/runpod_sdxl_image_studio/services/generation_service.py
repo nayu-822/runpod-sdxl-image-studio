@@ -7,7 +7,7 @@ import logging
 import secrets
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Protocol, cast
 from uuid import UUID, uuid4
 
 from runpod_sdxl_image_studio.adapters.catalog.upscaler_catalog import UpscalerCatalog
@@ -43,6 +43,9 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_reposito
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_start_repository import (
     GenerationStartRepositoryProtocol,
 )
+from runpod_sdxl_image_studio.adapters.database.repositories.metadata_import_repository import (
+    MetadataImportRepositoryProtocol,
+)
 from runpod_sdxl_image_studio.adapters.database.repositories.upscale_settings_repository import (
     UpscaleSettingsRepositoryError,
     UpscaleSettingsRepositoryProtocol,
@@ -53,6 +56,10 @@ from runpod_sdxl_image_studio.adapters.storage.generation_metadata_storage impor
 )
 from runpod_sdxl_image_studio.adapters.storage.history_thumbnail_storage import (
     HistoryThumbnailStorage,
+)
+from runpod_sdxl_image_studio.adapters.storage.imported_image_storage import (
+    ImportedImageStorage,
+    ImportedImageStorageError,
 )
 from runpod_sdxl_image_studio.adapters.storage.local_storage import LocalStorageAdapter
 from runpod_sdxl_image_studio.config import Settings, get_settings
@@ -77,7 +84,10 @@ from runpod_sdxl_image_studio.domain.generation_settings import (
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
 from runpod_sdxl_image_studio.domain.job import GenerationJob
 from runpod_sdxl_image_studio.domain.system_status import CapabilityRefreshResult
-from runpod_sdxl_image_studio.domain.upscale_snapshot import UpscaleSettingsSnapshot
+from runpod_sdxl_image_studio.domain.upscale_snapshot import (
+    UpscaleSettingsSnapshot,
+    UpscaleSourceKind,
+)
 from runpod_sdxl_image_studio.services.generation_errors import (
     ArtifactPersistenceError,
     CompletionPersistenceError,
@@ -168,6 +178,8 @@ class GenerationService:
         upscale_settings_repository: UpscaleSettingsRepositoryProtocol | None = None,
         upscale_workflow_adapter: UpscaleWorkflowAdapter | None = None,
         upscaler_catalog: UpscalerCatalog | None = None,
+        metadata_import_repository: MetadataImportRepositoryProtocol | None = None,
+        imported_image_storage: ImportedImageStorage | None = None,
     ) -> None:
         self._client = client
         self._workflow_adapter = workflow_adapter
@@ -198,14 +210,14 @@ class GenerationService:
             if not all(repository is not None for repository in individual_repositories):
                 raise ValueError("generation persistence repositories must be configured together")
             persistence = GenerationPersistenceRepositories(
-                generation=generation_repository,  # type: ignore[arg-type]
-                job=job_repository,  # type: ignore[arg-type]
-                artifact=artifact_repository,  # type: ignore[arg-type]
-                start=start_repository,  # type: ignore[arg-type]
-                queue=queue_repository,  # type: ignore[arg-type]
-                progress=progress_repository,  # type: ignore[arg-type]
-                completion=completion_repository,  # type: ignore[arg-type]
-                failure=failure_repository,  # type: ignore[arg-type]
+                generation=cast(GenerationRepositoryProtocol, generation_repository),
+                job=cast(GenerationJobRepositoryProtocol, job_repository),
+                artifact=cast(GenerationArtifactRepositoryProtocol, artifact_repository),
+                start=cast(GenerationStartRepositoryProtocol, start_repository),
+                queue=cast(GenerationQueueRepositoryProtocol, queue_repository),
+                progress=cast(GenerationProgressRepositoryProtocol, progress_repository),
+                completion=cast(GenerationCompletionRepositoryProtocol, completion_repository),
+                failure=cast(GenerationFailureRepositoryProtocol, failure_repository),
             )
         self._generation_repository = persistence.generation if persistence else None
         self._job_repository = persistence.job if persistence else None
@@ -227,6 +239,8 @@ class GenerationService:
         self._upscaler_catalog = upscaler_catalog or UpscalerCatalog.scan(
             self._settings.upscaler_dir
         )
+        self._metadata_import_repository = metadata_import_repository
+        self._imported_image_storage = imported_image_storage
         self._jobs: dict[UUID, GenerationJob] = {}
         self._results: dict[UUID, GenerationResult] = {}
         self._lock = asyncio.Lock()
@@ -844,23 +858,53 @@ class GenerationService:
             )
             if upscale_snapshot is None:
                 raise GenerationPersistenceError("upscale settings were not found")
-            source_artifact = self._artifact_repository.get_primary_image(
-                upscale_snapshot.source_generation_id
-            )
-            if source_artifact is None or source_artifact.id != upscale_snapshot.source_artifact_id:
-                raise ComfyUIPromptError("upscale source artifact was not found")
-            source = verify_source_artifact(source_artifact, self._settings)
-            source_generation = self._generation_repository.get_by_id(
-                upscale_snapshot.source_generation_id
-            )
-            if source_generation is None:
-                raise ComfyUIPromptError("upscale parent generation was not found")
-            await self._preflight_upscale(upscale_snapshot, source_generation.settings_snapshot)
+            if upscale_snapshot.source_kind is UpscaleSourceKind.GENERATION_ARTIFACT:
+                if (
+                    upscale_snapshot.source_generation_id is None
+                    or upscale_snapshot.source_artifact_id is None
+                ):
+                    raise ComfyUIPromptError("upscale source artifact is incomplete")
+                source_artifact = self._artifact_repository.get_primary_image(
+                    upscale_snapshot.source_generation_id
+                )
+                if (
+                    source_artifact is None
+                    or source_artifact.id != upscale_snapshot.source_artifact_id
+                ):
+                    raise ComfyUIPromptError("upscale source artifact was not found")
+                source = verify_source_artifact(source_artifact, self._settings)
+                source_bytes = source.path.read_bytes()
+                source_generation = self._generation_repository.get_by_id(
+                    upscale_snapshot.source_generation_id
+                )
+                if source_generation is None:
+                    raise ComfyUIPromptError("upscale parent generation was not found")
+                source_settings = source_generation.settings_snapshot
+            else:
+                if (
+                    upscale_snapshot.source_import_id is None
+                    or self._metadata_import_repository is None
+                    or self._imported_image_storage is None
+                ):
+                    raise ComfyUIPromptError("upscale import source is unavailable")
+                imported = self._metadata_import_repository.get_by_id(
+                    upscale_snapshot.source_import_id
+                )
+                if imported is None:
+                    raise ComfyUIPromptError("upscale import source was not found")
+                try:
+                    source_bytes = self._imported_image_storage.read_verified(imported)
+                except ImportedImageStorageError as exc:
+                    raise UpscaleEnqueueError(
+                        exc.code, "metadata import source could not be verified"
+                    ) from exc
+                source_settings = GenerationSettingsSnapshot.from_settings(settings)
+            await self._preflight_upscale(upscale_snapshot, source_settings)
             upload = getattr(self._client, "upload_input_image", None)
             if not callable(upload):
                 raise ComfyUIPromptError("ComfyUI input image upload is unavailable")
             source_token = await upload(
-                source.path.read_bytes(), job.generation_id, upscale_snapshot.source_sha256
+                source_bytes, job.generation_id, upscale_snapshot.source_sha256
             )
             source_token_name = (
                 source_token.filename if hasattr(source_token, "filename") else str(source_token)
@@ -874,7 +918,7 @@ class GenerationService:
             else:
                 workflow = self._upscale_workflow_adapter.build_latent_upscale_workflow(
                     source_token_name,
-                    source_generation.settings_snapshot,
+                    source_settings,
                     upscale_snapshot,
                 )
         else:
@@ -1447,6 +1491,8 @@ def _safe_generation_error(
 ) -> str:
     if isinstance(error, UpscaleEnqueueError):
         return _safe_upscale_error(error)
+    if isinstance(error, ImportedImageStorageError):
+        return "metadata import source could not be verified"
     if isinstance(error, GenerationPersistenceError):
         if isinstance(error, FailurePersistenceError) and original_error is not None:
             return "生成に失敗しました。加えて、履歴の失敗状態を完全に保存できませんでした。"
@@ -1485,6 +1531,8 @@ def _safe_upscale_error(error: UpscaleEnqueueError) -> str:
 
 def _generation_error_code(error: Exception) -> str:
     if isinstance(error, UpscaleEnqueueError):
+        return error.code
+    if isinstance(error, ImportedImageStorageError):
         return error.code
     if isinstance(error, UpscaleSettingsRepositoryError):
         return "upscale_settings_unavailable"

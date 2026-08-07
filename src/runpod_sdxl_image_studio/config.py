@@ -49,6 +49,15 @@ class Settings(BaseSettings):
     max_upscale_input_image_bytes: int = Field(
         52_428_800, validation_alias="IMAGE_STUDIO_MAX_UPSCALE_INPUT_IMAGE_BYTES"
     )
+    max_metadata_import_image_bytes: int = Field(
+        52_428_800, validation_alias="IMAGE_STUDIO_MAX_METADATA_IMPORT_IMAGE_BYTES"
+    )
+    max_metadata_sidecar_bytes: int = Field(
+        2_000_000, validation_alias="IMAGE_STUDIO_MAX_METADATA_SIDECAR_BYTES"
+    )
+    max_metadata_raw_bytes: int = Field(
+        4_000_000, validation_alias="IMAGE_STUDIO_MAX_METADATA_RAW_BYTES"
+    )
 
     data_dir: Path = Field(
         Path("/workspace/image-studio-data"), validation_alias="IMAGE_STUDIO_DATA_DIR"
@@ -188,6 +197,9 @@ class Settings(BaseSettings):
         "history_max_attempts",
         "max_output_image_bytes",
         "max_upscale_input_image_bytes",
+        "max_metadata_import_image_bytes",
+        "max_metadata_sidecar_bytes",
+        "max_metadata_raw_bytes",
         "max_lora_thumbnail_bytes",
         "lora_thumbnail_max_edge",
         "max_trigger_words",

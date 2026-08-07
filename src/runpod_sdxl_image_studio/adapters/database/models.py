@@ -144,6 +144,42 @@ class GenerationArtifactModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class MetadataImportModel(Base):
+    """Stored canonical external image and its non-executable metadata preview."""
+
+    __tablename__ = "metadata_imports"
+    __table_args__ = (
+        CheckConstraint(
+            "metadata_status IN ('ready', 'needs_mapping', 'metadata_missing', 'invalid_metadata')",
+            name="ck_metadata_import_status",
+        ),
+        CheckConstraint(
+            "metadata_source IN ('comfyui_prompt', 'app_sidecar', 'workflow', 'none')",
+            name="ck_metadata_import_source",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    original_filename: Mapped[str] = mapped_column(String(500), nullable=False)
+    stored_image_path: Mapped[str] = mapped_column(String(1000), nullable=False)
+    source_image_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    stored_image_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    image_width: Mapped[int] = mapped_column(Integer, nullable=False)
+    image_height: Mapped[int] = mapped_column(Integer, nullable=False)
+    image_mime_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    metadata_source: Mapped[str] = mapped_column(String(32), nullable=False)
+    metadata_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    raw_metadata_json: Mapped[str] = mapped_column(Text, nullable=False)
+    raw_metadata_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    candidate_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    normalized_snapshot_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    normalized_snapshot_schema_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    manual_mapping_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    warnings_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class GenerationUpscaleSettingsModel(Base):
     """Immutable request projection for one upscale generation."""
 
@@ -162,13 +198,29 @@ class GenerationUpscaleSettingsModel(Base):
         CheckConstraint(
             "denoise IS NULL OR (denoise >= 0 AND denoise <= 1)", name="ck_upscale_denoise"
         ),
+        CheckConstraint(
+            "(source_kind='generation_artifact' AND source_artifact_id IS NOT NULL "
+            "AND source_import_id IS NULL) OR "
+            "(source_kind='metadata_import' AND source_artifact_id IS NULL "
+            "AND source_import_id IS NOT NULL)",
+            name="ck_upscale_source_kind",
+        ),
     )
 
     generation_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("generations.id", ondelete="CASCADE"), primary_key=True
     )
-    source_artifact_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("generation_artifacts.id", ondelete="RESTRICT"), nullable=False
+    source_kind: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="generation_artifact",
+        server_default="generation_artifact",
+    )
+    source_artifact_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("generation_artifacts.id", ondelete="RESTRICT"), nullable=True
+    )
+    source_import_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("metadata_imports.id", ondelete="RESTRICT"), nullable=True
     )
     method: Mapped[str] = mapped_column(String(16), nullable=False)
     sizing_mode: Mapped[str] = mapped_column(String(16), nullable=False)
@@ -330,6 +382,7 @@ Index("ix_generations_resolution", GenerationModel.width, GenerationModel.height
 Index("ix_generation_loras_name", GenerationLoraModel.lora_name)
 Index("ix_generation_artifacts_generation", GenerationArtifactModel.generation_id)
 Index("ix_generation_upscale_source_artifact", GenerationUpscaleSettingsModel.source_artifact_id)
+Index("ix_generation_upscale_source_import", GenerationUpscaleSettingsModel.source_import_id)
 Index("ix_generation_upscale_method", GenerationUpscaleSettingsModel.method)
 Index("ix_generation_jobs_generation", GenerationJobModel.generation_id)
 Index("ix_generation_jobs_prompt", GenerationJobModel.comfy_prompt_id)
@@ -346,6 +399,9 @@ Index("ix_presets_updated", PresetModel.updated_at)
 Index("ix_generation_batches_created", GenerationBatchModel.created_at)
 Index("ix_generation_queue_batch", GenerationQueueEntryModel.batch_id)
 Index("ix_generation_queue_lease", GenerationQueueEntryModel.lease_expires_at)
+Index("ix_metadata_imports_created", MetadataImportModel.created_at)
+Index("ix_metadata_imports_status", MetadataImportModel.metadata_status)
+Index("ix_metadata_imports_source_hash", MetadataImportModel.source_image_sha256)
 Index(
     "uq_generations_retry_of_generation",
     GenerationModel.retry_of_generation_id,

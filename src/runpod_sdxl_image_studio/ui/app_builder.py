@@ -39,6 +39,9 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_start_re
 from runpod_sdxl_image_studio.adapters.database.repositories.lora_metadata_repository import (
     LoraMetadataRepository,
 )
+from runpod_sdxl_image_studio.adapters.database.repositories.metadata_import_repository import (
+    MetadataImportRepository,
+)
 from runpod_sdxl_image_studio.adapters.database.repositories.preset_repository import (
     PresetRepository,
 )
@@ -51,6 +54,7 @@ from runpod_sdxl_image_studio.adapters.storage.generation_metadata_storage impor
 from runpod_sdxl_image_studio.adapters.storage.history_thumbnail_storage import (
     HistoryThumbnailStorage,
 )
+from runpod_sdxl_image_studio.adapters.storage.imported_image_storage import ImportedImageStorage
 from runpod_sdxl_image_studio.adapters.storage.local_storage import LocalStorageAdapter
 from runpod_sdxl_image_studio.adapters.storage.lora_thumbnail_storage import LoraThumbnailStorage
 from runpod_sdxl_image_studio.config import Settings, get_settings
@@ -83,6 +87,7 @@ from runpod_sdxl_image_studio.services.lora_catalog_service import (
     LoraCatalogError,
     LoraCatalogService,
 )
+from runpod_sdxl_image_studio.services.metadata_import_service import MetadataImportService
 from runpod_sdxl_image_studio.services.preset_service import PresetService
 from runpod_sdxl_image_studio.services.recent_settings_service import RecentSettingsService
 from runpod_sdxl_image_studio.services.upscale_enqueue_service import UpscaleEnqueueService
@@ -124,6 +129,13 @@ from runpod_sdxl_image_studio.ui.tabs.lora_management_tab import (
     make_sync_handler,
     make_thumbnail_delete_handler,
     make_thumbnail_save_handler,
+)
+from runpod_sdxl_image_studio.ui.tabs.metadata_import_tab import (
+    build_metadata_import_tab,
+    make_metadata_generation_apply_handler,
+    make_metadata_import_handler,
+    make_metadata_mapping_handler,
+    make_metadata_upscale_apply_handler,
 )
 from runpod_sdxl_image_studio.ui.tabs.preset_tab import (
     build_preset_tab,
@@ -240,6 +252,13 @@ def build_app(
     loaded_image_upscale = load_workflow_template("sdxl_image_upscale", workflow_root)
     loaded_latent_upscale = load_workflow_template("sdxl_latent_upscale", workflow_root)
     upscale_settings_repository = UpscaleSettingsRepository(session_factory)
+    metadata_import_repository = MetadataImportRepository(session_factory)
+    imported_image_storage = ImportedImageStorage(app_settings)
+    metadata_import_service = MetadataImportService(
+        metadata_import_repository,
+        imported_image_storage,
+        app_settings,
+    )
     upscale_catalog = UpscalerCatalog.scan(app_settings.upscaler_dir)
     upscale_enqueue_service = UpscaleEnqueueService(
         generation_repository,
@@ -247,6 +266,8 @@ def build_app(
         dispatch_queue_repository,
         app_settings,
         catalog=upscale_catalog,
+        metadata_import_repository=metadata_import_repository,
+        imported_image_storage=imported_image_storage,
     )
     generation_service = GenerationService(
         client,
@@ -273,6 +294,8 @@ def build_app(
             loaded_image_upscale.as_mapping(), loaded_latent_upscale.as_mapping()
         ),
         upscaler_catalog=upscale_catalog,
+        metadata_import_repository=metadata_import_repository,
+        imported_image_storage=imported_image_storage,
     )
     cancellation_adapter = ComfyUICancellationAdapter(client, app_settings)
     queue_service = GenerationQueueService(
@@ -369,6 +392,47 @@ def build_app(
             upscale = build_upscale_tab(upscale_catalog)
         with gr.Tab("プリセット"):
             presets = build_preset_tab()
+        with gr.Tab("外部metadata"):
+            metadata_import = build_metadata_import_tab(app_settings.max_loras)
+
+        metadata_import.parse_button.click(
+            fn=make_metadata_import_handler(metadata_import_service),
+            inputs=[metadata_import.image, metadata_import.sidecar],
+            outputs=[
+                metadata_import.import_id,
+                metadata_import.preview_image,
+                metadata_import.image_hash,
+                metadata_import.image_dimensions,
+                metadata_import.metadata_source,
+                metadata_import.status,
+                metadata_import.warnings,
+                metadata_import.unresolved,
+                metadata_import.raw_metadata,
+                metadata_import.settings_preview,
+                metadata_import.apply_generation,
+                metadata_import.apply_upscale,
+            ],
+            concurrency_limit=1,
+        )
+        metadata_import.apply_mapping.click(
+            fn=make_metadata_mapping_handler(metadata_import_service),
+            inputs=[metadata_import.import_id, metadata_import.mapping_json],
+            outputs=[
+                metadata_import.import_id,
+                metadata_import.preview_image,
+                metadata_import.image_hash,
+                metadata_import.image_dimensions,
+                metadata_import.metadata_source,
+                metadata_import.status,
+                metadata_import.warnings,
+                metadata_import.unresolved,
+                metadata_import.raw_metadata,
+                metadata_import.settings_preview,
+                metadata_import.apply_generation,
+                metadata_import.apply_upscale,
+            ],
+            concurrency_limit=1,
+        )
 
         upscale.enqueue_button.click(
             fn=begin_upscale_enqueue,
@@ -385,6 +449,7 @@ def build_app(
                 upscale.target_height,
                 upscale.upscaler_name,
                 upscale.denoise,
+                upscale.source_import_id,
             ],
             outputs=[upscale.enqueue_button, upscale.status],
             concurrency_limit=1,
@@ -393,12 +458,21 @@ def build_app(
             fn=make_latest_parent_selection_handler(upscale_enqueue_service),
             outputs=[upscale.parent_generation_id, upscale.source_preview, upscale.status],
             concurrency_limit=1,
+        ).then(
+            fn=lambda: "",
+            outputs=[upscale.source_import_id],
+            queue=False,
         )
         history.selected.change(
             fn=make_parent_selection_handler(upscale_enqueue_service),
             inputs=[history.selected],
             outputs=[upscale.parent_generation_id, upscale.source_preview, upscale.status],
             concurrency_limit=1,
+        )
+        history.selected.change(
+            fn=lambda: "",
+            outputs=[upscale.source_import_id],
+            queue=False,
         )
         history.selected.change(
             fn=make_upscale_result_handler(upscale_enqueue_service),
@@ -427,6 +501,7 @@ def build_app(
             upscale.target_height,
             upscale.upscaler_name,
             upscale.denoise,
+            upscale.source_import_id,
         ]
         for component in upscale_plan_inputs:
             component.change(
@@ -453,12 +528,18 @@ def build_app(
                 app_settings.timezone,
                 generation,
                 catalog_service,
+                metadata_import_service.set_capabilities,
             ),
             inputs=capability_inputs,
             outputs=[system.status_markdown, system.capability_message, *capability_outputs],
         )
         system.refresh_button.click(
-            fn=make_refresh_handler(comfyui_service, generation, catalog_service),
+            fn=make_refresh_handler(
+                comfyui_service,
+                generation,
+                catalog_service,
+                metadata_import_service.set_capabilities,
+            ),
             inputs=capability_inputs,
             outputs=[system.capability_message, *capability_outputs],
         )
@@ -1323,6 +1404,29 @@ def build_app(
             generation.restored_from_generation,
             generation.regeneration_valid,
         ]
+        metadata_import.apply_generation.click(
+            fn=make_metadata_generation_apply_handler(
+                metadata_import_service,
+                app_settings.max_loras,
+            ),
+            inputs=[
+                metadata_import.import_id,
+                generation.checkpoint_choices,
+                generation.vae_choices,
+                generation.lora_editor.choices,
+            ],
+            outputs=restore_outputs,
+        )
+        metadata_import.apply_upscale.click(
+            fn=make_metadata_upscale_apply_handler(metadata_import_service),
+            inputs=[metadata_import.import_id],
+            outputs=[
+                upscale.source_import_id,
+                upscale.parent_generation_id,
+                upscale.source_preview,
+                upscale.status,
+            ],
+        )
         history.restore_button.click(
             fn=make_restore_handler(history_service, app_settings.max_loras),
             inputs=[
