@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
 from runpod_sdxl_image_studio.domain.lora import LoraSetting
@@ -43,14 +43,28 @@ class MetadataImportError(ValueError):
         self.code = code
 
 
+# This is a character-independent contract: all raw metadata is limited by
+# its UTF-8 encoded byte length at the adapter boundary and again by the
+# domain model.  Settings may choose a smaller operational limit, never a
+# larger one.
+MAX_METADATA_RAW_BYTES = 4_000_000
+
+
 class MetadataRawSource(BaseModel):
     """Original metadata text retained outside the executable image."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     kind: MetadataSourceKind
-    raw_text: str = Field(max_length=1_000_000)
+    raw_text: str
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("raw_text")
+    @classmethod
+    def validate_raw_text_size(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > MAX_METADATA_RAW_BYTES:
+            raise ValueError("raw metadata exceeds the UTF-8 byte limit")
+        return value
 
 
 class MetadataFieldResolution(BaseModel):
@@ -162,8 +176,8 @@ class MetadataImportCandidate(BaseModel):
             field
             for field in self.unresolved_fields
             if not (
-                (field == "checkpoint" and checkpoint != self.checkpoint_name)
-                or (field == "vae" and vae != self.vae_name)
+                (field in {"checkpoint", "checkpoint_name"} and checkpoint != self.checkpoint_name)
+                or (field in {"vae", "vae_name"} and vae != self.vae_name)
                 or (field == "loras" and loras != self.loras)
             )
         )
@@ -218,6 +232,9 @@ class MetadataImportPreview(BaseModel):
     status: MetadataImportStatus
     metadata_source: MetadataSourceKind
     candidate: MetadataImportCandidate | None = None
+    candidates: tuple[MetadataImportCandidate, ...] = ()
+    selected_metadata_source: MetadataSourceKind | None = None
+    sidecar_hash_confirmed: bool = False
     raw_sources: tuple[MetadataRawSource, ...] = ()
     warnings: tuple[str, ...] = ()
     unresolved_fields: tuple[str, ...] = ()
@@ -236,6 +253,9 @@ class MetadataImportRecord(BaseModel):
     metadata_status: MetadataImportStatus
     raw_sources: tuple[MetadataRawSource, ...] = ()
     candidate: MetadataImportCandidate | None = None
+    candidates: tuple[MetadataImportCandidate, ...] = ()
+    selected_metadata_source: MetadataSourceKind | None = None
+    sidecar_hash_confirmed: bool = False
     normalized_snapshot_json: str | None = None
     normalized_snapshot_schema_version: int | None = None
     manual_mappings: tuple[MetadataModelMapping, ...] = ()
@@ -256,4 +276,5 @@ __all__ = [
     "MetadataModelMapping",
     "MetadataRawSource",
     "MetadataSourceKind",
+    "MAX_METADATA_RAW_BYTES",
 ]

@@ -56,25 +56,36 @@ def parse_comfyui_prompt_metadata(
     samplers = [
         (node_id, node) for node_id, node in nodes.items() if node.get("class_type") == "KSampler"
     ]
+    sampler_id: str | None = None
     if len(samplers) != 1:
         unresolved.append("sampler_graph")
         sampler_node: Mapping[str, object] = {}
     else:
-        sampler_node = samplers[0][1]
+        sampler_id, sampler_node = samplers[0]
     inputs = _inputs(sampler_node)
 
-    positive = _connected_text(nodes, inputs.get("positive"))
-    negative = _connected_text(nodes, inputs.get("negative"))
+    positive, positive_clip_chain, positive_clip_ok = _connected_text(nodes, inputs.get("positive"))
+    negative, negative_clip_chain, negative_clip_ok = _connected_text(nodes, inputs.get("negative"))
     if positive is None:
         unresolved.append("positive_prompt")
     if negative is None:
         unresolved.append("negative_prompt")
+    if not positive_clip_ok or not negative_clip_ok:
+        unresolved.append("clip_graph")
 
     model_ref = _link(inputs.get("model"))
-    checkpoint, loras, model_unresolved = _model_chain(nodes, model_ref)
+    checkpoint, loras, model_unresolved, model_chain = _model_chain(nodes, model_ref)
     if checkpoint is None:
         unresolved.append("checkpoint")
     unresolved.extend(model_unresolved)
+    if (
+        model_chain is None
+        or positive_clip_chain is None
+        or negative_clip_chain is None
+        or positive_clip_chain != model_chain
+        or negative_clip_chain != model_chain
+    ):
+        unresolved.append("clip_graph")
 
     latent_ref = _link(inputs.get("latent_image"))
     width, height = _latent_dimensions(nodes, latent_ref)
@@ -83,9 +94,7 @@ def parse_comfyui_prompt_metadata(
     if height is None:
         unresolved.append("height")
 
-    vae_name = _external_vae(nodes, inputs)
-    # No VAELoader is a valid checkpoint-internal VAE. An explicitly present but
-    # disconnected external loader is not guessed as the execution VAE.
+    vae_name = _external_vae(nodes, sampler_id, model_chain)
     if vae_name is _UNRESOLVED:
         unresolved.append("vae")
         vae_name = None
@@ -185,33 +194,47 @@ def _inputs(node: Mapping[str, object]) -> Mapping[str, object]:
 
 
 def _link(value: object) -> tuple[str, int] | None:
-    if isinstance(value, (list, tuple)) and len(value) >= 1 and isinstance(value[0], (str, int)):
-        return str(value[0]), int(value[1]) if len(value) > 1 and isinstance(value[1], int) else 0
+    if (
+        isinstance(value, (list, tuple))
+        and len(value) == 2
+        and isinstance(value[0], (str, int))
+        and not isinstance(value[0], bool)
+        and isinstance(value[1], int)
+        and not isinstance(value[1], bool)
+        and value[1] >= 0
+    ):
+        return str(value[0]), value[1]
     return None
 
 
-def _connected_text(nodes: Mapping[str, Mapping[str, object]], value: object) -> str | None:
+def _connected_text(
+    nodes: Mapping[str, Mapping[str, object]], value: object
+) -> tuple[str | None, tuple[str, ...] | None, bool]:
     link = _link(value)
-    if link is None:
-        return None
+    if link is None or link[1] != 0:
+        return None, None, False
     node = nodes.get(link[0])
     if node is None or node.get("class_type") != "CLIPTextEncode":
-        return None
+        return None, None, False
     text = _inputs(node).get("text")
-    return text if isinstance(text, str) else None
+    clip_ref = _link(_inputs(node).get("clip"))
+    chain, ok = _clip_chain(nodes, clip_ref)
+    return (text if isinstance(text, str) else None), chain, ok
 
 
 def _model_chain(
     nodes: Mapping[str, Mapping[str, object]],
     model_ref: tuple[str, int] | None,
-) -> tuple[str | None, tuple[LoraSetting, ...], tuple[str, ...]]:
+) -> tuple[str | None, tuple[LoraSetting, ...], tuple[str, ...], tuple[str, ...] | None]:
     if model_ref is None:
-        return None, (), ("checkpoint",)
-    current = model_ref[0]
+        return None, (), ("checkpoint",), None
+    current, output_index = model_ref
     lora_nodes: list[Mapping[str, object]] = []
+    lora_ids: list[str] = []
     visited: set[str] = set()
     unresolved: list[str] = []
     checkpoint: str | None = None
+    checkpoint_id: str | None = None
     while current not in visited:
         visited.add(current)
         node = nodes.get(current)
@@ -221,14 +244,22 @@ def _model_chain(
         class_type = node.get("class_type")
         node_inputs = _inputs(node)
         if class_type == "LoraLoader":
+            if output_index != 0:
+                unresolved.append("checkpoint")
+                break
             lora_nodes.append(node)
+            lora_ids.append(current)
             previous = _link(node_inputs.get("model"))
             if previous is None:
                 unresolved.append("loras")
                 break
-            current = previous[0]
+            current, output_index = previous
             continue
         if class_type == "CheckpointLoaderSimple":
+            if output_index != 0:
+                unresolved.append("checkpoint")
+                break
+            checkpoint_id = current
             checkpoint = _safe_model_name(node_inputs.get("ckpt_name"))
             if checkpoint is None:
                 unresolved.append("checkpoint")
@@ -258,7 +289,39 @@ def _model_chain(
             )
         except ValueError:
             unresolved.append("loras")
-    return checkpoint, tuple(loras), tuple(dict.fromkeys(unresolved))
+    chain = (checkpoint_id, *reversed(lora_ids)) if checkpoint_id is not None else None
+    return checkpoint, tuple(loras), tuple(dict.fromkeys(unresolved)), chain
+
+
+def _clip_chain(
+    nodes: Mapping[str, Mapping[str, object]],
+    clip_ref: tuple[str, int] | None,
+) -> tuple[tuple[str, ...] | None, bool]:
+    """Trace the CLIP output back through the exact model/LoRA chain."""
+
+    if clip_ref is None:
+        return None, False
+    current, output_index = clip_ref
+    lora_ids: list[str] = []
+    visited: set[str] = set()
+    while current not in visited:
+        visited.add(current)
+        node = nodes.get(current)
+        if node is None:
+            return None, False
+        class_type = node.get("class_type")
+        if class_type == "CheckpointLoaderSimple":
+            return ((current, *reversed(lora_ids)), True) if output_index == 1 else (None, False)
+        if class_type != "LoraLoader":
+            return None, False
+        if output_index != 1:
+            return None, False
+        lora_ids.append(current)
+        previous = _link(_inputs(node).get("clip"))
+        if previous is None:
+            return None, False
+        current, output_index = previous
+    return None, False
 
 
 def _latent_dimensions(
@@ -268,34 +331,46 @@ def _latent_dimensions(
     if latent_ref is None:
         return None, None
     node = nodes.get(latent_ref[0])
-    if node is None or node.get("class_type") != "EmptyLatentImage":
+    if node is None or node.get("class_type") != "EmptyLatentImage" or latent_ref[1] != 0:
         return None, None
     inputs = _inputs(node)
     return _int_value(inputs.get("width")), _int_value(inputs.get("height"))
 
 
 def _external_vae(
-    nodes: Mapping[str, Mapping[str, object]], sampler_inputs: Mapping[str, object]
+    nodes: Mapping[str, Mapping[str, object]],
+    sampler_id: str | None,
+    model_chain: tuple[str, ...] | None,
 ) -> str | None | object:
-    # Locate the VAEDecode node fed by the sampler and use only its VAE link.
-    sample_ref = _link(sampler_inputs.get("latent_image"))
-    del sample_ref
-    for node in nodes.values():
-        if node.get("class_type") != "VAEDecode":
-            continue
-        vae_ref = _link(_inputs(node).get("vae"))
-        if vae_ref is None:
-            return None
-        vae_node = nodes.get(vae_ref[0])
-        if vae_node is None:
-            return _UNRESOLVED
-        if vae_node.get("class_type") == "VAELoader":
-            name = _safe_model_name(_inputs(vae_node).get("vae_name"))
-            return name if name is not None else _UNRESOLVED
-        if vae_node.get("class_type") == "CheckpointLoaderSimple":
-            return None
+    """Resolve only the VAE on the selected KSampler execution path."""
+
+    if sampler_id is None or model_chain is None:
         return _UNRESOLVED
-    return None
+    matches = [
+        node_id
+        for node_id, node in nodes.items()
+        if node.get("class_type") == "VAEDecode"
+        and _link(_inputs(node).get("samples")) == (sampler_id, 0)
+    ]
+    decoders = [node_id for node_id, node in nodes.items() if node.get("class_type") == "VAEDecode"]
+    if len(decoders) != 1 or len(matches) != 1:
+        return _UNRESOLVED
+    vae_ref = _link(_inputs(nodes[matches[0]]).get("vae"))
+    if vae_ref is None:
+        return _UNRESOLVED
+    vae_node = nodes.get(vae_ref[0])
+    if vae_node is None:
+        return _UNRESOLVED
+    if vae_node.get("class_type") == "VAELoader":
+        if vae_ref[1] != 0:
+            return _UNRESOLVED
+        name = _safe_model_name(_inputs(vae_node).get("vae_name"))
+        return name if name is not None else _UNRESOLVED
+    if vae_node.get("class_type") == "CheckpointLoaderSimple":
+        # CheckpointLoaderSimple output 2 is its VAE.  A different checkpoint
+        # or a non-VAE output is not equivalent to the execution model.
+        return None if vae_ref[0] == model_chain[0] and vae_ref[1] == 2 else _UNRESOLVED
+    return _UNRESOLVED
 
 
 def _safe_model_name(value: object) -> str | None:

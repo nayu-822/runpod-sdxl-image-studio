@@ -159,6 +159,40 @@ class ImportedImageStorage:
         relative = _safe_relative_path(imported_image.stored_image_path)
         return self._settings.data_dir.joinpath(*relative.parts)
 
+    def cleanup_uncommitted(self, imported_image: ImportedImage) -> bool:
+        """Remove only a newly-created canonical image whose DB row never committed.
+
+        This is deliberately stricter than normal file cleanup.  A path must
+        still be the UUID-based canonical import path, resolve below the data
+        root without a symlink, and contain exactly the bytes recorded by the
+        store operation.  Any uncertainty leaves the file in place.
+        """
+
+        try:
+            relative = _safe_relative_path(imported_image.stored_image_path)
+            if (
+                len(relative.parts) != 4
+                or relative.parts[0] != "imports"
+                or relative.parts[2] != "images"
+                or relative.name != f"{imported_image.id}.png"
+            ):
+                return False
+            root = self._settings.data_dir.resolve()
+            path = self._settings.data_dir.joinpath(*relative.parts)
+            if path.is_symlink():
+                return False
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(root)
+            if not resolved.is_file():
+                return False
+            contents = resolved.read_bytes()
+            if hashlib.sha256(contents).hexdigest() != imported_image.stored_image_sha256:
+                return False
+            resolved.unlink()
+            return True
+        except (OSError, ValueError, ImportedImageStorageError):
+            return False
+
 
 def _canonical_png(image_bytes: bytes) -> tuple[int, int, bytes]:
     try:

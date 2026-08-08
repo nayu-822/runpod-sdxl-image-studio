@@ -893,7 +893,9 @@ class GenerationService:
                 if imported is None:
                     raise ComfyUIPromptError("upscale import source was not found")
                 try:
-                    source_bytes = self._imported_image_storage.read_verified(imported)
+                    source_bytes = self._imported_image_storage.read_verified(
+                        imported.imported_image
+                    )
                 except ImportedImageStorageError as exc:
                     raise UpscaleEnqueueError(
                         exc.code, "metadata import source could not be verified"

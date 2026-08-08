@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import ntpath
 import posixpath
 from dataclasses import dataclass
@@ -94,8 +95,10 @@ def _candidate_from_settings(
             warnings=("metadata_import_unresolved",),
         )
     source = raw_settings
-    positive = _string(source.get("positive_prompt"))
-    negative = _string(source.get("negative_prompt"))
+    # Prompt text is user data, not a model identifier.  Preserve it exactly,
+    # including an intentionally empty value and surrounding whitespace.
+    positive = _prompt(source, "positive_prompt")
+    negative = _prompt(source, "negative_prompt")
     seed = _int(source.get("seed"))
     width = _int(source.get("width"))
     height = _int(source.get("height"))
@@ -104,8 +107,10 @@ def _candidate_from_settings(
     sampler = _string(source.get("sampler_name"))
     scheduler = _string(source.get("scheduler_name"))
     checkpoint = _safe_model_name(source.get("checkpoint_name"))
-    vae = _safe_model_name(source.get("vae_name")) if source.get("vae_name") is not None else None
-    loras, lora_ok = _loras(source.get("loras"))
+    raw_vae = source.get("vae_name")
+    vae = _safe_model_name(raw_vae) if raw_vae is not None else None
+    vae_ok = "vae_name" in source and (raw_vae is None or vae is not None)
+    loras, lora_ok = _loras(source.get("loras"), present="loras" in source)
     unresolved = [
         name
         for name, value in (
@@ -122,6 +127,8 @@ def _candidate_from_settings(
         )
         if value is None
     ]
+    if not vae_ok:
+        unresolved.append("vae_name")
     if not lora_ok:
         unresolved.append("loras")
     resolutions = tuple(
@@ -171,25 +178,40 @@ def _candidate_from_settings(
     )
 
 
-def _loras(value: object) -> tuple[tuple[LoraSetting, ...], bool]:
-    if value is None:
-        return (), True
+def _loras(value: object, *, present: bool) -> tuple[tuple[LoraSetting, ...], bool]:
+    # An omitted key is different from an explicitly empty collection.  The
+    # latter is a fully resolved "no LoRA" choice.
+    if not present:
+        return (), False
     if not isinstance(value, (list, tuple)):
         return (), False
     result: list[LoraSetting] = []
     try:
-        for index, item in enumerate(value):
+        for item in value:
             if not isinstance(item, dict):
+                return (), False
+            required = {"name", "model_strength", "clip_strength", "order"}
+            if not required.issubset(item):
+                return (), False
+            name = _safe_model_name(item.get("name"))
+            model_strength = _float(item.get("model_strength"))
+            clip_strength = _float(item.get("clip_strength"))
+            order = _order(item.get("order"))
+            if name is None or model_strength is None or clip_strength is None or order is None:
                 return (), False
             result.append(
                 LoraSetting(
-                    name=_safe_model_name(item.get("name")) or "",
-                    model_strength=_float(item.get("model_strength")) or 0.0,
-                    clip_strength=_float(item.get("clip_strength")) or 0.0,
-                    order=_int(item.get("order")) if _int(item.get("order")) is not None else index,
+                    name=name,
+                    model_strength=model_strength,
+                    clip_strength=clip_strength,
+                    order=order,
                 )
             )
     except ValueError:
+        return (), False
+    if len({item.name for item in result}) != len(result):
+        return (), False
+    if len({item.order for item in result}) != len(result):
         return (), False
     return tuple(result), True
 
@@ -213,6 +235,11 @@ def _string(value: object) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
+def _prompt(source: dict[str, object], key: str) -> str | None:
+    value = source.get(key)
+    return value if isinstance(value, str) else None
+
+
 def _int(value: object) -> int | None:
     if isinstance(value, bool):
         return None
@@ -223,10 +250,17 @@ def _int(value: object) -> int | None:
     return None
 
 
+def _order(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
 def _float(value: object) -> float | None:
     if isinstance(value, bool):
         return None
-    return float(value) if isinstance(value, (int, float)) else None
+    if not isinstance(value, (int, float)):
+        return None
+    normalized = float(value)
+    return normalized if math.isfinite(normalized) else None
 
 
 __all__ = [

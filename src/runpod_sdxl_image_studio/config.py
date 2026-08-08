@@ -7,6 +7,8 @@ from pathlib import Path
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from runpod_sdxl_image_studio.domain.metadata_import import MAX_METADATA_RAW_BYTES
+
 
 class Settings(BaseSettings):
     """Runtime configuration for the application.
@@ -297,6 +299,10 @@ class Settings(BaseSettings):
             raise ValueError(
                 "image_download_stale_after_seconds must exceed the maximum metadata request wait"
             )
+        if self.max_metadata_sidecar_bytes > MAX_METADATA_RAW_BYTES:
+            raise ValueError("max_metadata_sidecar_bytes exceeds the raw metadata contract")
+        if self.max_metadata_raw_bytes > MAX_METADATA_RAW_BYTES:
+            raise ValueError("max_metadata_raw_bytes exceeds the raw metadata contract")
         return self
 
     @field_validator("max_upscale_factor")

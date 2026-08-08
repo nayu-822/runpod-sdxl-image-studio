@@ -445,6 +445,10 @@ ComfyUIの既知の `prompt` graph と本アプリの sidecar schema v1だけを
 
 生成条件への適用はpreview後の明示操作だけで行われ、適用自体は生成もQueue投入も行いません。外部画像はmetadataがなくても画像アップスケールへ適用できます。Latentアップスケールには完全に解決済みのmetadataが必要です。
 
+sidecarのpromptは空文字・空白を含めて保持し、LoRAのname、strength、order、VAEの明示指定を省略時の既定値で補完しません。PNG promptとsidecarの値が衝突した場合は、UIでsourceを選択してSQLiteへ保存します。sidecarの画像hashが一致しない場合は、明示確認なしにsidecarを実行へ使用しません。ComfyUI promptは対象KSamplerからmodel、CLIP、latent、VAEDecodeへの接続を辿って検証し、別branch・複数候補・未知の実行chainは未解決として扱います。
+
+画像・latentの外部upscaleは既存の永続Queueを通り、worker直前にcanonical画像とcheckpoint、VAE、LoRA、sampler、scheduler、upscalerの能力を再検証します。外部sourceの変更は `metadata_import_source_changed` で確定し、uploadと `/prompt` は行いません。再起動後のprompt reconciliationは既存promptを再送せず、retryは新しいGeneration/Jobを作成して `retry_of_generation_id`、attempt、外部sourceを引き継ぎます。
+
 Phase 6 migration確認:
 
 ```bash
@@ -454,3 +458,5 @@ alembic upgrade head
 ```
 
 `generation_upscale_settings` は既存のGeneration Artifact sourceを維持しつつ、外部画像では `source_import_id` とSHA-256を保存します。workerは実行直前にcanonical画像のpath、hash、形式、寸法を再検証し、変更時は `metadata_import_source_changed` として失敗確定します。
+
+source選択の候補と確認状態は `0011_phase6_metadata_source_selection` で保存します。通常のdowngradeでは0011だけを戻せますが、外部upscale行が残る状態で0010から0009へ戻す操作は安全のため拒否されます。

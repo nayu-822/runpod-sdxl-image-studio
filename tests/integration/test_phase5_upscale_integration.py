@@ -207,6 +207,8 @@ def test_phase5_migration_runs_from_empty_and_phase4_database(tmp_path: Path) ->
             == job_id
         )
     command.downgrade(_alembic_config(phase4_url), "-1")
+    assert inspect(engine).has_table("metadata_imports")
+    command.downgrade(_alembic_config(phase4_url), "-1")
     assert not inspect(engine).has_table("metadata_imports")
     assert inspect(engine).has_table("generation_upscale_settings")
     command.downgrade(_alembic_config(phase4_url), "-1")

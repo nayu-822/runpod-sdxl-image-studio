@@ -12,6 +12,7 @@ from warnings import catch_warnings, simplefilter
 from PIL import Image, UnidentifiedImageError
 
 from runpod_sdxl_image_studio.adapters.catalog.upscaler_catalog import UpscalerCatalog
+from runpod_sdxl_image_studio.adapters.comfyui.models import ComfyUICapabilities
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_dispatch_queue_repository import (  # noqa: E501
     GenerationDispatchQueueRepositoryError,
     GenerationDispatchQueueRepositoryProtocol,
@@ -37,8 +38,8 @@ from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettin
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
 from runpod_sdxl_image_studio.domain.metadata_import import (
     ImportedImage,
+    MetadataImportCandidate,
     MetadataImportError,
-    MetadataImportStatus,
 )
 from runpod_sdxl_image_studio.domain.upscale import (
     UpscaleLoadLevel,
@@ -57,6 +58,24 @@ class UpscaleEnqueueError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+_CAPABILITY_WARNINGS = frozenset(
+    {
+        "metadata_import_model_missing",
+        "metadata_import_model_catalog_unavailable",
+    }
+)
+_BLOCKING_METADATA_WARNINGS = frozenset(
+    {
+        "metadata_import_sidecar_hash_mismatch",
+        "metadata_import_ambiguous",
+        "metadata_import_model_missing",
+        "metadata_import_model_catalog_unavailable",
+        "metadata_import_mapping_invalid",
+        "metadata_import_unresolved",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -102,6 +121,7 @@ class UpscaleEnqueueService:
         catalog: UpscalerCatalog | None = None,
         metadata_import_repository: MetadataImportRepositoryProtocol | None = None,
         imported_image_storage: ImportedImageStorage | None = None,
+        capabilities: ComfyUICapabilities | None = None,
     ) -> None:
         self._generations = generation_repository
         self._artifacts = artifact_repository
@@ -110,6 +130,10 @@ class UpscaleEnqueueService:
         self._catalog = catalog or UpscalerCatalog.scan(settings.upscaler_dir)
         self._metadata_import_repository = metadata_import_repository
         self._imported_image_storage = imported_image_storage
+        self._capabilities = capabilities
+
+    def set_capabilities(self, capabilities: ComfyUICapabilities | None) -> None:
+        self._capabilities = capabilities
 
     def latest_completed_generation_id(self) -> UUID | None:
         page = self._generations.list_history(
@@ -335,13 +359,19 @@ class UpscaleEnqueueService:
             record = self._metadata_import_repository.get_by_id(import_id)  # type: ignore[union-attr]
             if (
                 record is None
-                or record.metadata_status is not MetadataImportStatus.READY
                 or record.candidate is None
+                or not record.candidate.is_generation_ready
             ):
                 raise UpscaleEnqueueError(
                     "metadata_import_unresolved",
                     "latent upscale requires complete imported metadata",
                 )
+            if (set(record.warnings) - _CAPABILITY_WARNINGS) & _BLOCKING_METADATA_WARNINGS:
+                raise UpscaleEnqueueError(
+                    "metadata_import_unresolved",
+                    "latent upscale metadata has blocking warnings",
+                )
+            self._validate_import_capabilities(record.candidate)
             try:
                 source_settings = record.candidate.to_generation_settings()
             except MetadataImportError as exc:
@@ -412,15 +442,42 @@ class UpscaleEnqueueService:
         if upscale_settings.method.value != "latent":
             return
         record = self._metadata_import_repository.get_by_id(import_id)  # type: ignore[union-attr]
-        if (
-            record is None
-            or record.metadata_status is not MetadataImportStatus.READY
-            or record.candidate is None
-            or not record.candidate.is_generation_ready
-        ):
+        if record is None or record.candidate is None or not record.candidate.is_generation_ready:
             raise UpscaleEnqueueError(
                 "metadata_import_unresolved",
                 "latent upscale requires complete imported metadata",
+            )
+        if (set(record.warnings) - _CAPABILITY_WARNINGS) & _BLOCKING_METADATA_WARNINGS:
+            raise UpscaleEnqueueError(
+                "metadata_import_unresolved",
+                "latent upscale metadata has blocking warnings",
+            )
+        self._validate_import_capabilities(record.candidate)
+
+    def _validate_import_capabilities(self, candidate: MetadataImportCandidate) -> None:
+        capabilities = self._capabilities
+        if capabilities is None:
+            raise UpscaleEnqueueError(
+                "metadata_import_model_catalog_unavailable",
+                "latent upscale capabilities are unavailable",
+            )
+        missing = []
+        checkpoint = candidate.checkpoint_name
+        if checkpoint not in capabilities.checkpoints:
+            missing.append("checkpoint")
+        vae = candidate.vae_name
+        if vae is not None and vae not in capabilities.vaes:
+            missing.append("vae")
+        if any(lora.name not in capabilities.loras for lora in candidate.loras):
+            missing.append("lora")
+        if candidate.sampler_name not in capabilities.samplers:
+            missing.append("sampler")
+        if candidate.scheduler_name not in capabilities.schedulers:
+            missing.append("scheduler")
+        if missing:
+            raise UpscaleEnqueueError(
+                "metadata_import_model_missing",
+                "latent upscale metadata references unavailable capabilities",
             )
 
     def _plan_for_dimensions(

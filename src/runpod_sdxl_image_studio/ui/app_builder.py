@@ -9,6 +9,7 @@ import gradio as gr
 from runpod_sdxl_image_studio.adapters.catalog.upscaler_catalog import UpscalerCatalog
 from runpod_sdxl_image_studio.adapters.comfyui.cancellation import ComfyUICancellationAdapter
 from runpod_sdxl_image_studio.adapters.comfyui.client import ComfyUIClient
+from runpod_sdxl_image_studio.adapters.comfyui.models import ComfyUICapabilities
 from runpod_sdxl_image_studio.adapters.comfyui.upscale_workflow_adapter import (
     UpscaleWorkflowAdapter,
 )
@@ -135,6 +136,7 @@ from runpod_sdxl_image_studio.ui.tabs.metadata_import_tab import (
     make_metadata_generation_apply_handler,
     make_metadata_import_handler,
     make_metadata_mapping_handler,
+    make_metadata_source_selection_handler,
     make_metadata_upscale_apply_handler,
 )
 from runpod_sdxl_image_studio.ui.tabs.preset_tab import (
@@ -269,6 +271,11 @@ def build_app(
         metadata_import_repository=metadata_import_repository,
         imported_image_storage=imported_image_storage,
     )
+
+    def set_phase6_capabilities(capabilities: ComfyUICapabilities | None) -> None:
+        metadata_import_service.set_capabilities(capabilities)
+        upscale_enqueue_service.set_capabilities(capabilities)
+
     generation_service = GenerationService(
         client,
         WorkflowAdapter(loaded_workflow.as_mapping()),
@@ -395,42 +402,48 @@ def build_app(
         with gr.Tab("外部metadata"):
             metadata_import = build_metadata_import_tab(app_settings.max_loras)
 
+        metadata_import_outputs = [
+            metadata_import.import_id,
+            metadata_import.preview_image,
+            metadata_import.image_hash,
+            metadata_import.image_dimensions,
+            metadata_import.metadata_source,
+            metadata_import.source_selection,
+            metadata_import.confirm_sidecar_hash,
+            metadata_import.select_source_button,
+            metadata_import.status,
+            metadata_import.warnings,
+            metadata_import.unresolved,
+            metadata_import.raw_metadata,
+            metadata_import.settings_preview,
+            metadata_import.apply_generation,
+            metadata_import.apply_upscale,
+            metadata_import.parse_button,
+        ]
         metadata_import.parse_button.click(
+            fn=lambda: gr.Button(interactive=False),
+            outputs=[metadata_import.parse_button],
+            queue=False,
+        ).then(
             fn=make_metadata_import_handler(metadata_import_service),
             inputs=[metadata_import.image, metadata_import.sidecar],
-            outputs=[
-                metadata_import.import_id,
-                metadata_import.preview_image,
-                metadata_import.image_hash,
-                metadata_import.image_dimensions,
-                metadata_import.metadata_source,
-                metadata_import.status,
-                metadata_import.warnings,
-                metadata_import.unresolved,
-                metadata_import.raw_metadata,
-                metadata_import.settings_preview,
-                metadata_import.apply_generation,
-                metadata_import.apply_upscale,
-            ],
+            outputs=metadata_import_outputs,
             concurrency_limit=1,
         )
         metadata_import.apply_mapping.click(
             fn=make_metadata_mapping_handler(metadata_import_service),
             inputs=[metadata_import.import_id, metadata_import.mapping_json],
-            outputs=[
+            outputs=metadata_import_outputs,
+            concurrency_limit=1,
+        )
+        metadata_import.select_source_button.click(
+            fn=make_metadata_source_selection_handler(metadata_import_service),
+            inputs=[
                 metadata_import.import_id,
-                metadata_import.preview_image,
-                metadata_import.image_hash,
-                metadata_import.image_dimensions,
-                metadata_import.metadata_source,
-                metadata_import.status,
-                metadata_import.warnings,
-                metadata_import.unresolved,
-                metadata_import.raw_metadata,
-                metadata_import.settings_preview,
-                metadata_import.apply_generation,
-                metadata_import.apply_upscale,
+                metadata_import.source_selection,
+                metadata_import.confirm_sidecar_hash,
             ],
+            outputs=metadata_import_outputs,
             concurrency_limit=1,
         )
 
@@ -528,7 +541,7 @@ def build_app(
                 app_settings.timezone,
                 generation,
                 catalog_service,
-                metadata_import_service.set_capabilities,
+                set_phase6_capabilities,
             ),
             inputs=capability_inputs,
             outputs=[system.status_markdown, system.capability_message, *capability_outputs],
@@ -538,7 +551,7 @@ def build_app(
                 comfyui_service,
                 generation,
                 catalog_service,
-                metadata_import_service.set_capabilities,
+                set_phase6_capabilities,
             ),
             inputs=capability_inputs,
             outputs=[system.capability_message, *capability_outputs],

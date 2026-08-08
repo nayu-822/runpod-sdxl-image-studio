@@ -17,7 +17,7 @@
 
 0005/0006では既存DBの状態不一致を terminal state と Artifact の証拠に基づいて補正し、Generation と Job の prompt ID 不一致は `migration_prompt_id_mismatch` として Queue entry ごと `ambiguous` に隔離します。0005/0006適用済みDBには0007後続migrationを適用し、cancel requestだけで `cancelled` へ遷移させず、復元できない状態を監査可能に保持します。既存の画像、Artifact、履歴、Presetは削除しません。
 
-Queue 並べ替え、複数 worker/GPU、自動 retry、外部画像metadata、Google Drive同期、ComfyUI汎用workflow editor、LoRA学習は未実装です。
+Queue 並べ替え、複数 worker/GPU、自動 retry、Google Drive同期、ComfyUI汎用workflow editor、LoRA学習は未実装です。
 
 ## 方針
 
@@ -431,7 +431,7 @@ GenerationServiceが受け付けるようにしました。Repository群は`Gene
 設定復元、親Generationとの差分確認を満たします。
 
 Phase 4へは、生成キュー、複数ジョブ、キャンセル、再試行、失敗のみ再実行、バッチ生成、stale jobの高度な
-reconciliationを残します。アップスケール実処理、Google Drive同期、外部metadata import、複数ユーザー対応も
+reconciliationを残します。Google Drive同期、複数ユーザー対応も
 従来計画どおり後続フェーズです。
 
 ## フェーズ5の完了状況
@@ -449,12 +449,17 @@ capability不足時のfailed確定、再起動後のhistory復旧、誤寸法出
 
 フェーズ6を実装済みです。PNG/WebPの安全な検証とcanonical PNG保存、SHA-256・寸法・形式の記録、ComfyUI既知prompt graphと
 本アプリsidecar schema v1の候補解析、raw metadata保持、未解決項目のpreview、明示的なmodel mapping、SQLite `metadata_imports`
-repository、0010 migrationを追加しました。workflow metadataはraw-onlyで保持し、実行・eval・exec・pickle・shellは行いません。
+repository、0010/0011 migrationを追加しました。workflow metadataはraw-onlyで保持し、実行・eval・exec・pickle・shellは行いません。
 
 previewからの生成条件適用は明示操作に限定し、外部画像はmetadataなしでも画像アップスケールへ利用できます。Latentアップスケールは
-完全に解決済みのGenerationSettingsだけを受け付け、Queue投入を既存のSQLite transactionへ接続しました。外部sourceのpath、hash、
-寸法、PNG形式はworker実行直前とretry時にも再検証し、変更時は `metadata_import_source_changed` で失敗確定します。
+完全に解決済みのGenerationSettingsだけを受け付け、Queue投入を既存のSQLite transactionへ接続しました。sidecarのprompt空白、LoRAの
+strength/order、VAEのnullを損なわず、PNG promptとsidecarの衝突はsource選択とhash確認をSQLiteへ保存します。ComfyUI graphはtarget
+KSamplerからのmodel/CLIP/latent/VAEDecode接続を検証し、別branch・複数候補・execution-chain unknownは未解決にします。外部sourceのpath、hash、
+寸法、PNG形式とcheckpoint、VAE、LoRA、sampler、scheduler、upscalerの能力はworker実行直前とretry時にも再検証し、変更時は
+`metadata_import_source_changed` で失敗確定します。外部image/latentはuploadと固定workflowを経由し、既存promptのreconciliationでは再送せず、
+retryはsource provenanceと `retry_of_generation_id` を保持した新規Generation/Jobとして冪等に作成します。
 
-実ComfyUI、実GPU、実RunPod、実Google Driveを使った手動確認は未実施です。自動テストではFake/SQLite/Alembicでparser、storage、
-mapping、外部source provenance、migrationの安全なdowngrade、既存Queue経路を検証します。Phase 7、複数worker、Queue並べ替え、自動retry、
+実ComfyUI、実GPU、実RunPod、実Google Driveを使った手動確認は未実施です。自動テストではFake/SQLite/Alembicでstrict parser、storage cleanup、
+source selection、UIの排他再有効化、mapping、外部image/latentのworkerとreconciliation、source mutation、retry idempotency、migrationの安全なdowngrade、
+既存Queue経路を検証します。Phase 7、複数worker、Queue並べ替え、自動retry、
 Google Drive同期、汎用workflow editorは対象外です。

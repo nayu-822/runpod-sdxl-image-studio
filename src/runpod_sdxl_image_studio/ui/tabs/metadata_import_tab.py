@@ -15,6 +15,7 @@ from runpod_sdxl_image_studio.domain.metadata_import import (
     MetadataImportError,
     MetadataImportPreview,
     MetadataModelMapping,
+    MetadataSourceKind,
 )
 from runpod_sdxl_image_studio.services.metadata_import_service import MetadataImportService
 from runpod_sdxl_image_studio.ui.components.lora_editor import render_state_updates
@@ -35,6 +36,9 @@ class MetadataImportTabComponents:
     image_hash: Any
     image_dimensions: Any
     metadata_source: Any
+    source_selection: Any
+    confirm_sidecar_hash: Any
+    select_source_button: Any
     status: Any
     warnings: Any
     unresolved: Any
@@ -64,6 +68,21 @@ def build_metadata_import_tab(max_loras: int = 8) -> MetadataImportTabComponents
     image_hash = gr.Textbox(label="stored image SHA-256", interactive=False)
     image_dimensions = gr.Textbox(label="画像寸法", interactive=False)
     metadata_source = gr.Markdown()
+    source_selection = gr.Radio(
+        label="metadata source",
+        choices=[
+            ("ComfyUI PNG prompt", MetadataSourceKind.COMFYUI_PROMPT.value),
+            ("app sidecar", MetadataSourceKind.APP_SIDECAR.value),
+        ],
+        value=None,
+        interactive=False,
+    )
+    confirm_sidecar_hash = gr.Checkbox(
+        label="sidecarの画像hash不一致を確認して使用する",
+        value=False,
+        interactive=False,
+    )
+    select_source_button = gr.Button("選択したmetadata sourceを確定", interactive=False)
     status = gr.Markdown()
     warnings = gr.Markdown()
     unresolved = gr.Markdown()
@@ -89,6 +108,9 @@ def build_metadata_import_tab(max_loras: int = 8) -> MetadataImportTabComponents
         image_hash=image_hash,
         image_dimensions=image_dimensions,
         metadata_source=metadata_source,
+        source_selection=source_selection,
+        confirm_sidecar_hash=confirm_sidecar_hash,
+        select_source_button=select_source_button,
         status=status,
         warnings=warnings,
         unresolved=unresolved,
@@ -121,6 +143,49 @@ def make_metadata_import_handler(
             return _import_error_outputs()
         except Exception:  # noqa: BLE001 - UI boundary hides internal details
             logger.exception("Metadata import handler failed")
+            return _import_internal_error_outputs()
+
+    return handler
+
+
+def make_metadata_source_selection_handler(
+    service: MetadataImportService,
+) -> Callable[[str | None, str | None, bool], tuple[object, ...]]:
+    def handler(
+        import_id: str | None,
+        source_kind: str | None,
+        confirm_sidecar_hash: bool,
+    ) -> tuple[object, ...]:
+        try:
+            if not import_id or not source_kind:
+                raise MetadataImportError(
+                    "metadata_import_source_invalid", "metadata source is not selected"
+                )
+            preview = service.select_metadata_source(
+                UUID(import_id),
+                source_kind,
+                confirm_sidecar_hash_mismatch=bool(confirm_sidecar_hash),
+            )
+            return _preview_outputs(service, preview)
+        except (MetadataImportError, ValueError) as exc:
+            if import_id:
+                try:
+                    preview = service.get_preview(UUID(import_id))
+                    warning = getattr(exc, "code", "metadata_import_source_invalid")
+                    preview = preview.model_copy(
+                        update={"warnings": tuple(dict.fromkeys((*preview.warnings, warning)))}
+                    )
+                    return _preview_outputs(service, preview)
+                except Exception:  # noqa: BLE001 - retain safe error fallback
+                    pass
+            return _import_error_outputs()
+        except Exception:  # noqa: BLE001 - UI boundary hides internal details
+            logger.exception("Metadata source selection failed")
+            if import_id:
+                try:
+                    return _preview_outputs(service, service.get_preview(UUID(import_id)))
+                except Exception:  # noqa: BLE001 - retain safe error fallback
+                    pass
             return _import_internal_error_outputs()
 
     return handler
@@ -217,8 +282,8 @@ def make_metadata_upscale_apply_handler(
         try:
             if not import_id:
                 raise MetadataImportError("metadata_import_unresolved", "import is not selected")
-            path = service.get_upscale_source_path(UUID(import_id))
-            return str(import_id), "", str(path), "外部画像をアップスケール対象に指定しました。"
+            path = _gradio_image_path(service, UUID(import_id))
+            return str(import_id), "", path, "外部画像をアップスケール対象に指定しました。"
         except (MetadataImportError, ValueError):
             return "", "", None, _SAFE_IMPORT_ERROR
         except Exception:  # noqa: BLE001 - UI boundary hides internal details
@@ -231,15 +296,32 @@ def make_metadata_upscale_apply_handler(
 def _preview_outputs(
     service: MetadataImportService, preview: MetadataImportPreview
 ) -> tuple[object, ...]:
-    image_path = service.get_upscale_source_path(preview.id)
+    image_path = _gradio_image_path(service, preview.id)
     raw_text = "\n\n".join(source.raw_text for source in preview.raw_sources)
     settings = preview.candidate.model_dump(mode="json") if preview.candidate else {}
+    source_choices = [candidate.source_kind.value for candidate in preview.candidates]
+    selected_source = (
+        preview.selected_metadata_source.value
+        if preview.selected_metadata_source is not None
+        else None
+    )
+    sidecar_hash_confirmation = "metadata_import_sidecar_hash_mismatch" in preview.warnings
     return (
         str(preview.id),
         str(image_path),
         preview.imported_image.stored_image_sha256,
         f"{preview.imported_image.image_width} × {preview.imported_image.image_height}",
         f"metadata source: `{preview.metadata_source.value}`",
+        gr.Radio(
+            choices=source_choices,
+            value=selected_source,
+            interactive=bool(source_choices),
+        ),
+        gr.Checkbox(
+            value=preview.sidecar_hash_confirmed,
+            interactive=sidecar_hash_confirmation,
+        ),
+        gr.Button(interactive=bool(source_choices)),
         f"status: `{preview.status.value}`",
         "\n".join(f"- `{warning}`" for warning in preview.warnings) or "警告はありません。",
         "\n".join(f"- `{field}`" for field in preview.unresolved_fields)
@@ -247,6 +329,7 @@ def _preview_outputs(
         raw_text,
         json.dumps(settings, ensure_ascii=False, indent=2),
         gr.Button(interactive=preview.status.value == "ready"),
+        gr.Button(interactive=True),
         gr.Button(interactive=True),
     )
 
@@ -259,11 +342,15 @@ def _import_error_outputs() -> tuple[object, ...]:
         "",
         "",
         "",
+        None,
+        False,
+        gr.Button(interactive=False),
         _SAFE_IMPORT_ERROR,
         "",
         "",
         "",
-        gr.Button(interactive=True),
+        gr.Button(interactive=False),
+        gr.Button(interactive=False),
         gr.Button(interactive=True),
     )
 
@@ -276,11 +363,15 @@ def _import_internal_error_outputs() -> tuple[object, ...]:
         "",
         "",
         "",
+        None,
+        False,
+        gr.Button(interactive=False),
         _SAFE_INTERNAL_ERROR,
         "",
         "",
         "",
-        gr.Button(interactive=True),
+        gr.Button(interactive=False),
+        gr.Button(interactive=False),
         gr.Button(interactive=True),
     )
 
@@ -294,11 +385,18 @@ def _restore_error_outputs(max_loras: int) -> tuple[object, ...]:
     )
 
 
+def _gradio_image_path(service: MetadataImportService, import_id: UUID) -> str:
+    """Resolve an absolute path only at the isolated Gradio image boundary."""
+
+    return str(service.get_upscale_source_path(import_id))
+
+
 __all__ = [
     "MetadataImportTabComponents",
     "build_metadata_import_tab",
     "make_metadata_generation_apply_handler",
     "make_metadata_import_handler",
     "make_metadata_mapping_handler",
+    "make_metadata_source_selection_handler",
     "make_metadata_upscale_apply_handler",
 ]

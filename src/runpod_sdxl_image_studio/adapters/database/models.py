@@ -172,6 +172,11 @@ class MetadataImportModel(Base):
     raw_metadata_json: Mapped[str] = mapped_column(Text, nullable=False)
     raw_metadata_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     candidate_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    candidate_options_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    selected_metadata_source: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    sidecar_hash_confirmed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
     normalized_snapshot_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     normalized_snapshot_schema_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     manual_mapping_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")

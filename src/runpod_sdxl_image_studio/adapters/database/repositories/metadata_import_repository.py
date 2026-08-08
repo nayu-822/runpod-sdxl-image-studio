@@ -36,6 +36,10 @@ class MetadataImportRepositoryProtocol(Protocol):
 
     def get_by_id(self, import_id: UUID) -> MetadataImportRecord | None: ...
 
+    def get_by_source_image_sha256(
+        self, source_image_sha256: str
+    ) -> MetadataImportRecord | None: ...
+
     def list_recent(self, limit: int = 20) -> tuple[MetadataImportRecord, ...]: ...
 
 
@@ -65,6 +69,19 @@ class MetadataImportRepository(MetadataImportRepositoryProtocol):
         try:
             with session_scope(self._session_factory) as session:
                 row = session.get(MetadataImportModel, str(import_id))
+                return _record(row) if row is not None else None
+        except (SQLAlchemyError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise MetadataImportRepositoryError("metadata import could not be read") from exc
+
+    def get_by_source_image_sha256(self, source_image_sha256: str) -> MetadataImportRecord | None:
+        try:
+            with session_scope(self._session_factory) as session:
+                row = session.scalar(
+                    select(MetadataImportModel)
+                    .where(MetadataImportModel.source_image_sha256 == source_image_sha256)
+                    .order_by(MetadataImportModel.created_at.desc())
+                    .limit(1)
+                )
                 return _record(row) if row is not None else None
         except (SQLAlchemyError, ValueError, TypeError, json.JSONDecodeError) as exc:
             raise MetadataImportRepositoryError("metadata import could not be read") from exc
@@ -106,6 +123,17 @@ def _row_values(record: MetadataImportRecord) -> dict[str, object]:
         "candidate_json": (
             record.candidate.model_dump_json() if record.candidate is not None else None
         ),
+        "candidate_options_json": json.dumps(
+            [candidate.model_dump(mode="json") for candidate in record.candidates],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        "selected_metadata_source": (
+            record.selected_metadata_source.value
+            if record.selected_metadata_source is not None
+            else None
+        ),
+        "sidecar_hash_confirmed": record.sidecar_hash_confirmed,
         "normalized_snapshot_json": record.normalized_snapshot_json,
         "normalized_snapshot_schema_version": record.normalized_snapshot_schema_version,
         "manual_mapping_json": json.dumps(
@@ -126,6 +154,12 @@ def _record(row: MetadataImportModel) -> MetadataImportRecord:
         if row.candidate_json
         else None
     )
+    candidates = tuple(
+        MetadataImportCandidate.model_validate(candidate_value)
+        for candidate_value in json.loads(getattr(row, "candidate_options_json", "[]") or "[]")
+    )
+    if not candidates and candidate is not None:
+        candidates = (candidate,)
     mappings = tuple(
         MetadataModelMapping.model_validate(mapping)
         for mapping in json.loads(row.manual_mapping_json or "[]")
@@ -149,6 +183,13 @@ def _record(row: MetadataImportModel) -> MetadataImportRecord:
         metadata_status=MetadataImportStatus(row.metadata_status),
         raw_sources=sources,
         candidate=candidate,
+        candidates=candidates,
+        selected_metadata_source=(
+            MetadataSourceKind(row.selected_metadata_source)
+            if getattr(row, "selected_metadata_source", None)
+            else None
+        ),
+        sidecar_hash_confirmed=bool(getattr(row, "sidecar_hash_confirmed", False)),
         normalized_snapshot_json=row.normalized_snapshot_json,
         normalized_snapshot_schema_version=row.normalized_snapshot_schema_version,
         manual_mappings=mappings,
