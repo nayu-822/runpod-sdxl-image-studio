@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
-import re
+import math
 from collections.abc import Awaitable, Callable
 from pathlib import Path, PurePosixPath
 
@@ -150,11 +150,10 @@ class GoogleDriveAdapter:
             ) from exc
 
         log_target = self._resolve_log_path(log_path)
-        self._append_log(log_target, f"operation_started={operation}")
+        self._append_log(log_target, f"operation_started={_safe_operation(operation)}")
         stdout_task = asyncio.create_task(
             self._consume_stream(
                 process.stdout,
-                is_progress=True,
                 progress_callback=progress_callback,
                 total_bytes=total_bytes,
                 current_artifact=current_artifact,
@@ -164,7 +163,6 @@ class GoogleDriveAdapter:
         stderr_task = asyncio.create_task(
             self._consume_stream(
                 process.stderr,
-                is_progress=True,
                 progress_callback=progress_callback,
                 total_bytes=total_bytes,
                 current_artifact=current_artifact,
@@ -174,6 +172,7 @@ class GoogleDriveAdapter:
         callback_error: Exception | None = None
         timed_out = False
         try:
+            self._append_log(log_target, "pid_started=true")
             if process_started_callback is not None:
                 try:
                     await _invoke(process_started_callback, process.pid)
@@ -203,19 +202,24 @@ class GoogleDriveAdapter:
                     await _invoke(process_finished_callback)
                 except Exception:  # noqa: BLE001 - best effort PID cleanup
                     logger.warning("rclone process-finished callback failed", exc_info=True)
-            self._append_log(log_target, f"operation_finished={operation}")
+            self._append_log(log_target, f"operation_finished={_safe_operation(operation)}")
 
         if callback_error is not None:
+            self._append_log(
+                log_target,
+                f"operation_error={DriveSyncErrorCode.PERSISTENCE_FAILED.value}",
+            )
             raise GoogleDriveAdapterError(
                 DriveSyncErrorCode.PERSISTENCE_FAILED.value,
                 "rclone process state could not be persisted",
             ) from callback_error
         if timed_out:
+            self._append_log(log_target, f"operation_error={_safe_error_code(timeout_code)}")
             raise GoogleDriveAdapterError(timeout_code, "rclone operation timed out")
         if process.returncode != 0:
             code = _classify_rclone_failure(stderr)
             logger.warning("rclone operation failed code=%s", code)
-            self._append_log(log_target, f"operation_error={code}")
+            self._append_log(log_target, f"operation_error={_safe_error_code(code)}")
             raise GoogleDriveAdapterError(code, "rclone operation failed")
         return stdout, stderr
 
@@ -223,7 +227,6 @@ class GoogleDriveAdapter:
         self,
         stream: asyncio.StreamReader | None,
         *,
-        is_progress: bool,
         progress_callback: ProgressCallback | None,
         total_bytes: int,
         current_artifact: str | None,
@@ -238,10 +241,10 @@ class GoogleDriveAdapter:
                 break
             line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
             chunks.append(line)
-            self._append_log(log_target, _redact_log_line(line))
-            if is_progress and progress_callback is not None:
-                progress = _progress_from_line(line, total_bytes, current_artifact)
-                if progress is not None:
+            progress = _progress_from_line(line, total_bytes, current_artifact)
+            if progress is not None:
+                self._append_log(log_target, _safe_progress_event(progress))
+                if progress_callback is not None:
                     try:
                         await _invoke(progress_callback, progress)
                     except Exception:  # noqa: BLE001 - progress persistence is best effort
@@ -331,47 +334,69 @@ def _progress_from_line(
     raw_percentage = value.get("percentage")
     if not isinstance(raw_bytes, (int, float)) or isinstance(raw_bytes, bool):
         return None
-    resolved_total = int(raw_total) if isinstance(raw_total, (int, float)) else total_bytes
-    if resolved_total <= 0:
-        resolved_total = max(total_bytes, int(raw_bytes))
-    percentage = (
-        float(raw_percentage)
-        if isinstance(raw_percentage, (int, float)) and not isinstance(raw_percentage, bool)
-        else min(100.0, int(raw_bytes) * 100.0 / resolved_total)
-        if resolved_total
-        else 0.0
-    )
-    return DriveSyncProgress(
-        int(raw_bytes),
-        resolved_total,
-        max(0.0, min(100.0, percentage)),
-        current_artifact,
-    )
-
-
-_SECRET_PATTERN = re.compile(
-    r"(?i)(rclone[_ -]?config|--config|token|credential|cookie|api[_ -]?key|password|secret)"
-    r"(\s*[:=]\s*|\s+)[^\s,;]+"
-)
-
-
-def _redact_log_line(line: str) -> str:
-    if any(
-        marker in line.lower()
-        for marker in (
-            "rclone_config",
-            "rclone config",
-            "--config",
-            "token",
-            "credential",
-            "cookie",
-            "api key",
-            "password",
-            "secret",
+    try:
+        numeric_values = [raw_bytes]
+        if isinstance(raw_total, (int, float)) and not isinstance(raw_total, bool):
+            numeric_values.append(raw_total)
+        if isinstance(raw_percentage, (int, float)) and not isinstance(raw_percentage, bool):
+            numeric_values.append(raw_percentage)
+        if any(isinstance(value, float) and not math.isfinite(value) for value in numeric_values):
+            return None
+        progress_bytes = int(raw_bytes)
+        if progress_bytes < 0:
+            return None
+        resolved_total = (
+            int(raw_total)
+            if isinstance(raw_total, (int, float)) and not isinstance(raw_total, bool)
+            else total_bytes
         )
-    ):
-        return _SECRET_PATTERN.sub(r"\1=[REDACTED]", line)[:4000]
-    return line[:4000]
+        if resolved_total <= 0:
+            resolved_total = max(total_bytes, progress_bytes)
+        resolved_total = max(resolved_total, progress_bytes)
+        percentage = (
+            float(raw_percentage)
+            if isinstance(raw_percentage, (int, float)) and not isinstance(raw_percentage, bool)
+            else min(100.0, progress_bytes * 100.0 / resolved_total)
+            if resolved_total
+            else 0.0
+        )
+        return DriveSyncProgress(
+            progress_bytes,
+            resolved_total,
+            max(0.0, min(100.0, percentage)),
+            current_artifact,
+        )
+    except (TypeError, ValueError, OverflowError):
+        # Malformed progress must never turn an otherwise valid transfer into a failure.
+        return None
+
+
+_SAFE_ERROR_CODES = frozenset(
+    {error.value for error in DriveSyncErrorCode}
+    | {"drive_authentication_failed", "operation_timeout", "operation_failed"}
+)
+_SAFE_OPERATIONS = frozenset({"connection", "copyto"})
+_SAFE_ARTIFACTS = frozenset({"image", "metadata", "manifest"})
+
+
+def _safe_error_code(value: str) -> str:
+    return value if value in _SAFE_ERROR_CODES else "operation_failed"
+
+
+def _safe_operation(value: str) -> str:
+    return value if value in _SAFE_OPERATIONS else "operation"
+
+
+def _safe_progress_event(progress: DriveSyncProgress) -> str:
+    artifact = (
+        progress.current_artifact if progress.current_artifact in _SAFE_ARTIFACTS else "unknown"
+    )
+    return (
+        f"progress_bytes={progress.progress_bytes} "
+        f"total_bytes={progress.total_bytes} "
+        f"percentage={progress.progress_percentage:.1f} "
+        f"current_artifact={artifact}"
+    )
 
 
 __all__ = [

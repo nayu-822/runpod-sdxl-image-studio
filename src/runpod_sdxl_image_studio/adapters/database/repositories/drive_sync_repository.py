@@ -732,12 +732,38 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
                 for row in rows:
                     key = (row.local_date, row.remote_name, row.remote_base_path)
                     latest.setdefault(key, row)
-                return tuple(
-                    DriveManifestFailureTarget(local_date, remote_name, remote_base_path)
+                targets: dict[tuple[str, str, str], DriveManifestFailureTarget] = {
+                    (local_date, remote_name, remote_base_path): DriveManifestFailureTarget(
+                        local_date, remote_name, remote_base_path
+                    )
                     for (local_date, remote_name, remote_base_path), row in latest.items()
                     if row.status == DriveSyncStatus.FAILED.value and row.retryable
-                )[: min(max(1, limit), 100)]
-        except SQLAlchemyError as exc:
+                }
+
+                warning_rows = session.execute(
+                    select(
+                        DriveSyncRecordModel.remote_name,
+                        DriveSyncRecordModel.remote_base_path,
+                        GenerationModel.created_at,
+                    )
+                    .join(
+                        GenerationModel,
+                        GenerationModel.id == DriveSyncRecordModel.generation_id,
+                    )
+                    .where(
+                        DriveSyncRecordModel.status == DriveSyncStatus.SYNCED.value,
+                        DriveSyncRecordModel.error_code == "drive_manifest_failed",
+                    )
+                ).all()
+                for remote_name, remote_base_path, created_at in warning_rows:
+                    local_date = _tokyo_date(created_at)
+                    key = (local_date, remote_name, remote_base_path)
+                    targets.setdefault(
+                        key,
+                        DriveManifestFailureTarget(local_date, remote_name, remote_base_path),
+                    )
+                return tuple(targets.values())[: min(max(1, limit), 100)]
+        except (SQLAlchemyError, ValueError) as exc:
             raise DriveSyncRepositoryError("drive manifest failures could not be listed") from exc
 
     def reconcile_stale(self, now: datetime | None = None) -> int:

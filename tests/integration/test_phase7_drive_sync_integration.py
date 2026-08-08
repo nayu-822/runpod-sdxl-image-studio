@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from datetime import UTC, datetime
@@ -14,32 +15,54 @@ from alembic.config import Config
 from PIL import Image
 from sqlalchemy import create_engine, inspect
 
+from runpod_sdxl_image_studio.adapters.comfyui.models import (
+    ComfyUICapabilities,
+    ComfyUIOutputImage,
+    PromptHistory,
+    QueuedPrompt,
+)
+from runpod_sdxl_image_studio.adapters.comfyui.workflow_adapter import WorkflowAdapter
 from runpod_sdxl_image_studio.adapters.database.engine import create_session_factory
 from runpod_sdxl_image_studio.adapters.database.models import Base
 from runpod_sdxl_image_studio.adapters.database.repositories.drive_sync_repository import (
     DriveSyncRepository,
     DriveSyncRepositoryError,
 )
+from runpod_sdxl_image_studio.adapters.database.repositories.generation_progress_repository import (
+    GenerationProgressRepository,
+)
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_repository import (
     GenerationArtifactRepository,
     GenerationCompletionRepository,
+    GenerationFailureRepository,
     GenerationJobRepository,
+    GenerationQueueRepository,
     GenerationRepository,
 )
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_start_repository import (
     GenerationStartRepository,
 )
+from runpod_sdxl_image_studio.adapters.storage.generation_metadata_storage import (
+    GenerationMetadataStorage,
+)
+from runpod_sdxl_image_studio.adapters.storage.local_storage import LocalStorageAdapter
 from runpod_sdxl_image_studio.config import Settings
 from runpod_sdxl_image_studio.domain.drive_sync import (
     DriveConnectionResult,
     DriveConnectionStatus,
     DriveSyncStatus,
 )
-from runpod_sdxl_image_studio.domain.generation import GenerationKind
+from runpod_sdxl_image_studio.domain.generation import GenerationKind, GenerationStatus
 from runpod_sdxl_image_studio.domain.generation_artifact import ArtifactType, GenerationArtifact
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
+from runpod_sdxl_image_studio.domain.system_status import CapabilityRefreshResult
 from runpod_sdxl_image_studio.services.drive_sync_service import DriveSyncService
+from runpod_sdxl_image_studio.services.generation_persistence import (
+    GenerationPersistenceRepositories,
+)
+from runpod_sdxl_image_studio.services.generation_service import GenerationService
+from runpod_sdxl_image_studio.workflows.loader import load_txt2img_template
 
 ROOT = Path(__file__).parents[2]
 
@@ -56,6 +79,130 @@ class _FailingEnqueueRepository(DriveSyncRepository):
     def enqueue(self, record, job):
         del record, job
         raise DriveSyncRepositoryError("simulated enqueue failure")
+
+
+def _png() -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (64, 64), "white").save(output, format="PNG")
+    return output.getvalue()
+
+
+def _generation_service_fixture(tmp_path: Path, repository_type=DriveSyncRepository):
+    database_url = f"sqlite:///{(tmp_path / 'generation-service.sqlite3').as_posix()}"
+    settings = Settings(
+        _env_file=None,
+        database_url=database_url,
+        data_dir=tmp_path,
+        rclone_remote="drive-a",
+        rclone_base_path="studio-a",
+        history_poll_interval_seconds=0.001,
+        generation_timeout_seconds=5,
+        max_output_image_bytes=1_000_000,
+        max_metadata_sidecar_bytes=1_000_000,
+    )
+    command.upgrade(_config(database_url), "head")
+    engine = create_engine(database_url)
+    factory = create_session_factory(engine)
+    generations = GenerationRepository(factory)
+    artifacts = GenerationArtifactRepository(factory)
+    jobs = GenerationJobRepository(factory)
+    queue = GenerationQueueRepository(factory)
+    start = GenerationStartRepository(factory)
+    progress = GenerationProgressRepository(factory)
+    completion = GenerationCompletionRepository(factory)
+    failure = GenerationFailureRepository(factory)
+    drive_repository = repository_type(factory)
+    drive_service = DriveSyncService(
+        drive_repository,
+        generations,
+        artifacts,
+        settings,
+        _NoopDriveAdapter(),
+    )
+
+    class FakeClient:
+        async def queue_prompt(self, workflow: object, client_id: str) -> QueuedPrompt:
+            del workflow, client_id
+            return QueuedPrompt("generation-prompt", 1, {})
+
+        async def get_prompt_history(self, prompt_id: str) -> PromptHistory:
+            return PromptHistory(
+                prompt_id,
+                True,
+                False,
+                (ComfyUIOutputImage("generated.png", "", "output"),),
+                None,
+            )
+
+        async def get_output_image(self, output: ComfyUIOutputImage) -> bytes:
+            del output
+            return _png()
+
+    class FakeWebSocket:
+        async def watch_prompt(self, prompt_id: str, client_id: str):
+            del prompt_id, client_id
+            if False:
+                yield None
+
+    capabilities = ComfyUICapabilities(
+        checkpoints=("sdxl.safetensors",),
+        vaes=(),
+        samplers=("euler",),
+        schedulers=("normal",),
+        loras=(),
+        upscale_models=(),
+        available_node_classes=frozenset(
+            {
+                "CheckpointLoaderSimple",
+                "CLIPTextEncode",
+                "EmptyLatentImage",
+                "KSampler",
+                "VAEDecode",
+                "SaveImage",
+            }
+        ),
+        warnings=(),
+    )
+
+    async def capability_provider() -> CapabilityRefreshResult:
+        return CapabilityRefreshResult(True, "ok", capabilities)
+
+    service = GenerationService(
+        FakeClient(),  # type: ignore[arg-type]
+        WorkflowAdapter(load_txt2img_template().as_mapping()),
+        FakeWebSocket(),  # type: ignore[arg-type]
+        LocalStorageAdapter(settings),
+        capability_provider,
+        settings,
+        persistence=GenerationPersistenceRepositories(
+            generation=generations,
+            job=jobs,
+            artifact=artifacts,
+            start=start,
+            queue=queue,
+            progress=progress,
+            completion=completion,
+            failure=failure,
+        ),
+        metadata_storage=GenerationMetadataStorage(tmp_path),
+        drive_sync_enqueue_handler=drive_service.enqueue_generation,
+    )
+    return engine, service, generations, jobs, artifacts, drive_repository
+
+
+def _generation_settings() -> GenerationSettings:
+    return GenerationSettings(
+        positive_prompt="a cat",
+        negative_prompt="",
+        seed=42,
+        width=64,
+        height=64,
+        steps=20,
+        cfg_scale=7,
+        sampler_name="euler",
+        scheduler_name="normal",
+        checkpoint_name="sdxl.safetensors",
+    )
 
 
 def _completed_generation_for_drive(tmp_path: Path):
@@ -256,3 +403,71 @@ def test_drive_enqueue_failure_does_not_reopen_completed_generation(
     assert generation is not None and generation.status.value == "completed"
     assert job is not None and job.status.value == "completed"
     engine.dispose()
+
+
+def test_generation_service_completion_enqueues_drive_after_local_commit(tmp_path: Path) -> None:
+    engine, service, generations, jobs, artifacts, drive_repository = _generation_service_fixture(
+        tmp_path
+    )
+    try:
+        result = asyncio.run(service.generate(_generation_settings()))
+
+        assert result.status is GenerationStatus.COMPLETED
+        assert result.stored_image is not None
+        generation = generations.get_by_id(result.generation_id)
+        job = jobs.get_by_generation(result.generation_id)
+        persisted_artifacts = artifacts.list_by_generation(result.generation_id)
+        drive_record = drive_repository.get_by_generation(result.generation_id)
+        drive_jobs = drive_repository.list_jobs()
+
+        assert generation is not None
+        assert generation.status is GenerationStatus.COMPLETED
+        assert generation.comfy_prompt_id == "generation-prompt"
+        assert generation.completed_at is not None
+        assert job is not None
+        assert job.status is GenerationStatus.COMPLETED
+        assert job.completed_at is not None
+        assert (
+            sum(artifact.artifact_type is ArtifactType.IMAGE for artifact in persisted_artifacts)
+            == 1
+        )
+        assert (
+            sum(artifact.artifact_type is ArtifactType.METADATA for artifact in persisted_artifacts)
+            == 1
+        )
+        assert result.stored_image.path.exists()
+        assert drive_record is not None and drive_record.status is DriveSyncStatus.PENDING
+        assert len(drive_jobs) == 1
+        assert drive_jobs[0].status is DriveSyncStatus.PENDING
+    finally:
+        engine.dispose()
+
+
+def test_generation_service_drive_enqueue_failure_keeps_completed_pair_and_image(
+    tmp_path: Path,
+) -> None:
+    engine, service, generations, jobs, artifacts, drive_repository = _generation_service_fixture(
+        tmp_path, _FailingEnqueueRepository
+    )
+    try:
+        result = asyncio.run(service.generate(_generation_settings()))
+
+        assert result.status is GenerationStatus.COMPLETED
+        assert result.stored_image is not None
+        generation = generations.get_by_id(result.generation_id)
+        job = jobs.get_by_generation(result.generation_id)
+        image_artifacts = tuple(
+            artifact
+            for artifact in artifacts.list_by_generation(result.generation_id)
+            if artifact.artifact_type is ArtifactType.IMAGE
+        )
+
+        assert generation is not None and generation.status is GenerationStatus.COMPLETED
+        assert generation.completed_at is not None
+        assert job is not None and job.status is GenerationStatus.COMPLETED
+        assert job.completed_at is not None
+        assert len(image_artifacts) == 1
+        assert result.stored_image.path.exists()
+        assert drive_repository.get_by_generation(result.generation_id) is None
+    finally:
+        engine.dispose()

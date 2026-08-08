@@ -458,7 +458,11 @@ def test_manifest_failure_keeps_sync_synced_and_rebuilds_the_affected_date(
     assert record is not None
     assert record.status is DriveSyncStatus.SYNCED
     assert record.error_code == DriveSyncErrorCode.MANIFEST_FAILED.value
-    assert service.list_manifest_failure_targets()
+    targets = service.list_manifest_failure_targets()
+    assert len(targets) == 1
+    assert targets[0].local_date == "2026-08-08"
+    assert targets[0].remote_name == "drive"
+    assert targets[0].remote_base_path == "studio"
 
     adapter.fail_relative_path = None
     assert service.retry_failed_manifests() == ("2026-08-08",)
@@ -470,6 +474,46 @@ def test_manifest_failure_keeps_sync_synced_and_rebuilds_the_affected_date(
     assert record is not None
     assert record.status is DriveSyncStatus.SYNCED
     assert record.error_code is None
+    assert service.list_manifest_failure_targets() == ()
+
+
+def test_manifest_enqueue_failure_recovers_using_stored_destination_after_config_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, repository, generation_id, _, _, adapter = _fixture(tmp_path)
+    assert service.enqueue_generation(generation_id) is not None
+    claimed = repository.claim_next("worker-1", 120)
+    assert claimed is not None
+
+    def fail_manifest_enqueue(job: object) -> None:
+        del job
+        raise DriveSyncRepositoryError("simulated manifest enqueue failure")
+
+    with monkeypatch.context() as context:
+        context.setattr(service._repository, "enqueue_manifest", fail_manifest_enqueue)
+        synced = asyncio.run(service.process_job(claimed, "worker-1"))
+
+    assert synced is not None and synced.status is DriveSyncStatus.SYNCED
+    record = repository.get_by_generation(generation_id)
+    assert record is not None
+    assert record.error_code == DriveSyncErrorCode.MANIFEST_FAILED.value
+    targets = service.list_manifest_failure_targets()
+    assert len(targets) == 1
+    assert targets[0].local_date == "2026-08-08"
+    assert targets[0].remote_name == "drive"
+    assert targets[0].remote_base_path == "studio"
+
+    service._settings.rclone_remote = "drive-b"
+    service._settings.rclone_base_path = "studio-b"
+    assert service.retry_failed_manifests() == ("2026-08-08",)
+    manifest_job = repository.claim_next_manifest("worker-1", 120)
+    assert manifest_job is not None
+    rebuilt = asyncio.run(service.process_manifest_job(manifest_job, "worker-1"))
+
+    assert rebuilt is not None and rebuilt.status is DriveSyncStatus.SYNCED
+    assert adapter.calls[-1][1] == DriveDestination("drive", "studio")
+    record = repository.get_by_generation(generation_id)
+    assert record is not None and record.error_code is None
     assert service.list_manifest_failure_targets() == ()
 
 
@@ -705,7 +749,16 @@ class _SlowProcess:
         self.pid = 9898
         self.returncode = 0
         self.stdout = _FakeStream((b'{"bytes":1,"totalBytes":4,"percentage":25}\n',))
-        self.stderr = _FakeStream((b"token=secret RCLONE_CONFIG=hidden\n",))
+        self.stderr = _FakeStream(
+            (
+                b"token=secret\n",
+                b'{"access_token":"secret"}\n',
+                b'{"client_secret":"secret"}\n',
+                b"Authorization: Bearer secret\n",
+                b"password: secret\n",
+                b"RCLONE_CONFIG=/secret/path\n",
+            )
+        )
         self.killed = False
 
     async def wait(self) -> int:
@@ -764,5 +817,18 @@ def test_connection_timeout_is_separate_from_transfer_and_progress_is_streamed(
     assert [event.progress_percentage for event in progress] == [25.0]
     log = tmp_path / "logs" / "drive_sync" / "timeout-test.log"
     assert log.exists()
-    assert "secret" not in log.read_text(encoding="utf-8")
-    assert "hidden" not in log.read_text(encoding="utf-8")
+    contents = log.read_text(encoding="utf-8")
+    assert "secret" not in contents
+    assert "token" not in contents
+    assert "access_token" not in contents
+    assert "client_secret" not in contents
+    assert "Authorization" not in contents
+    assert "password" not in contents
+    assert "Bearer" not in contents
+    assert "/secret/path" not in contents
+    assert "RCLONE_CONFIG" not in contents
+    assert "operation_started=connection" not in contents
+    assert "operation_started=copyto" in contents
+    assert "pid_started=true" in contents
+    assert "progress_bytes=1 total_bytes=4 percentage=25.0 current_artifact=unknown" in contents
+    assert "operation_finished=copyto" in contents
