@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import pytest
 from PIL import Image, PngImagePlugin
@@ -317,11 +318,12 @@ def test_import_storage_rejects_symlink_escape_before_writing(
     service, repository, storage = _service(tmp_path, _capabilities())
     outside = tmp_path / "outside"
     outside.mkdir()
+    local_date = datetime.now(UTC).astimezone(ZoneInfo("Asia/Tokyo")).date().isoformat()
     if symlink_level == "imports":
         _make_directory_symlink(tmp_path / "imports", outside)
     else:
-        (tmp_path / "imports" / "2025-01-02").mkdir(parents=True)
-        _make_directory_symlink(tmp_path / "imports" / "2025-01-02" / "images", outside)
+        (tmp_path / "imports" / local_date).mkdir(parents=True)
+        _make_directory_symlink(tmp_path / "imports" / local_date / "images", outside)
 
     with pytest.raises(ImportedImageStorageError) as error:
         service.import_image(_png(), "outside.png")
@@ -330,6 +332,72 @@ def test_import_storage_rejects_symlink_escape_before_writing(
     assert not list(outside.glob("*.png"))
     assert repository.list_recent() == ()
     assert storage.data_dir == tmp_path
+
+
+def test_valid_png_can_be_selected_when_sidecar_is_invalid(tmp_path: Path) -> None:
+    service, repository, _ = _service(tmp_path, _capabilities())
+    preview = service.import_image(
+        _png(prompt=_prompt_graph()),
+        "valid-png-invalid-sidecar.png",
+        sidecar_bytes=b"{malformed",
+    )
+
+    assert preview.status is MetadataImportStatus.INVALID_METADATA
+    selected = service.select_metadata_source(preview.id, MetadataSourceKind.COMFYUI_PROMPT)
+
+    assert selected.status is MetadataImportStatus.READY
+    assert selected.selected_metadata_source is MetadataSourceKind.COMFYUI_PROMPT
+    assert "metadata_import_sidecar_invalid_ignored" in selected.warnings
+    assert "metadata_import_invalid_json" not in selected.warnings
+    assert service.build_generation_settings(preview.id).positive_prompt == "a cat"
+    persisted = repository.get_by_id(preview.id)
+    assert persisted is not None
+    assert persisted.metadata_status is MetadataImportStatus.READY
+
+
+def test_valid_sidecar_can_be_selected_when_png_prompt_is_invalid(tmp_path: Path) -> None:
+    output = BytesIO()
+    metadata = PngImagePlugin.PngInfo()
+    metadata.add_text("prompt", "{malformed")
+    Image.new("RGB", (512, 512), "white").save(output, format="PNG", pnginfo=metadata)
+    service, repository, _ = _service(tmp_path, _capabilities())
+    preview = service.import_image(
+        output.getvalue(),
+        "invalid-png-valid-sidecar.png",
+        sidecar_bytes=json.dumps(_sidecar_settings()),
+    )
+
+    assert preview.status is MetadataImportStatus.INVALID_METADATA
+    selected = service.select_metadata_source(preview.id, MetadataSourceKind.APP_SIDECAR)
+
+    assert selected.status is MetadataImportStatus.READY
+    assert selected.selected_metadata_source is MetadataSourceKind.APP_SIDECAR
+    assert "metadata_import_png_prompt_invalid_ignored" in selected.warnings
+    assert "metadata_import_png_prompt_invalid" not in selected.warnings
+    assert service.build_generation_settings(preview.id).positive_prompt == "a cat"
+    persisted = repository.get_by_id(preview.id)
+    assert persisted is not None
+    assert persisted.metadata_status is MetadataImportStatus.READY
+
+
+def test_invalid_png_and_sidecar_keep_import_invalid_and_image_upscale_available(
+    tmp_path: Path,
+) -> None:
+    output = BytesIO()
+    metadata = PngImagePlugin.PngInfo()
+    metadata.add_text("prompt", "{malformed")
+    Image.new("RGB", (512, 512), "white").save(output, format="PNG", pnginfo=metadata)
+    service, _, storage = _service(tmp_path, _capabilities())
+
+    preview = service.import_image(
+        output.getvalue(), "invalid-both.png", sidecar_bytes=b"{malformed"
+    )
+
+    assert preview.status is MetadataImportStatus.INVALID_METADATA
+    assert preview.candidate is None
+    assert storage.absolute_path(preview.imported_image).exists()
+    with pytest.raises(MetadataImportError):
+        service.build_generation_settings(preview.id)
 
 
 def test_import_storage_allows_symlink_that_resolves_inside_data_root(tmp_path: Path) -> None:

@@ -47,6 +47,10 @@ def upgrade() -> None:
             # A corrupt legacy row must remain inspectable and must not prevent
             # other imports from being repaired during the same migration.
             continue
+        if not options:
+            # Do not blank a legacy candidate when its raw sources cannot be
+            # reconstructed.  Keeping candidate_json is safer than guessing.
+            continue
         connection.execute(
             sa.text(
                 "UPDATE metadata_imports SET candidate_json = NULL, "
@@ -64,9 +68,25 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # This migration only restores information into an existing JSON column.
-    # There is no safe inverse that would discard one of the candidates.
-    pass
+    connection = op.get_bind()
+    # 0012 intentionally moves the legacy candidate out of candidate_json and
+    # reconstructs one or more source candidates in candidate_options_json.
+    # The old row does not record which reconstructed option was the original
+    # candidate, so deleting the options during 0011's downgrade could lose
+    # data.  Refuse the downgrade before changing either the row or schema.
+    protected = connection.execute(
+        sa.text(
+            "SELECT id FROM metadata_imports "
+            "WHERE warnings_json LIKE '%metadata_import_ambiguous%' "
+            "AND candidate_json IS NULL "
+            "AND candidate_options_json IS NOT NULL "
+            "LIMIT 1"
+        )
+    ).first()
+    if protected is not None:
+        raise RuntimeError(
+            "cannot downgrade Phase 6 legacy metadata candidates without losing candidate data"
+        )
 
 
 def _rebuild_candidates(
@@ -119,7 +139,6 @@ def _rebuild_candidates(
 
 
 def _append_candidate(candidates: list[dict[str, object]], candidate: dict[str, object]) -> None:
-    source_kind = candidate.get("source_kind")
-    if any(existing.get("source_kind") == source_kind for existing in candidates):
+    if any(existing == candidate for existing in candidates):
         return
     candidates.append(candidate)

@@ -53,6 +53,27 @@ _INVALID_METADATA_WARNINGS = frozenset(
         "metadata_import_png_prompt_invalid",
     }
 )
+_SOURCE_INVALID_WARNINGS = {
+    MetadataSourceKind.COMFYUI_PROMPT: frozenset(
+        {
+            "metadata_import_parse_failed",
+            "metadata_import_invalid_json",
+            "metadata_import_png_prompt_invalid",
+        }
+    ),
+    MetadataSourceKind.APP_SIDECAR: frozenset(
+        {
+            "metadata_import_invalid_json",
+            "metadata_import_invalid_utf8",
+            "metadata_import_unsupported_schema",
+            "metadata_import_too_large",
+        }
+    ),
+}
+_SOURCE_INVALID_IGNORED_WARNINGS = {
+    MetadataSourceKind.COMFYUI_PROMPT: "metadata_import_png_prompt_invalid_ignored",
+    MetadataSourceKind.APP_SIDECAR: "metadata_import_sidecar_invalid_ignored",
+}
 _BLOCKING_WARNINGS = frozenset(
     {
         "metadata_import_sidecar_hash_mismatch",
@@ -252,6 +273,13 @@ class MetadataImportService:
                 )
             }
         )
+        ignored_source = (
+            MetadataSourceKind.APP_SIDECAR
+            if selected is MetadataSourceKind.COMFYUI_PROMPT
+            else MetadataSourceKind.COMFYUI_PROMPT
+        )
+        ignored_source_warnings = _SOURCE_INVALID_WARNINGS[ignored_source]
+        ignored_source_had_invalid = bool(set(record.warnings) & ignored_source_warnings)
         retained = tuple(
             warning
             for warning in record.warnings
@@ -264,7 +292,14 @@ class MetadataImportService:
                 "metadata_import_model_missing",
                 "metadata_import_model_catalog_unavailable",
             }
+            and warning not in ignored_source_warnings
+            and warning not in _SOURCE_INVALID_IGNORED_WARNINGS.values()
         )
+        if ignored_source_had_invalid:
+            retained = (
+                *retained,
+                _SOURCE_INVALID_IGNORED_WARNINGS[ignored_source],
+            )
         if selected is MetadataSourceKind.APP_SIDECAR and hash_mismatch:
             retained = (*retained, "metadata_import_sidecar_hash_mismatch_confirmed")
         elif selected is MetadataSourceKind.COMFYUI_PROMPT and hash_mismatch:

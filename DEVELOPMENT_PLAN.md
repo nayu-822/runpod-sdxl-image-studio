@@ -449,7 +449,7 @@ capability不足時のfailed確定、再起動後のhistory復旧、誤寸法出
 
 フェーズ6を実装済みです。PNG/WebPの安全な検証とcanonical PNG保存、SHA-256・寸法・形式の記録、ComfyUI既知prompt graphと
 本アプリsidecar schema v1の候補解析、raw metadata保持、未解決項目のpreview、明示的なmodel mapping、SQLite `metadata_imports`
-repository、0010/0011/0012 migrationを追加しました。workflow metadataはraw-onlyで保持し、実行・eval・exec・pickle・shellは行いません。sidecarのmalformed JSON、invalid UTF-8、unsupported schemaはcanonical画像保存と分離し、画像upscaleだけを許可します。保存先のparent symlinkはdata root外への解決を拒否し、legacy ambiguous rowはraw sourceから候補を再構築して自動選択しません。
+repository、0010/0011/0012 migrationを追加しました。workflow metadataはraw-onlyで保持し、実行・eval・exec・pickle・shellは行いません。sidecarのmalformed JSON、invalid UTF-8、unsupported schemaはcanonical画像保存と分離し、初期状態では画像upscaleだけを許可します。有効なPNG promptまたはsidecarを明示選択した場合は、無効sourceを`*_invalid_ignored`監査warningへ降格して生成復元とlatent upscaleを許可し、有効sourceがない場合は画像upscaleだけに制限します。保存先のparent symlinkはdata root外への解決を拒否し、legacy ambiguous rowはraw sourceから候補を再構築して自動選択しません。
 
 previewからの生成条件適用は明示操作に限定し、外部画像はmetadataなしでも画像アップスケールへ利用できます。Latentアップスケールは
 完全に解決済みのGenerationSettingsだけを受け付け、Queue投入を既存のSQLite transactionへ接続しました。sidecarのprompt空白、LoRAの
@@ -460,6 +460,6 @@ KSamplerからのmodel/CLIP/latent/VAEDecode接続を検証し、別branch・複
 retryはsource provenanceと `retry_of_generation_id` を保持した新規Generation/Jobとして冪等に作成します。
 
 実ComfyUI、実GPU、実RunPod、実Google Driveを使った手動確認は未実施です。自動テストではFake/SQLite/Alembicでstrict parser、storage cleanup、
-source selection、UIの排他再有効化、mapping、外部image/latentのworkerとreconciliation、source mutation、retry idempotency、migrationの安全なdowngrade、
+source selection、UIの排他再有効化、mapping、外部image/latentのworkerとreconciliation、source mutation、retry idempotency、migrationの候補消失を拒否する安全なdowngrade、
 既存Queue経路を検証します。Phase 7、複数worker、Queue並べ替え、自動retry、
 Google Drive同期、汎用workflow editorは対象外です。

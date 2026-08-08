@@ -433,6 +433,9 @@ def test_phase6_migration_repairs_legacy_ambiguous_candidates_without_auto_selec
             },
         )
 
+    original_raw_metadata = raw_metadata
+    original_warnings = '["metadata_import_ambiguous"]'
+
     command.upgrade(config, "head")
     with engine.connect() as connection:
         row = connection.execute(
@@ -450,6 +453,48 @@ def test_phase6_migration_repairs_legacy_ambiguous_candidates_without_auto_selec
         "comfyui_prompt",
         "app_sidecar",
     }
+
+    with pytest.raises(RuntimeError, match="without losing candidate data"):
+        command.downgrade(config, "0010_phase6_metadata_imports")
+    with engine.connect() as connection:
+        unchanged = connection.execute(
+            text(
+                "SELECT candidate_json, candidate_options_json, selected_metadata_source, "
+                "raw_metadata_json, warnings_json, metadata_status "
+                "FROM metadata_imports WHERE id=:id"
+            ),
+            {"id": str(import_id)},
+        ).one()
+        assert unchanged.candidate_json is None
+        assert unchanged.candidate_options_json == row.candidate_options_json
+        assert unchanged.selected_metadata_source is None
+        assert unchanged.raw_metadata_json == original_raw_metadata
+        assert unchanged.warnings_json == original_warnings
+        assert unchanged.metadata_status == "needs_mapping"
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
+            "0012_phase6_legacy_metadata_candidates"
+        )
+
+
+def test_phase6_migration_empty_head_downgrade_upgrade_roundtrip(tmp_path: Path) -> None:
+    database_path = tmp_path / "migration-empty-roundtrip.sqlite3"
+    config = _alembic_config(database_path)
+
+    command.upgrade(config, "head")
+    command.downgrade(config, "-1")
+    command.upgrade(config, "head")
+
+    with create_image_studio_engine(
+        Settings(
+            _env_file=None,
+            environment="test",
+            data_dir=tmp_path,
+            database_url=f"sqlite:///{database_path.as_posix()}",
+        )
+    ).connect() as connection:
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
+            "0012_phase6_legacy_metadata_candidates"
+        )
 
 
 @pytest.mark.parametrize(
