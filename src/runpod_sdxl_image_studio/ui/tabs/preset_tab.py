@@ -647,8 +647,12 @@ def make_recent_lora_add_handler(
                     state, choices, max_loras, "LoRA数が上限を超えています。"
                 )
             rows = normalize_lora_state(state, max_loras)
-            if rows and not rows[-1].get("lora_name"):
-                row_index = len(rows) - 1
+            empty_index = next(
+                (index for index, row in enumerate(rows) if not row.get("lora_name")),
+                None,
+            )
+            if empty_index is not None:
+                row_index = empty_index
                 updated = update_lora_row(state, row_index, selected, 1.0, 1.0, max_loras)
             else:
                 expanded = add_lora_row(state, max_loras)

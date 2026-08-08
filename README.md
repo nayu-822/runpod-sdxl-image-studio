@@ -504,5 +504,13 @@ pytest tests/integration/test_phase8_mobile_ui_integration.py
 pytest tests/browser/test_phase8_mobile_viewports.py
 ```
 
-ブラウザviewportテストは、ローカルで起動したGradio URLを`IMAGE_STUDIO_BROWSER_URL`へ設定した場合のみ実行します。実機での375x812、390x844、430x932、
-1280x800の画面確認、Safari/Chromeのbackground復帰、ソフトキーボード表示中のsticky操作は別途手動確認が必要です。
+ブラウザテストをローカルで実行する場合は、追加依存とChromiumをインストールし、Gradio URLを指定します。
+
+```bash
+pip install -e ".[dev,browser]"
+python -m playwright install chromium
+IMAGE_STUDIO_BROWSER_URL=http://127.0.0.1:7860 pytest -q tests/browser/test_phase8_mobile_viewports.py
+```
+
+CIでは一時SQLiteを使うローカルGradioを起動し、`python -m playwright install --with-deps chromium`後に同じviewportテストを実行します。
+テスト対象は320x568、375x812、390x844、430x932、768x1024、1280x800です。Safari/Chromeのbackground復帰、ソフトキーボード表示中のsticky操作は別途手動確認が必要です。

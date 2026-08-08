@@ -31,6 +31,9 @@ dev = [
     "respx>=0.21,<1.0",
     "ruff>=0.5,<1.0",
 ]
+browser = [
+    "playwright>=1.40,<2.0",
+]
 
 [project.scripts]
 runpod-sdxl-image-studio = "runpod_sdxl_image_studio.app:main"

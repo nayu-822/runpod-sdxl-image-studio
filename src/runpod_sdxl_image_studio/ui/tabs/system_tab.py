@@ -116,7 +116,6 @@ class GenerationTabComponents:
     result_regenerate_button: gr.Button
     result_edit_button: gr.Button
     result_upscale_button: gr.Button
-    result_seed_copy_button: gr.Button
     result_message: gr.Markdown
 
 
@@ -240,11 +239,12 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
                 result_upscale_button = gr.Button(
                     "アップスケール", elem_classes=["mobile-tap-button"]
                 )
-                result_seed_copy_button = gr.Button(
-                    "Seedをコピー", elem_classes=["mobile-tap-button"]
-                )
                 result_favorite = gr.Checkbox(label="お気に入り", value=False)
-            result_seed = gr.Textbox(label="実使用Seed", interactive=False)
+            result_seed = gr.Textbox(
+                label="実使用Seed（コピー）",
+                interactive=False,
+                show_copy_button=True,
+            )
             result_message = gr.Markdown("")
 
     with gr.Accordion("高度な設定", open=False, elem_classes=["generation-advanced"]):
@@ -333,7 +333,6 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
         result_regenerate_button=result_regenerate_button,
         result_edit_button=result_edit_button,
         result_upscale_button=result_upscale_button,
-        result_seed_copy_button=result_seed_copy_button,
         result_message=result_message,
     )
 
@@ -562,7 +561,7 @@ def make_generate_handler(
 def make_enqueue_handler(
     service: GenerationQueueService,
     max_loras: int,
-) -> Callable[..., Awaitable[tuple[object, ...]]]:
+) -> Callable[..., Awaitable[tuple[object, object, object, object, object, object]]]:
     """Create the non-blocking UI boundary that only persists queue work."""
 
     async def handler(
@@ -583,8 +582,19 @@ def make_enqueue_handler(
         restored_from_generation_id: str | None = None,
         regeneration_valid: bool = False,
         regeneration_requested: bool = False,
-    ) -> tuple[object, ...]:
+    ) -> tuple[object, object, object, object, object, object]:
         del size_preset
+
+        def failure(message: str) -> tuple[object, object, object, object, object, object]:
+            return (
+                gr.Button("生成をキューへ追加", interactive=True),
+                "",
+                None,
+                message,
+                False,
+                gr.skip(),
+            )
+
         try:
             loras = lora_settings_from_state(lora_state, max_loras=max_loras)
             generation_settings = GenerationSettings(
@@ -602,62 +612,35 @@ def make_enqueue_handler(
                 cfg_scale=float(cfg_scale),
             )
         except (TypeError, ValueError, ValidationError):
-            return (
-                gr.Button("生成をキューへ追加", interactive=True),
-                "",
-                None,
-                "入力値を確認してください。",
-                False,
-            )
+            return failure("入力値を確認してください。")
         if regeneration_requested and not restored_from_generation_id:
-            return (
-                gr.Button("生成をキューへ追加", interactive=True),
-                "",
-                None,
-                "履歴設定の復元に失敗したため、キューへ追加しませんでした。",
-                False,
-            )
+            return failure("履歴設定の復元に失敗したため、キューへ追加しませんでした。")
         if regeneration_requested and not regeneration_valid:
-            return (
-                gr.Button("生成をキューへ追加", interactive=True),
-                "",
-                None,
-                "利用できない設定があるため、キューへ追加しませんでした。",
-                False,
-            )
+            return failure("利用できない設定があるため、キューへ追加しませんでした。")
         if seed_mode == "Previous seed" and not restored_from_generation_id:
-            return (
-                gr.Button("生成をキューへ追加", interactive=True),
-                "",
-                None,
-                "復元元Generationがありません。",
-                False,
-            )
+            return failure("復元元Generationがありません。")
         parent_id: UUID | None = None
         if restored_from_generation_id:
             try:
                 parent_id = UUID(restored_from_generation_id)
             except ValueError:
-                return (
-                    gr.Button("生成をキューへ追加", interactive=True),
-                    "",
-                    None,
-                    "復元元Generationが不正です。",
-                    False,
-                )
+                return failure("復元元Generationが不正です。")
+        if regeneration_requested and parent_id is not None:
+            try:
+                parent_item = service.get_job_detail(parent_id)
+            except GenerationQueueServiceError:
+                return failure("再生成元Generationを確認できないため、キューへ追加しませんでした。")
+            if parent_item is None:
+                return failure("再生成元Generationが見つからないため、キューへ追加しませんでした。")
+            if parent_item.generation.status is not GenerationStatus.COMPLETED:
+                return failure("完了済みGenerationだけを再生成できます。")
         try:
             queued = service.enqueue(
                 generation_settings,
                 parent_generation_id=parent_id,
             )
         except GenerationQueueServiceError as exc:
-            return (
-                gr.Button("生成をキューへ追加", interactive=True),
-                "",
-                None,
-                str(exc),
-                False,
-            )
+            return failure(str(exc))
         details = (
             f"Queued Generation ID: `{queued.item.generation.id}`\n"
             f"Queue position: `{queued.queue_position}`\n"
@@ -669,6 +652,7 @@ def make_enqueue_handler(
             None,
             details,
             False,
+            str(queued.item.generation.id),
         )
 
     return handler

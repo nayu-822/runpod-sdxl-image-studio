@@ -179,6 +179,8 @@ class GenerationDispatchQueueRepositoryProtocol(Protocol):
 
     def get_queue_item(self, generation_id: UUID) -> GenerationQueueItem | None: ...
 
+    def get_latest_status_candidate(self) -> GenerationQueueItem | None: ...
+
     def list_batch_items(self, batch_id: UUID) -> tuple[GenerationQueueItem, ...]: ...
 
     def reconcile_expired_claims(self, *, now: datetime | None = None) -> int: ...
@@ -1024,6 +1026,40 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
                 return _load_item_by_generation(session, generation_id)
         except (SQLAlchemyError, ValueError) as exc:
             raise GenerationDispatchQueueRepositoryError("queue item could not be read") from exc
+
+    def get_latest_status_candidate(self) -> GenerationQueueItem | None:
+        """Return the newest active queue item, or the newest item after that."""
+
+        active_statuses = (
+            GenerationStatus.PENDING.value,
+            GenerationStatus.QUEUED.value,
+            GenerationStatus.RUNNING.value,
+        )
+        try:
+            with session_scope(self._session_factory) as session:
+                active_statement = (
+                    select(GenerationQueueEntryModel)
+                    .join(
+                        GenerationModel,
+                        GenerationModel.id == GenerationQueueEntryModel.generation_id,
+                    )
+                    .where(GenerationModel.status.in_(active_statuses))
+                    .order_by(GenerationQueueEntryModel.sequence.desc())
+                    .limit(1)
+                )
+                entry = session.scalars(active_statement).first()
+                if entry is None:
+                    latest_statement = (
+                        select(GenerationQueueEntryModel)
+                        .order_by(GenerationQueueEntryModel.sequence.desc())
+                        .limit(1)
+                    )
+                    entry = session.scalars(latest_statement).first()
+                return _queue_item_from_entry(session, entry) if entry is not None else None
+        except (SQLAlchemyError, ValueError) as exc:
+            raise GenerationDispatchQueueRepositoryError(
+                "latest queue status candidate could not be read"
+            ) from exc
 
     def list_batch_items(self, batch_id: UUID) -> tuple[GenerationQueueItem, ...]:
         return self.list_queue(batch_id=batch_id, limit=500)

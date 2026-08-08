@@ -110,6 +110,7 @@ from runpod_sdxl_image_studio.ui.components.lora_editor import (
     update_lora_row,
 )
 from runpod_sdxl_image_studio.ui.components.mobile_actions import (
+    make_mobile_status_poll_handler,
     make_mobile_status_refresh_handler,
 )
 from runpod_sdxl_image_studio.ui.mobile_styles import mobile_ui_css
@@ -408,6 +409,10 @@ def build_app(
         queue_service,
         history_service,
     )
+    mobile_status_poll_handler = make_mobile_status_poll_handler(
+        queue_service,
+        history_service,
+    )
     with gr.Blocks(title=APP_TITLE, css=APP_CSS) as demo:
         gr.Markdown(f"# {APP_TITLE}")
         with gr.Tab("生成"):
@@ -462,10 +467,11 @@ def build_app(
             generation.result_favorite,
             generation.result_message,
         ]
+        mobile_status_poll_outputs = mobile_status_outputs[1:]
         generation.status_poll_timer.tick(
-            fn=mobile_status_handler,
+            fn=mobile_status_poll_handler,
             inputs=mobile_status_inputs,
-            outputs=mobile_status_outputs,
+            outputs=mobile_status_poll_outputs,
             concurrency_limit=1,
         )
         demo.load(
@@ -767,9 +773,9 @@ def build_app(
             ],
             concurrency_limit=1,
         ).then(
-            fn=mobile_status_handler,
+            fn=mobile_status_poll_handler,
             inputs=mobile_status_inputs,
-            outputs=mobile_status_outputs,
+            outputs=mobile_status_poll_outputs,
             concurrency_limit=1,
         )
         queue_refresh.click(
@@ -1744,11 +1750,6 @@ def build_app(
             queue=False,
         )
         regenerate_event = regenerate_event.then(
-            fn=lambda: None,
-            outputs=[generation.active_generation_id],
-            queue=False,
-        )
-        regenerate_event = regenerate_event.then(
             fn=make_restore_handler(history_service, app_settings.max_loras),
             inputs=[
                 history.selected,
@@ -1767,6 +1768,7 @@ def build_app(
                 generation.result_image,
                 generation.result_details,
                 generation.regeneration_requested,
+                generation.active_generation_id,
             ],
             concurrency_limit=1,
         )
@@ -1774,19 +1776,14 @@ def build_app(
             fn=enable_regeneration_button,
             outputs=[history.regenerate_button],
         ).then(
-            fn=mobile_status_handler,
+            fn=mobile_status_poll_handler,
             inputs=mobile_status_inputs,
-            outputs=mobile_status_outputs,
+            outputs=mobile_status_poll_outputs,
         )
         generate_event = generation.generate_button.click(
             fn=disable_generate_button,
             outputs=[generation.generate_button],
             queue=False,
-        )
-        generate_event = generate_event.then(
-            fn=lambda: None,
-            outputs=[generation.active_generation_id],
-            queue=True,
         )
         generation_enqueue_event = generate_event.then(
             fn=make_enqueue_handler(queue_service, app_settings.max_loras),
@@ -1797,13 +1794,14 @@ def build_app(
                 generation.result_image,
                 generation.result_details,
                 generation.regeneration_requested,
+                generation.active_generation_id,
             ],
             concurrency_limit=1,
         )
         generation_enqueue_event.then(
-            fn=mobile_status_handler,
+            fn=mobile_status_poll_handler,
             inputs=mobile_status_inputs,
-            outputs=mobile_status_outputs,
+            outputs=mobile_status_poll_outputs,
             concurrency_limit=1,
         )
         generation.result_edit_button.click(
@@ -1823,20 +1821,14 @@ def build_app(
             outputs=[upscale.parent_generation_id, upscale.source_preview, upscale.status],
             concurrency_limit=1,
         )
-        generation.result_seed_copy_button.click(
-            fn=lambda seed: f"Seed `{seed}`をコピーできます。",
-            inputs=[generation.result_seed],
-            outputs=[generation.result_message],
-            queue=False,
-        )
         generation.result_favorite.input(
             fn=make_history_favorite_handler(history_service),
             inputs=[generation.active_generation_id, generation.result_favorite],
             outputs=[generation.result_favorite, generation.result_message],
         )
         result_regenerate_event = generation.result_regenerate_button.click(
-            fn=lambda: gr.Button(value="再生成中…", interactive=False),
-            outputs=[generation.result_regenerate_button],
+            fn=begin_regeneration,
+            outputs=[generation.result_regenerate_button, generation.regeneration_requested],
             queue=False,
         )
         result_regenerate_event = result_regenerate_event.then(
@@ -1850,11 +1842,6 @@ def build_app(
             outputs=restore_outputs,
             concurrency_limit=1,
         )
-        result_regenerate_event = result_regenerate_event.then(
-            fn=lambda: None,
-            outputs=[generation.active_generation_id],
-            queue=False,
-        )
         result_regenerate_enqueue_event = result_regenerate_event.then(
             fn=make_enqueue_handler(queue_service, app_settings.max_loras),
             inputs=generation_inputs,
@@ -1864,6 +1851,7 @@ def build_app(
                 generation.result_image,
                 generation.result_details,
                 generation.regeneration_requested,
+                generation.active_generation_id,
             ],
             concurrency_limit=1,
         )
@@ -1871,9 +1859,9 @@ def build_app(
             fn=lambda: gr.Button(value="同条件で再生成", interactive=True),
             outputs=[generation.result_regenerate_button],
         ).then(
-            fn=mobile_status_handler,
+            fn=mobile_status_poll_handler,
             inputs=mobile_status_inputs,
-            outputs=mobile_status_outputs,
+            outputs=mobile_status_poll_outputs,
             concurrency_limit=1,
         )
     demo.generation_queue_runtime = queue_runtime

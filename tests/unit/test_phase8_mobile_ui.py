@@ -1,22 +1,37 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import gradio as gr
+import pytest
+from sqlalchemy import create_engine
 
+from runpod_sdxl_image_studio.adapters.database.engine import create_session_factory
+from runpod_sdxl_image_studio.adapters.database.models import Base
+from runpod_sdxl_image_studio.adapters.database.repositories.generation_dispatch_queue_repository import (  # noqa: E501
+    GenerationDispatchQueueRepository,
+)
+from runpod_sdxl_image_studio.config import Settings
 from runpod_sdxl_image_studio.domain.generation import GenerationStatus
 from runpod_sdxl_image_studio.domain.generation_history import GenerationHistoryItem
+from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
 from runpod_sdxl_image_studio.services.generation_history_service import GenerationHistoryError
-from runpod_sdxl_image_studio.services.generation_queue_service import GenerationQueueServiceError
+from runpod_sdxl_image_studio.services.generation_queue_service import (
+    GenerationQueueService,
+    GenerationQueueServiceError,
+)
 from runpod_sdxl_image_studio.ui.components.lora_editor import build_lora_editor
 from runpod_sdxl_image_studio.ui.components.mobile_actions import (
+    make_mobile_status_poll_handler,
     make_mobile_status_refresh_handler,
 )
 from runpod_sdxl_image_studio.ui.mobile_styles import MOBILE_UI_CSS
 from runpod_sdxl_image_studio.ui.tabs.history_tab import render_history_thumbnails
-from runpod_sdxl_image_studio.ui.tabs.system_tab import build_generation_tab
+from runpod_sdxl_image_studio.ui.tabs.preset_tab import make_recent_lora_add_handler
+from runpod_sdxl_image_studio.ui.tabs.system_tab import build_generation_tab, make_enqueue_handler
 
 
 def _queue_item(
@@ -33,6 +48,7 @@ def _queue_item(
             id=generation_id,
             status=status,
             error_summary=None,
+            settings_snapshot=SimpleNamespace(seed=123),
         ),
         job=SimpleNamespace(
             progress_value=progress_value,
@@ -53,6 +69,15 @@ class _FakeQueueService:
         if self.error is not None:
             raise self.error
         return self.items
+
+    def get_latest_status_candidate(self) -> object | None:
+        if self.error is not None:
+            raise self.error
+        return max(
+            self.items,
+            key=lambda item: item.entry.sequence,
+            default=None,
+        )
 
     def get_job_detail(self, generation_id: UUID) -> object | None:
         return next(
@@ -79,6 +104,58 @@ class _FakeHistoryService:
 
     def absolute_data_path(self, _relative_path: str | None) -> Path:
         return self.image_path
+
+
+class _FakeEnqueueService:
+    def __init__(self, item: object | None = None, enqueue_item: object | None = None) -> None:
+        self.item = item
+        self.enqueue_item = enqueue_item if enqueue_item is not None else item
+        self.detail_calls = 0
+        self.enqueue_calls = 0
+        self.parent_generation_ids: list[UUID | None] = []
+
+    def get_job_detail(self, generation_id: UUID) -> object | None:
+        self.detail_calls += 1
+        if self.item is None:
+            return None
+        return self.item if self.item.generation.id == generation_id else None
+
+    def enqueue(self, _settings: object, *, parent_generation_id: UUID | None = None) -> object:
+        self.enqueue_calls += 1
+        self.parent_generation_ids.append(parent_generation_id)
+        if self.enqueue_item is None:
+            raise AssertionError("enqueue should not be called without a result item")
+        return SimpleNamespace(
+            item=self.enqueue_item,
+            queue_position=self.enqueue_item.entry.sequence,
+        )
+
+
+def _enqueue_inputs(
+    parent_generation_id: UUID | None,
+    *,
+    regeneration_valid: bool = True,
+    regeneration_requested: bool = True,
+) -> tuple[object, ...]:
+    return (
+        "checkpoint.safetensors",
+        "positive prompt",
+        "negative prompt",
+        "1024 × 1024",
+        1024,
+        1024,
+        "Fixed",
+        123,
+        28,
+        5.5,
+        "euler",
+        "normal",
+        None,
+        [],
+        str(parent_generation_id) if parent_generation_id is not None else None,
+        regeneration_valid,
+        regeneration_requested,
+    )
 
 
 def test_mobile_css_covers_responsive_layout_without_overflow_masking() -> None:
@@ -132,7 +209,7 @@ def test_mobile_status_handler_uses_bounded_queue_lookup_and_completed_detail() 
     result = handler(None, "old card", "old.png", "old details", "1", False)
 
     assert len(result) == 7
-    assert queue.list_limit == 20
+    assert queue.list_limit is None
     assert result[0] == str(generation_id)
     assert "completed" in result[1]
     assert result[2] == str(history.image_path)
@@ -179,6 +256,231 @@ def test_mobile_status_handler_reports_running_progress_without_exposing_prompt(
     assert "KSampler" in result[1]
     assert "prompt" not in result[1].lower()
     assert history.detail_calls == 0
+
+
+def test_mobile_status_poll_does_not_overwrite_active_generation_id() -> None:
+    generation_id = uuid4()
+    item = _queue_item(generation_id, sequence=8, status=GenerationStatus.RUNNING)
+    queue = _FakeQueueService((item,))
+    history = _FakeHistoryService()
+    handler = make_mobile_status_poll_handler(queue, history)
+
+    result = handler(str(generation_id), "old card", None, "", "", False)
+
+    assert len(result) == 6
+    assert "running" in result[0]
+    assert history.detail_calls == 0
+
+
+def test_latest_status_candidate_uses_sequence_26_for_reload_after_more_than_20_jobs() -> None:
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    repository = GenerationDispatchQueueRepository(create_session_factory(engine))
+    service = GenerationQueueService(
+        repository,
+        Settings(_env_file=None, queue_max_pending_jobs=40),
+    )
+    try:
+        items = tuple(
+            service.enqueue(
+                GenerationSettings(
+                    positive_prompt="positive",
+                    negative_prompt="negative",
+                    checkpoint_name="checkpoint.safetensors",
+                    sampler_name="euler",
+                    scheduler_name="normal",
+                    vae_name=None,
+                    loras=(),
+                    width=1024,
+                    height=1024,
+                    seed=index,
+                    steps=28,
+                    cfg_scale=5.5,
+                )
+            ).item
+            for index in range(26)
+        )
+        latest = service.get_latest_status_candidate()
+
+        assert items[-1].entry.sequence == 26
+        assert latest is not None
+        assert latest.generation.id == items[-1].generation.id
+
+        handler = make_mobile_status_refresh_handler(service, _FakeHistoryService())
+        reloaded = handler(None, None, None, None, None, False)
+        assert reloaded[0] == str(items[-1].generation.id)
+    finally:
+        engine.dispose()
+
+
+def test_latest_status_candidate_falls_back_to_newest_terminal_queue_item() -> None:
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    repository = GenerationDispatchQueueRepository(create_session_factory(engine))
+    service = GenerationQueueService(
+        repository,
+        Settings(_env_file=None, queue_max_pending_jobs=4),
+    )
+    try:
+        first = service.enqueue(
+            GenerationSettings(
+                positive_prompt="positive",
+                negative_prompt="negative",
+                checkpoint_name="checkpoint.safetensors",
+                sampler_name="euler",
+                scheduler_name="normal",
+                width=1024,
+                height=1024,
+                seed=1,
+                steps=28,
+                cfg_scale=5.5,
+            )
+        ).item
+        second = service.enqueue(
+            GenerationSettings(
+                positive_prompt="positive",
+                negative_prompt="negative",
+                checkpoint_name="checkpoint.safetensors",
+                sampler_name="euler",
+                scheduler_name="normal",
+                width=1024,
+                height=1024,
+                seed=2,
+                steps=28,
+                cfg_scale=5.5,
+            )
+        ).item
+        repository.mark_cancelled(first.generation.id)
+        repository.mark_cancelled(second.generation.id)
+
+        latest = service.get_latest_status_candidate()
+
+        assert latest is not None
+        assert latest.generation.id == second.generation.id
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        GenerationStatus.PENDING,
+        GenerationStatus.QUEUED,
+        GenerationStatus.RUNNING,
+        GenerationStatus.FAILED,
+        GenerationStatus.CANCELLED,
+    ],
+)
+def test_result_regeneration_enqueues_only_completed_generation(status: GenerationStatus) -> None:
+    parent_id = uuid4()
+    item = _queue_item(parent_id, sequence=1, status=status)
+    service = _FakeEnqueueService(item)
+    handler = make_enqueue_handler(service, max_loras=2)
+
+    result = asyncio.run(
+        handler(
+            *_enqueue_inputs(
+                parent_id,
+                regeneration_valid=True,
+                regeneration_requested=True,
+            )
+        )
+    )
+
+    assert service.detail_calls == 1
+    assert service.enqueue_calls == 0
+    assert result[0].interactive is True
+    assert result[4] is False
+    assert isinstance(result[5], dict)
+    assert "完了済みGenerationだけ" in result[3]
+
+
+@pytest.mark.parametrize(
+    ("parent_id", "regeneration_valid", "message"),
+    [
+        (None, False, "復元に失敗"),
+        (uuid4(), False, "利用できない設定"),
+    ],
+)
+def test_result_regeneration_restore_failure_does_not_enqueue(
+    parent_id: UUID | None,
+    regeneration_valid: bool,
+    message: str,
+) -> None:
+    service = _FakeEnqueueService()
+    handler = make_enqueue_handler(service, max_loras=2)
+
+    result = asyncio.run(
+        handler(
+            *_enqueue_inputs(
+                parent_id,
+                regeneration_valid=regeneration_valid,
+                regeneration_requested=True,
+            )
+        )
+    )
+
+    assert service.detail_calls == 0
+    assert service.enqueue_calls == 0
+    assert result[0].interactive is True
+    assert result[4] is False
+    assert isinstance(result[5], dict)
+    assert message in result[3]
+
+
+def test_result_regeneration_returns_new_active_generation_id_after_completed_parent() -> None:
+    parent_id = uuid4()
+    new_id = uuid4()
+    parent = _queue_item(parent_id, sequence=1, status=GenerationStatus.COMPLETED)
+    queued = _queue_item(new_id, sequence=2, status=GenerationStatus.PENDING)
+    service = _FakeEnqueueService(parent, enqueue_item=queued)
+    handler = make_enqueue_handler(service, max_loras=2)
+
+    result = asyncio.run(handler(*_enqueue_inputs(parent_id)))
+
+    assert service.detail_calls == 1
+    assert service.enqueue_calls == 1
+    assert service.parent_generation_ids == [parent_id]
+    assert result[5] == str(new_id)
+
+
+def test_recent_lora_shortcut_fills_the_first_empty_middle_row() -> None:
+    handler = make_recent_lora_add_handler(4)
+    state = [
+        {
+            "row_id": "one",
+            "lora_name": "one.safetensors",
+            "model_strength": 0.8,
+            "clip_strength": 0.7,
+        },
+        {
+            "row_id": "empty",
+            "lora_name": None,
+            "model_strength": 1.0,
+            "clip_strength": 1.0,
+        },
+        {
+            "row_id": "three",
+            "lora_name": "three.safetensors",
+            "model_strength": 0.6,
+            "clip_strength": 0.5,
+        },
+    ]
+
+    result = handler(
+        "two.safetensors",
+        state,
+        ("one.safetensors", "two.safetensors", "three.safetensors"),
+    )
+
+    updated = result[0]
+    assert [row["lora_name"] for row in updated] == [
+        "one.safetensors",
+        "two.safetensors",
+        "three.safetensors",
+    ]
+    assert updated[0]["model_strength"] == 0.8
+    assert updated[2]["clip_strength"] == 0.5
 
 
 def test_history_gallery_never_falls_back_to_primary_image() -> None:

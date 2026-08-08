@@ -91,8 +91,35 @@ def _resolve_item(
 ) -> GenerationQueueItem | None:
     if active_generation_id and active_generation_id.strip():
         return service.get_job_detail(UUID(active_generation_id.strip()))
-    items = service.list_jobs(limit=20)
-    return max(items, key=lambda item: item.entry.sequence, default=None)
+    return service.get_latest_status_candidate()
+
+
+def make_mobile_status_poll_handler(
+    queue_service: GenerationQueueService,
+    history_service: GenerationHistoryService,
+) -> Callable[..., tuple[object, object, object, object, object, object]]:
+    """Create a poll handler that never writes the active Generation state."""
+
+    refresh_handler = make_mobile_status_refresh_handler(queue_service, history_service)
+
+    def handler(
+        active_generation_id: str | None = None,
+        current_card: str | None = None,
+        current_image: object = None,
+        current_details: str | None = None,
+        current_seed: str | None = None,
+        current_favorite: bool = False,
+    ) -> tuple[object, object, object, object, object, object]:
+        return refresh_handler(
+            active_generation_id,
+            current_card,
+            current_image,
+            current_details,
+            current_seed,
+            current_favorite,
+        )[1:]
+
+    return handler
 
 
 def _status_view(item: GenerationQueueItem) -> GenerationStatusCardView:
@@ -159,4 +186,8 @@ def _preserve_status_card(current_card: str | None) -> str:
     )
 
 
-__all__ = ["MobileStatusOutputs", "make_mobile_status_refresh_handler"]
+__all__ = [
+    "MobileStatusOutputs",
+    "make_mobile_status_poll_handler",
+    "make_mobile_status_refresh_handler",
+]

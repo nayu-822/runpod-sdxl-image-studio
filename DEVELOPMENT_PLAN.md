@@ -355,8 +355,10 @@ DBの状態遷移は変更しません。最近使ったcheckpoint、VAE、LoRA�
 履歴一覧はthumbnail Artifactだけを使用し、thumbnail欠損時は軽量placeholderを表示します。原寸画像は詳細表示・完了結果表示のService経路だけで復元します。
 履歴filter、Queue、Drive同期、metadata、Preset、upscale比較の既存機能はresponsive classを適用して維持し、LoRAのState・表示行・順序は既存handlerの同一出力で更新します。
 
-Phase 8ではDB schema、migration、Generation/Job/Queue/DriveのDomain仕様を変更していません。Playwrightのviewportテストは任意のローカル起動URLを
-`IMAGE_STUDIO_BROWSER_URL`で指定した場合のみ実行し、未指定時はskipします。375x812、390x844、430x932、1280x800の実機・ブラウザ手動確認は未実施です。
+Phase 8ではDB schema、migration、Generation/Job/Queue/DriveのDomain仕様を変更していません。Playwrightのviewportテストは
+`.[browser]` optional dependencyを使い、CIでは一時SQLiteを使うローカルGradioを起動して実行します。ローカルでは
+`IMAGE_STUDIO_BROWSER_URL`で起動済みURLを指定できます。テスト対象は320x568、375x812、390x844、430x932、768x1024、1280x800です。
+Safari/Chromeのbackground復帰、ソフトキーボード表示中のsticky操作は未実施の手動確認です。
 
 ## フェーズ9: システム状態・エラー履歴・生成前チェック強化
 

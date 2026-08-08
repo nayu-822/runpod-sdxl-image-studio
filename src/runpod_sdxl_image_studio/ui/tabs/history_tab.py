@@ -191,6 +191,7 @@ def build_history_tab() -> HistoryTabComponents:
     seed_copy = gr.Textbox(
         label="実使用seed（選択してコピー）",
         interactive=False,
+        show_copy_button=True,
         max_length=20,
     )
     favorite = gr.Checkbox(label="お気に入り")

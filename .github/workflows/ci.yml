@@ -42,3 +42,46 @@ jobs:
 
       - name: Run tests with coverage
         run: pytest --cov=runpod_sdxl_image_studio --cov-report=term-missing
+
+  browser:
+    name: Gradio mobile browser checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install project and browser dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,browser]"
+
+      - name: Install Chromium for Playwright
+        run: python -m playwright install --with-deps chromium
+
+      - name: Start local Gradio app
+        run: |
+          python tests/browser/serve_phase8_browser_app.py > /tmp/image-studio-browser.log 2>&1 &
+          echo $! > /tmp/image-studio-browser.pid
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:7860/ > /dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:7860/ > /dev/null
+
+      - name: Run mobile viewport checks
+        env:
+          IMAGE_STUDIO_BROWSER_URL: http://127.0.0.1:7860
+        run: pytest -q tests/browser/test_phase8_mobile_viewports.py
+
+      - name: Show Gradio log on failure
+        if: failure()
+        run: cat /tmp/image-studio-browser.log

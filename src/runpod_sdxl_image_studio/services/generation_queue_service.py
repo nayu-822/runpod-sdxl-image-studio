@@ -164,6 +164,14 @@ class GenerationQueueService:
         except GenerationDispatchQueueRepositoryError as exc:
             raise GenerationQueueServiceError("ジョブ詳細を取得できませんでした。") from exc
 
+    def get_latest_status_candidate(self) -> GenerationQueueItem | None:
+        """Return a bounded reload candidate using the repository's DESC/LIMIT query."""
+
+        try:
+            return self._repository.get_latest_status_candidate()
+        except GenerationDispatchQueueRepositoryError as exc:
+            raise GenerationQueueServiceError("最新のジョブ状態を取得できませんでした。") from exc
+
     async def cancel(self, generation_id: UUID) -> GenerationQueueItem:
         try:
             requested = self._repository.request_cancel(generation_id)
