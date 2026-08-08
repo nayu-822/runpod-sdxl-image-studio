@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Protocol
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
@@ -26,6 +26,8 @@ from runpod_sdxl_image_studio.domain.drive_sync import (
     DriveCapacity,
     DriveDestination,
     DriveManifestJob,
+    DriveManifestState,
+    DriveSyncErrorCode,
     DriveSyncJob,
     DriveSyncProgress,
     DriveSyncRecord,
@@ -38,6 +40,10 @@ from runpod_sdxl_image_studio.domain.generation_artifact import ArtifactType
 
 class DriveSyncRepositoryError(RuntimeError):
     """Safe persistence error for Drive synchronization records and jobs."""
+
+
+class DriveManifestRebuildRequired(DriveSyncRepositoryError):
+    """The old destination manifest is not settled enough for an explicit resync."""
 
 
 @dataclass(frozen=True)
@@ -82,8 +88,16 @@ class DriveSyncRepositoryProtocol(Protocol):
     ) -> tuple[DriveSyncRecord, DriveSyncJob | None]: ...
 
     def retry(
-        self, record: DriveSyncRecord, job: DriveSyncJob
+        self,
+        record: DriveSyncRecord,
+        job: DriveSyncJob,
+        *,
+        require_manifest_ready: bool = False,
     ) -> tuple[DriveSyncRecord, DriveSyncJob]: ...
+
+    def manifest_state_for_destination(
+        self, local_date: str, destination: DriveDestination
+    ) -> DriveManifestState: ...
 
     def claim_next(self, worker_id: str, lease_seconds: float) -> DriveSyncJob | None: ...
 
@@ -237,7 +251,11 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
             raise DriveSyncRepositoryError("drive sync enqueue could not be saved") from exc
 
     def retry(
-        self, record: DriveSyncRecord, job: DriveSyncJob
+        self,
+        record: DriveSyncRecord,
+        job: DriveSyncJob,
+        *,
+        require_manifest_ready: bool = False,
     ) -> tuple[DriveSyncRecord, DriveSyncJob]:
         """Reset one explicit retry/resync and create a new pending Job atomically."""
 
@@ -250,6 +268,8 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
                 )
                 if row is None:
                     raise DriveSyncRepositoryError("drive sync record was not found")
+                if require_manifest_ready:
+                    _require_manifest_ready(session, row)
                 active = session.scalar(
                     select(DriveSyncJobModel).where(
                         DriveSyncJobModel.sync_record_id == row.id,
@@ -499,6 +519,16 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
                 return _manifest_job_domain(row)
         except (IntegrityError, SQLAlchemyError, ValueError) as exc:
             raise DriveSyncRepositoryError("drive manifest job could not be queued") from exc
+
+    def manifest_state_for_destination(
+        self, local_date: str, destination: DriveDestination
+    ) -> DriveManifestState:
+        try:
+            date.fromisoformat(local_date)
+            with session_scope(self._session_factory) as session:
+                return _manifest_state_in_session(session, local_date, destination)
+        except (SQLAlchemyError, ValueError) as exc:
+            raise DriveSyncRepositoryError("drive manifest state could not be read") from exc
 
     def get_manifest_job(self, job_id: UUID) -> DriveManifestJob | None:
         try:
@@ -1022,6 +1052,57 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
             raise DriveSyncRepositoryError("drive cache candidates could not be read") from exc
 
 
+def _require_manifest_ready(session: Session, row: DriveSyncRecordModel) -> None:
+    if row.status != DriveSyncStatus.SYNCED.value:
+        raise DriveManifestRebuildRequired("drive sync record is not synced")
+    local_date = _manifest_local_date_from_record(row)
+    destination = DriveDestination(row.remote_name, row.remote_base_path)
+    if (
+        row.error_code == DriveSyncErrorCode.MANIFEST_FAILED.value
+        or _manifest_state_in_session(session, local_date, destination)
+        is not DriveManifestState.SYNCED
+    ):
+        raise DriveManifestRebuildRequired("old destination manifest rebuild is required")
+
+
+def _manifest_state_in_session(
+    session: Session, local_date: str, destination: DriveDestination
+) -> DriveManifestState:
+    rows = session.scalars(
+        select(DriveManifestJobModel)
+        .where(
+            DriveManifestJobModel.local_date == local_date,
+            DriveManifestJobModel.remote_name == destination.remote_name,
+            DriveManifestJobModel.remote_base_path == destination.base_path,
+        )
+        .order_by(DriveManifestJobModel.queue_sequence.desc())
+    ).all()
+    if not rows:
+        return DriveManifestState.MISSING
+    for row in rows:
+        if row.status == DriveSyncStatus.SYNCING.value:
+            return DriveManifestState.SYNCING
+        if row.status == DriveSyncStatus.PENDING.value:
+            return DriveManifestState.PENDING
+    return DriveManifestState(rows[0].status)
+
+
+def _manifest_local_date_from_record(row: DriveSyncRecordModel) -> str:
+    image_date = _remote_path_date_prefix(row.remote_image_path)
+    metadata_date = _remote_path_date_prefix(row.remote_metadata_path)
+    if image_date != metadata_date:
+        raise DriveManifestRebuildRequired("sync record remote dates are inconsistent")
+    return image_date
+
+
+def _remote_path_date_prefix(path: str) -> str:
+    prefix = path.replace("\\", "/").split("/", 1)[0]
+    try:
+        return date.fromisoformat(prefix).isoformat()
+    except ValueError as exc:
+        raise DriveManifestRebuildRequired("sync record remote date is invalid") from exc
+
+
 def _record_model(record: DriveSyncRecord) -> DriveSyncRecordModel:
     return DriveSyncRecordModel(
         id=str(record.id),
@@ -1236,6 +1317,7 @@ def _tokyo_date(value: datetime) -> str:
 __all__ = [
     "DriveManifestRecord",
     "DriveManifestFailureTarget",
+    "DriveManifestRebuildRequired",
     "DriveSyncDiscoveryCandidate",
     "DriveSyncRepository",
     "DriveSyncRepositoryError",

@@ -18,6 +18,14 @@ class DriveSyncStatus(StrEnum):
     FAILED = "failed"
 
 
+class DriveManifestState(StrEnum):
+    MISSING = "missing"
+    PENDING = "pending"
+    SYNCING = "syncing"
+    SYNCED = "synced"
+    FAILED = "failed"
+
+
 class DriveConnectionStatus(StrEnum):
     NOT_CONFIGURED = "not_configured"
     CONNECTED = "connected"
@@ -39,6 +47,7 @@ class DriveSyncErrorCode(StrEnum):
     STALE = "drive_sync_stale"
     PERSISTENCE_FAILED = "drive_persistence_failed"
     MANIFEST_FAILED = "drive_manifest_failed"
+    MANIFEST_REBUILD_REQUIRED = "drive_manifest_rebuild_required"
     DESTINATION_CHANGED = "drive_destination_changed"
 
 
@@ -263,6 +272,7 @@ __all__ = [
     "DriveConnectionResult",
     "DriveDestination",
     "DriveManifestJob",
+    "DriveManifestState",
     "DriveConnectionStatus",
     "DriveRemotePaths",
     "DriveSyncErrorCode",

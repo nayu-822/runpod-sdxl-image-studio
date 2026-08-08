@@ -10,6 +10,7 @@ import gradio as gr
 
 from runpod_sdxl_image_studio.domain.drive_sync import (
     DriveConnectionStatus,
+    DriveSyncErrorCode,
     DriveSyncStatus,
 )
 from runpod_sdxl_image_studio.services.drive_sync_service import (
@@ -162,6 +163,10 @@ def make_drive_resync_handler(
         try:
             count = len(service.resync_synced())
             return gr.Button(interactive=True), f"{count}件の再同期を登録しました"
+        except DriveSyncServiceError as exc:
+            if exc.code == DriveSyncErrorCode.MANIFEST_REBUILD_REQUIRED.value:
+                return gr.Button(interactive=True), str(exc)
+            return gr.Button(interactive=True), "同期済みJobの再同期登録に失敗しました"
         except Exception:
             return gr.Button(interactive=True), "同期済みJobの再同期登録に失敗しました"
 

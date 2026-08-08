@@ -20,6 +20,7 @@ from PIL import Image, UnidentifiedImageError
 
 from runpod_sdxl_image_studio.adapters.database.repositories.drive_sync_repository import (
     DriveManifestFailureTarget,
+    DriveManifestRebuildRequired,
     DriveManifestRecord,
     DriveSyncRepositoryProtocol,
 )
@@ -34,6 +35,7 @@ from runpod_sdxl_image_studio.domain.drive_sync import (
     DriveConnectionResult,
     DriveDestination,
     DriveManifestJob,
+    DriveManifestState,
     DriveRemotePaths,
     DriveSyncErrorCode,
     DriveSyncJob,
@@ -48,6 +50,8 @@ from runpod_sdxl_image_studio.domain.generation import Generation, GenerationSta
 from runpod_sdxl_image_studio.domain.generation_artifact import ArtifactType, GenerationArtifact
 
 logger = logging.getLogger(__name__)
+
+_MANIFEST_REBUILD_REQUIRED_MESSAGE = "再同期前に旧保存先のManifestを再構築してください"
 
 ProgressCallback = Callable[[DriveSyncProgress], Awaitable[None] | None]
 ProcessStartedCallback = Callable[[int], Awaitable[None] | None]
@@ -183,6 +187,8 @@ class DriveSyncService:
                 "a synced generation requires explicit resync confirmation",
                 retryable=False,
             )
+        if existing.status is DriveSyncStatus.SYNCED and resync:
+            self._ensure_resync_manifest_ready(existing)
         if existing.status in {DriveSyncStatus.PENDING, DriveSyncStatus.SYNCING}:
             active_job = next(
                 (
@@ -210,7 +216,14 @@ class DriveSyncService:
             paths,
             existing=existing,
         )
-        saved_record, saved_job = self._repository.retry(updated_record, job)
+        try:
+            saved_record, saved_job = self._repository.retry(
+                updated_record,
+                job,
+                require_manifest_ready=resync,
+            )
+        except DriveManifestRebuildRequired as exc:
+            raise self._manifest_rebuild_required_error() from exc
         if metadata is None:
             return (
                 self._mark_enqueued_failed(
@@ -261,6 +274,15 @@ class DriveSyncService:
             seen.add(job.generation_id)
             try:
                 self.retry_generation(job.generation_id, resync=True)
+            except DriveSyncServiceError as exc:
+                if exc.code == DriveSyncErrorCode.MANIFEST_REBUILD_REQUIRED.value:
+                    raise
+                logger.warning(
+                    "Drive resync could not be queued generation=%s error=%s",
+                    job.generation_id,
+                    type(exc).__name__,
+                )
+                continue
             except Exception as exc:  # noqa: BLE001 - one manual resync must not stop the batch
                 logger.warning(
                     "Drive resync could not be queued generation=%s error=%s",
@@ -270,6 +292,33 @@ class DriveSyncService:
                 continue
             generation_ids.append(job.generation_id)
         return tuple(generation_ids)
+
+    def _ensure_resync_manifest_ready(self, record: DriveSyncRecord) -> None:
+        if record.error_code == DriveSyncErrorCode.MANIFEST_FAILED.value:
+            raise self._manifest_rebuild_required_error()
+        try:
+            local_date = _manifest_local_date_from_record(record)
+            state = self._repository.manifest_state_for_destination(
+                local_date,
+                DriveDestination(record.remote_name, record.remote_base_path),
+            )
+        except Exception as exc:  # noqa: BLE001 - fail closed without exposing persistence details
+            logger.warning(
+                "Drive resync manifest state could not be verified generation=%s error=%s",
+                record.generation_id,
+                type(exc).__name__,
+            )
+            raise self._manifest_rebuild_required_error() from exc
+        if state is not DriveManifestState.SYNCED:
+            raise self._manifest_rebuild_required_error()
+
+    @staticmethod
+    def _manifest_rebuild_required_error() -> DriveSyncServiceError:
+        return DriveSyncServiceError(
+            DriveSyncErrorCode.MANIFEST_REBUILD_REQUIRED.value,
+            _MANIFEST_REBUILD_REQUIRED_MESSAGE,
+            retryable=False,
+        )
 
     def discover_missing(self, limit: int | None = None) -> tuple[UUID, ...]:
         """Discover completed primary images without a sync record, once per call."""
@@ -910,6 +959,19 @@ def _paths_from_record_or_generation(
             f"{_local_date(generation.created_at, timezone_name)}/manifests/manifest.jsonl"
         ),
     )
+
+
+def _manifest_local_date_from_record(record: DriveSyncRecord) -> str:
+    image_date = _remote_path_date_prefix(record.remote_image_path)
+    metadata_date = _remote_path_date_prefix(record.remote_metadata_path)
+    if image_date != metadata_date:
+        raise ValueError("sync record remote dates are inconsistent")
+    return image_date
+
+
+def _remote_path_date_prefix(path: str) -> str:
+    prefix = path.replace("\\", "/").split("/", 1)[0]
+    return date.fromisoformat(prefix).isoformat()
 
 
 def _resolve_artifact_path(artifact: GenerationArtifact, settings: Settings) -> Path:

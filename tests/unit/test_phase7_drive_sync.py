@@ -33,6 +33,7 @@ from runpod_sdxl_image_studio.config import Settings
 from runpod_sdxl_image_studio.domain.drive_sync import (
     DriveConnectionStatus,
     DriveDestination,
+    DriveManifestState,
     DriveSyncErrorCode,
     DriveSyncProgress,
     DriveSyncStatus,
@@ -48,7 +49,10 @@ from runpod_sdxl_image_studio.services.drive_sync_service import (
     DriveSyncService,
     DriveSyncServiceError,
 )
-from runpod_sdxl_image_studio.ui.tabs.drive_sync_tab import make_drive_manifest_handler
+from runpod_sdxl_image_studio.ui.tabs.drive_sync_tab import (
+    make_drive_manifest_handler,
+    make_drive_resync_handler,
+)
 
 
 def _png() -> bytes:
@@ -75,6 +79,7 @@ def _settings() -> GenerationSettings:
 class FakeDriveAdapter:
     def __init__(self, *, fail_relative_path: str | None = None) -> None:
         self.calls: list[tuple[Path, DriveDestination, str]] = []
+        self.remote_files: dict[tuple[DriveDestination, str], bytes] = {}
         self.fail_relative_path = fail_relative_path
         self.progress_events: list[DriveSyncProgress] = []
         self.progress_observer = None
@@ -140,6 +145,7 @@ class FakeDriveAdapter:
             result = process_finished_callback()
             if asyncio.iscoroutine(result):
                 await result
+        self.remote_files[(destination, relative_remote_path)] = local_path.read_bytes()
 
 
 def _fixture(tmp_path: Path, *, adapter: FakeDriveAdapter | None = None):
@@ -397,6 +403,43 @@ def test_explicit_retry_snapshots_current_destination_without_changing_determini
     assert retry_job.status is DriveSyncStatus.PENDING
 
 
+def test_resync_rejects_pending_old_manifest_and_atomic_race_without_new_destination_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, repository, generation_id, _, _, _ = _fixture(tmp_path)
+    assert service.enqueue_generation(generation_id) is not None
+    claimed = repository.claim_next("worker-1", 120)
+    assert claimed is not None
+    assert asyncio.run(service.process_job(claimed, "worker-1")) is not None
+    assert (
+        repository.manifest_state_for_destination("2026-08-08", DriveDestination("drive", "studio"))
+        is DriveManifestState.PENDING
+    )
+
+    service._settings.rclone_remote = "drive-b"
+    service._settings.rclone_base_path = "studio-b"
+    with monkeypatch.context() as context:
+        context.setattr(
+            service._repository,
+            "manifest_state_for_destination",
+            lambda local_date, destination: DriveManifestState.SYNCED,
+        )
+        with pytest.raises(DriveSyncServiceError) as resync_error:
+            service.retry_generation(generation_id, resync=True)
+
+    assert resync_error.value.code == DriveSyncErrorCode.MANIFEST_REBUILD_REQUIRED.value
+    record = repository.get_by_generation(generation_id)
+    assert record is not None
+    assert record.status is DriveSyncStatus.SYNCED
+    assert (record.remote_name, record.remote_base_path) == ("drive", "studio")
+    drive_jobs = repository.list_jobs()
+    assert len(drive_jobs) == 1
+    assert drive_jobs[0].status is DriveSyncStatus.SYNCED
+    manifest_jobs = repository.list_manifest_jobs()
+    assert len(manifest_jobs) == 1
+    assert manifest_jobs[0].status is DriveSyncStatus.PENDING
+
+
 def test_process_pid_and_live_progress_are_persisted_with_lease_owner(
     tmp_path: Path,
 ) -> None:
@@ -438,6 +481,50 @@ def test_manifest_is_filtered_by_destination(tmp_path: Path) -> None:
     assert len(adapter.calls) == 2
 
 
+def test_resync_preserves_old_remote_manifest_and_builds_new_destination_manifest(
+    tmp_path: Path,
+) -> None:
+    adapter = FakeDriveAdapter()
+    service, repository, generation_id, _, _, _ = _fixture(tmp_path, adapter=adapter)
+    assert service.enqueue_generation(generation_id) is not None
+    drive_job_a = repository.claim_next("worker-1", 120)
+    assert drive_job_a is not None
+    assert asyncio.run(service.process_job(drive_job_a, "worker-1")) is not None
+    manifest_job_a = repository.claim_next_manifest("worker-1", 120)
+    assert manifest_job_a is not None
+    assert asyncio.run(service.process_manifest_job(manifest_job_a, "worker-1")) is not None
+
+    old_manifest = adapter.remote_files[
+        (DriveDestination("drive", "studio"), manifest_job_a.remote_manifest_path)
+    ]
+    assert str(generation_id).encode() in old_manifest
+
+    service._settings.rclone_remote = "drive-b"
+    service._settings.rclone_base_path = "studio-b"
+    resynced, resync_job = service.retry_generation(generation_id, resync=True)
+    assert resync_job is not None and resync_job.status is DriveSyncStatus.PENDING
+    assert (resynced.remote_name, resynced.remote_base_path) == ("drive-b", "studio-b")
+
+    drive_job_b = repository.claim_next("worker-1", 120)
+    assert drive_job_b is not None
+    assert asyncio.run(service.process_job(drive_job_b, "worker-1")) is not None
+    manifest_job_b = repository.claim_next_manifest("worker-1", 120)
+    assert manifest_job_b is not None
+    assert manifest_job_b.destination == DriveDestination("drive-b", "studio-b")
+    assert asyncio.run(service.process_manifest_job(manifest_job_b, "worker-1")) is not None
+
+    new_manifest = adapter.remote_files[
+        (DriveDestination("drive-b", "studio-b"), manifest_job_b.remote_manifest_path)
+    ]
+    assert str(generation_id).encode() in new_manifest
+    assert (
+        adapter.remote_files[
+            (DriveDestination("drive", "studio"), manifest_job_a.remote_manifest_path)
+        ]
+        == old_manifest
+    )
+
+
 def test_manifest_failure_keeps_sync_synced_and_rebuilds_the_affected_date(
     tmp_path: Path,
 ) -> None:
@@ -458,11 +545,29 @@ def test_manifest_failure_keeps_sync_synced_and_rebuilds_the_affected_date(
     assert record is not None
     assert record.status is DriveSyncStatus.SYNCED
     assert record.error_code == DriveSyncErrorCode.MANIFEST_FAILED.value
+    assert (
+        repository.manifest_state_for_destination("2026-08-08", DriveDestination("drive", "studio"))
+        is DriveManifestState.FAILED
+    )
     targets = service.list_manifest_failure_targets()
     assert len(targets) == 1
     assert targets[0].local_date == "2026-08-08"
     assert targets[0].remote_name == "drive"
     assert targets[0].remote_base_path == "studio"
+
+    service._settings.rclone_remote = "drive-b"
+    service._settings.rclone_base_path = "studio-b"
+    with pytest.raises(DriveSyncServiceError) as resync_error:
+        service.retry_generation(generation_id, resync=True)
+    assert resync_error.value.code == DriveSyncErrorCode.MANIFEST_REBUILD_REQUIRED.value
+    assert str(resync_error.value) == "再同期前に旧保存先のManifestを再構築してください"
+    blocked_record = repository.get_by_generation(generation_id)
+    assert blocked_record is not None
+    assert (blocked_record.remote_name, blocked_record.remote_base_path) == ("drive", "studio")
+    blocked_targets = service.list_manifest_failure_targets()
+    assert len(blocked_targets) == 1
+    assert blocked_targets[0].remote_name == "drive"
+    assert blocked_targets[0].remote_base_path == "studio"
 
     adapter.fail_relative_path = None
     assert service.retry_failed_manifests() == ("2026-08-08",)
@@ -475,6 +580,10 @@ def test_manifest_failure_keeps_sync_synced_and_rebuilds_the_affected_date(
     assert record.status is DriveSyncStatus.SYNCED
     assert record.error_code is None
     assert service.list_manifest_failure_targets() == ()
+
+    resynced, resync_job = service.retry_generation(generation_id, resync=True)
+    assert resync_job is not None and resync_job.status is DriveSyncStatus.PENDING
+    assert (resynced.remote_name, resynced.remote_base_path) == ("drive-b", "studio-b")
 
 
 def test_manifest_enqueue_failure_recovers_using_stored_destination_after_config_change(
@@ -505,6 +614,16 @@ def test_manifest_enqueue_failure_recovers_using_stored_destination_after_config
 
     service._settings.rclone_remote = "drive-b"
     service._settings.rclone_base_path = "studio-b"
+    with pytest.raises(DriveSyncServiceError) as resync_error:
+        service.retry_generation(generation_id, resync=True)
+    assert resync_error.value.code == DriveSyncErrorCode.MANIFEST_REBUILD_REQUIRED.value
+    blocked_record = repository.get_by_generation(generation_id)
+    assert blocked_record is not None
+    assert (blocked_record.remote_name, blocked_record.remote_base_path) == ("drive", "studio")
+    blocked_targets = service.list_manifest_failure_targets()
+    assert len(blocked_targets) == 1
+    assert blocked_targets[0].remote_name == "drive"
+    assert blocked_targets[0].remote_base_path == "studio"
     assert service.retry_failed_manifests() == ("2026-08-08",)
     manifest_job = repository.claim_next_manifest("worker-1", 120)
     assert manifest_job is not None
@@ -515,6 +634,10 @@ def test_manifest_enqueue_failure_recovers_using_stored_destination_after_config
     record = repository.get_by_generation(generation_id)
     assert record is not None and record.error_code is None
     assert service.list_manifest_failure_targets() == ()
+
+    resynced, resync_job = service.retry_generation(generation_id, resync=True)
+    assert resync_job is not None and resync_job.status is DriveSyncStatus.PENDING
+    assert (resynced.remote_name, resynced.remote_base_path) == ("drive-b", "studio-b")
 
 
 def test_worker_processes_sync_and_manifest_without_gradio(tmp_path: Path) -> None:
@@ -616,6 +739,22 @@ def test_manifest_ui_handler_hides_internal_errors() -> None:
     assert len(outputs) == 2
     assert "RCLONE_CONFIG" not in str(outputs)
     assert "absolute path" not in str(outputs)
+
+
+def test_resync_ui_handler_shows_safe_manifest_rebuild_message() -> None:
+    class BlockedService:
+        def resync_synced(self):
+            raise DriveSyncServiceError(
+                DriveSyncErrorCode.MANIFEST_REBUILD_REQUIRED.value,
+                "再同期前に旧保存先のManifestを再構築してください",
+                retryable=False,
+            )
+
+    outputs = make_drive_resync_handler(BlockedService())()
+
+    assert len(outputs) == 2
+    assert outputs[1] == "再同期前に旧保存先のManifestを再構築してください"
+    assert "/" not in outputs[1]
 
 
 @pytest.mark.parametrize("date_symlink", [False, True])
