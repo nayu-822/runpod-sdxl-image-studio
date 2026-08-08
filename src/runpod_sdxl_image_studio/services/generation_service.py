@@ -180,6 +180,7 @@ class GenerationService:
         upscaler_catalog: UpscalerCatalog | None = None,
         metadata_import_repository: MetadataImportRepositoryProtocol | None = None,
         imported_image_storage: ImportedImageStorage | None = None,
+        drive_sync_enqueue_handler: Callable[[UUID], object] | None = None,
     ) -> None:
         self._client = client
         self._workflow_adapter = workflow_adapter
@@ -241,6 +242,7 @@ class GenerationService:
         )
         self._metadata_import_repository = metadata_import_repository
         self._imported_image_storage = imported_image_storage
+        self._drive_sync_enqueue_handler = drive_sync_enqueue_handler
         self._jobs: dict[UUID, GenerationJob] = {}
         self._results: dict[UUID, GenerationResult] = {}
         self._lock = asyncio.Lock()
@@ -253,6 +255,11 @@ class GenerationService:
         """Return a result while the process is alive."""
 
         return self._results.get(generation_id)
+
+    def set_drive_sync_enqueue_handler(self, handler: Callable[[UUID], object] | None) -> None:
+        """Attach the independent Drive queue after the app has built its services."""
+
+        self._drive_sync_enqueue_handler = handler
 
     def repair_optional_artifacts(self, generation_id: UUID) -> OptionalArtifactRepairOutcome:
         """Repair missing metadata or thumbnails for one already completed generation."""
@@ -1218,6 +1225,7 @@ class GenerationService:
             kind,
             parent_generation_id,
         )
+        self._notify_drive_sync(job.generation_id)
 
     def _complete_existing_generation(self, generation_id: UUID, job_id: UUID) -> None:
         completed_at = datetime.now(UTC)
@@ -1238,21 +1246,35 @@ class GenerationService:
                 raise RecoveryPersistenceError(
                     "existing generation completion could not be persisted"
                 ) from exc
+        else:
+            if self._generation_repository is None or self._job_repository is None:
+                raise RecoveryPersistenceError("generation persistence is unavailable")
+            try:
+                self._generation_repository.mark_completed(generation_id, completed_at)
+                self._job_repository.mark_completed(job_id, completed_at)
+            except GenerationRepositoryError as exc:
+                logger.error(
+                    "Existing artifact completion persistence failed generation=%s job=%s",
+                    generation_id,
+                    job_id,
+                )
+                raise RecoveryPersistenceError(
+                    "existing generation completion could not be persisted"
+                ) from exc
+        self._notify_drive_sync(generation_id)
+
+    def _notify_drive_sync(self, generation_id: UUID) -> None:
+        if self._drive_sync_enqueue_handler is None:
             return
-        if self._generation_repository is None or self._job_repository is None:
-            raise RecoveryPersistenceError("generation persistence is unavailable")
         try:
-            self._generation_repository.mark_completed(generation_id, completed_at)
-            self._job_repository.mark_completed(job_id, completed_at)
-        except GenerationRepositoryError as exc:
-            logger.error(
-                "Existing artifact completion persistence failed generation=%s job=%s",
+            self._drive_sync_enqueue_handler(generation_id)
+        except Exception as exc:  # noqa: BLE001 - Drive failure must not reopen generation
+            logger.warning(
+                "Drive sync enqueue warning generation=%s error=%s",
                 generation_id,
-                job_id,
+                type(exc).__name__,
+                exc_info=True,
             )
-            raise RecoveryPersistenceError(
-                "existing generation completion could not be persisted"
-            ) from exc
 
     def _persist_primary_image_artifact(
         self, job: GenerationJob, artifact: GenerationArtifact

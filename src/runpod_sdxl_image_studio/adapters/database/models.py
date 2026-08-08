@@ -374,6 +374,93 @@ class GenerationQueueEntryModel(Base):
     )
 
 
+class DriveSyncRecordModel(Base):
+    """Persistent Google Drive synchronization state independent of generations."""
+
+    __tablename__ = "drive_sync_records"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'syncing', 'synced', 'failed')",
+            name="ck_drive_sync_record_status",
+        ),
+        UniqueConstraint("generation_id", name="uq_drive_sync_record_generation"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    generation_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("generations.id", ondelete="CASCADE"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    remote_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    remote_base_path: Mapped[str] = mapped_column(String(1000), nullable=False)
+    remote_image_path: Mapped[str] = mapped_column(String(1000), nullable=False)
+    remote_metadata_path: Mapped[str] = mapped_column(String(1000), nullable=False)
+    image_artifact_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("generation_artifacts.id", ondelete="RESTRICT"), nullable=False
+    )
+    metadata_artifact_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("generation_artifacts.id", ondelete="RESTRICT"), nullable=True
+    )
+    image_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    metadata_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    image_size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    metadata_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class DriveSyncJobModel(Base):
+    """Queued attempt with an independent lease and source snapshot."""
+
+    __tablename__ = "drive_sync_jobs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'syncing', 'synced', 'failed')",
+            name="ck_drive_sync_job_status",
+        ),
+        UniqueConstraint("queue_sequence", name="uq_drive_sync_job_sequence"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    sync_record_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("drive_sync_records.id", ondelete="CASCADE"), nullable=False
+    )
+    generation_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("generations.id", ondelete="CASCADE"), nullable=False
+    )
+    queue_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    progress_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    progress_percentage: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    current_artifact: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    worker_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retryable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    log_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    image_artifact_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    metadata_artifact_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    image_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    metadata_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    image_size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    metadata_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 Index("ix_generations_created_at", GenerationModel.created_at)
 Index("ix_generations_status", GenerationModel.status)
 Index("ix_generations_kind", GenerationModel.kind)
@@ -407,6 +494,21 @@ Index("ix_generation_queue_lease", GenerationQueueEntryModel.lease_expires_at)
 Index("ix_metadata_imports_created", MetadataImportModel.created_at)
 Index("ix_metadata_imports_status", MetadataImportModel.metadata_status)
 Index("ix_metadata_imports_source_hash", MetadataImportModel.source_image_sha256)
+Index("ix_drive_sync_records_status", DriveSyncRecordModel.status)
+Index("ix_drive_sync_records_generation", DriveSyncRecordModel.generation_id)
+Index(
+    "ix_drive_sync_jobs_status_sequence",
+    DriveSyncJobModel.status,
+    DriveSyncJobModel.queue_sequence,
+)
+Index("ix_drive_sync_jobs_record", DriveSyncJobModel.sync_record_id)
+Index("ix_drive_sync_jobs_lease", DriveSyncJobModel.lease_expires_at)
+Index(
+    "uq_drive_sync_active_record",
+    DriveSyncJobModel.sync_record_id,
+    unique=True,
+    sqlite_where=DriveSyncJobModel.status.in_(["pending", "syncing"]),
+)
 Index(
     "uq_generations_retry_of_generation",
     GenerationModel.retry_of_generation_id,

@@ -7,6 +7,10 @@ from pathlib import Path
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from runpod_sdxl_image_studio.domain.drive_sync import (
+    validate_remote_base_path,
+    validate_remote_name,
+)
 from runpod_sdxl_image_studio.domain.metadata_import import MAX_METADATA_RAW_BYTES
 
 
@@ -167,6 +171,31 @@ class Settings(BaseSettings):
     rclone_remote: str = Field("", validation_alias="RCLONE_REMOTE")
     rclone_base_path: str = Field("RunPodSDXLImageStudio", validation_alias="RCLONE_BASE_PATH")
     rclone_config: Path | None = Field(None, validation_alias="RCLONE_CONFIG")
+    drive_sync_poll_interval_seconds: float = Field(
+        5.0, validation_alias="IMAGE_STUDIO_DRIVE_SYNC_POLL_INTERVAL_SECONDS"
+    )
+    drive_sync_lease_seconds: float = Field(
+        120.0, validation_alias="IMAGE_STUDIO_DRIVE_SYNC_LEASE_SECONDS"
+    )
+    drive_sync_heartbeat_seconds: float = Field(
+        30.0, validation_alias="IMAGE_STUDIO_DRIVE_SYNC_HEARTBEAT_SECONDS"
+    )
+    drive_discovery_batch_size: int = Field(
+        100, validation_alias="IMAGE_STUDIO_DRIVE_DISCOVERY_BATCH_SIZE"
+    )
+    rclone_connection_timeout_seconds: float = Field(
+        20.0, validation_alias="IMAGE_STUDIO_RCLONE_CONNECTION_TIMEOUT_SECONDS"
+    )
+
+    @field_validator("rclone_remote")
+    @classmethod
+    def validate_rclone_remote(cls, value: str) -> str:
+        return validate_remote_name(value)
+
+    @field_validator("rclone_base_path")
+    @classmethod
+    def validate_rclone_base(cls, value: str) -> str:
+        return validate_remote_base_path(value)
 
     @field_validator("port")
     @classmethod
@@ -220,6 +249,7 @@ class Settings(BaseSettings):
         "optional_artifact_repair_batch_size",
         "queue_max_pending_jobs",
         "batch_max_items",
+        "drive_discovery_batch_size",
     )
     @classmethod
     def validate_positive_integer(cls, value: int) -> int:
@@ -265,6 +295,10 @@ class Settings(BaseSettings):
         "metadata_read_timeout_seconds",
         "metadata_rate_limiter_wait_seconds",
         "metadata_heartbeat_interval_seconds",
+        "drive_sync_poll_interval_seconds",
+        "drive_sync_lease_seconds",
+        "drive_sync_heartbeat_seconds",
+        "rclone_connection_timeout_seconds",
     )
     @classmethod
     def validate_queue_timing(cls, value: float) -> float:
@@ -283,6 +317,10 @@ class Settings(BaseSettings):
     def validate_queue_lease(self) -> Settings:
         if self.queue_lease_seconds <= self.queue_heartbeat_seconds:
             raise ValueError("queue_lease_seconds must be greater than queue_heartbeat_seconds")
+        if self.drive_sync_lease_seconds <= self.drive_sync_heartbeat_seconds:
+            raise ValueError(
+                "drive_sync_lease_seconds must be greater than drive_sync_heartbeat_seconds"
+            )
         if self.optional_artifact_repair_batch_size > self.recovery_max_items:
             raise ValueError(
                 "optional_artifact_repair_batch_size must not exceed recovery_max_items"

@@ -17,7 +17,7 @@
 
 0005/0006では既存DBの状態不一致を terminal state と Artifact の証拠に基づいて補正し、Generation と Job の prompt ID 不一致は `migration_prompt_id_mismatch` として Queue entry ごと `ambiguous` に隔離します。0005/0006適用済みDBには0007後続migrationを適用し、cancel requestだけで `cancelled` へ遷移させず、復元できない状態を監査可能に保持します。既存の画像、Artifact、履歴、Presetは削除しません。
 
-Queue 並べ替え、複数 worker/GPU、自動 retry、Google Drive同期、ComfyUI汎用workflow editor、LoRA学習は未実装です。
+Queue 並べ替え、複数 worker/GPU、自動 retry、ComfyUI汎用workflow editor、LoRA学習は未実装です。
 
 ## 方針
 
@@ -304,6 +304,14 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 - `rclone sync` を使用しない
 - Asia/Tokyo の日付でフォルダ分けされる
 
+### 実装状況
+
+フェーズ7を実装済みです。rcloneの引数配列Adapter、SQLiteの`drive_sync_records`／`drive_sync_jobs`、
+単一Workerのlease・heartbeat・stale復旧、生成完了後のenqueue、起動時のbounded discovery、手動retry／resync、
+Asia/Tokyoの日付別manifest、ローカル容量・未同期容量・削除候補表示、同期・設定UIを追加しました。
+画像とsidecar JSONは検証後に`copyto`で順に保存し、partial failureでもローカルを削除しません。
+`rclone sync`、remote削除、複数Worker、自動retry、Driveからのdownloadは実装していません。
+
 ## フェーズ8: モバイル UI 改善
 
 ### 目的
@@ -443,7 +451,7 @@ ComfyUI input upload、送信前capability検証、出力寸法検証、upscaled
 ただし、実GPU・実ComfyUIを使った運用確認は未実施です。Fake/SQLite/Alembicによる自動テストで検証し、実環境では
 capability不足時のfailed確定、再起動後のhistory復旧、誤寸法出力のfailed確定、元画像非上書き、UIの親画像選択と比較を手動確認する必要があります。
 
-未実装として複数worker、queue並べ替え、自動retry、Google Drive同期、汎用workflow editorは引き続き対象外です。
+未実装として複数worker、queue並べ替え、自動retry、汎用workflow editorは引き続き対象外です。
 
 ## フェーズ6の完了状況
 
@@ -461,5 +469,5 @@ retryはsource provenanceと `retry_of_generation_id` を保持した新規Gener
 
 実ComfyUI、実GPU、実RunPod、実Google Driveを使った手動確認は未実施です。自動テストではFake/SQLite/Alembicでstrict parser、storage cleanup、
 source selection、UIの排他再有効化、mapping、外部image/latentのworkerとreconciliation、source mutation、retry idempotency、migrationの候補消失を拒否する安全なdowngrade、
-既存Queue経路を検証します。Phase 7、複数worker、Queue並べ替え、自動retry、
-Google Drive同期、汎用workflow editorは対象外です。
+既存Queue経路を検証します。複数worker、Queue並べ替え、自動retry、
+汎用workflow editorは対象外です。

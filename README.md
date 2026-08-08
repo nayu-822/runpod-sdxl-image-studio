@@ -32,7 +32,7 @@ prompt ID の保存に失敗した場合は `ready` に戻しません。結果�
 
 単体 retry と failed-only batch retry は元 Generation/Batch との関連を持つ新規キュー項目です。同じ retry 要求を複数回受けても、0005 の NULL許容 partial unique index により既存結果を返し、新規項目を重複作成しません。Random seed、連番 seed、SQLite保存値の上限は `MAX_SEED = 2**63 - 1` に統一しています。
 
-Queue 並べ替え、複数 worker/GPU、自動 retry、Google Drive同期、汎用workflow editor、LoRA学習は今回の対象外です。
+Queue 並べ替え、複数 worker/GPU、自動 retry、汎用workflow editor、LoRA学習は今回の対象外です。
 
 ## フェーズ3A: 生成履歴・スナップショット・再生成
 
@@ -462,3 +462,23 @@ alembic upgrade head
 `generation_upscale_settings` は既存のGeneration Artifact sourceを維持しつつ、外部画像では `source_import_id` とSHA-256を保存します。workerは実行直前にcanonical画像のpath、hash、形式、寸法を再検証し、変更時は `metadata_import_source_changed` として失敗確定します。
 
 source選択の候補と確認状態は `0011_phase6_metadata_source_selection` で保存し、0010/0011時点のambiguous rowは `0012_phase6_legacy_metadata_candidates` でraw sourceから候補を再構築します。自動選択は行わず、raw metadataを保持します。0012でcandidate_jsonから候補を分離したlegacy ambiguous rowは、元候補を正確に復元できないため、downgrade時に候補消失を防ぐ目的で明示的に拒否します。該当行がないDBでは0012/0011のdowngradeと再upgradeが可能です。外部upscale行が残る状態で0010から0009へ戻す操作も安全のため拒否されます。completed外部upscaleの比較表示は `source_import_id` のcanonical画像を再検証して使用します。
+
+## Phase 7: Google Drive保存・再同期・容量可視化
+
+「同期・設定」タブからrclone接続確認、未同期Generationの検出、失敗Jobの手動再試行、同期済みの明示的な再同期、
+manifest再構築、ローカル容量と未同期容量を確認できます。Google Driveが未設定でも生成・履歴・ローカル保存は継続します。
+
+同期対象はcompleted Generationの主画像とsidecar JSONです。Asia/Tokyoの日付で`generated/`または`upscaled/`へ保存し、
+画像・JSONの両方が成功した後にSQLiteのSyncRecordを`synced`へ確定します。転送はrclone `copyto`だけを使い、
+同期失敗時もローカルファイルとremote上の既存ファイルを削除しません。日次JSONL manifestは同期済みDB行から決定的に再構築します。
+`RCLONE_CONFIG`はrcloneの引数へだけ渡し、DB・UI・manifest・ログへ保存しません。
+
+Phase 7 migration確認:
+
+```bash
+alembic upgrade head
+alembic downgrade -1
+alembic upgrade head
+```
+
+実Google Driveを使った手動確認は未実施です。自動テストではFake adapter、SQLite、Alembicを使用します。

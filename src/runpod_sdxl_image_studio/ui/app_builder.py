@@ -19,6 +19,9 @@ from runpod_sdxl_image_studio.adapters.database.engine import (
     create_image_studio_engine,
     create_session_factory,
 )
+from runpod_sdxl_image_studio.adapters.database.repositories.drive_sync_repository import (
+    DriveSyncRepository,
+)
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_dispatch_queue_repository import (  # noqa: E501
     GenerationDispatchQueueRepository,
 )
@@ -49,6 +52,7 @@ from runpod_sdxl_image_studio.adapters.database.repositories.preset_repository i
 from runpod_sdxl_image_studio.adapters.database.repositories.upscale_settings_repository import (
     UpscaleSettingsRepository,
 )
+from runpod_sdxl_image_studio.adapters.drive.google_drive_adapter import GoogleDriveAdapter
 from runpod_sdxl_image_studio.adapters.storage.generation_metadata_storage import (
     GenerationMetadataStorage,
 )
@@ -64,11 +68,13 @@ from runpod_sdxl_image_studio.domain.generation_queue import (
     ReconciliationOutcome,
 )
 from runpod_sdxl_image_studio.domain.lora_search import append_trigger_words
+from runpod_sdxl_image_studio.jobs.drive_sync_worker import DriveSyncRuntime, DriveSyncWorker
 from runpod_sdxl_image_studio.jobs.generation_queue_worker import (
     GenerationQueueRuntime,
     GenerationQueueWorker,
 )
 from runpod_sdxl_image_studio.services.comfyui_service import ComfyUIService
+from runpod_sdxl_image_studio.services.drive_sync_service import DriveSyncService
 from runpod_sdxl_image_studio.services.generation_diff_service import GenerationDiffService
 from runpod_sdxl_image_studio.services.generation_execution_service import (
     GenerationExecutionService,
@@ -102,6 +108,16 @@ from runpod_sdxl_image_studio.ui.components.lora_editor import (
     remove_lora_row,
     render_state_updates,
     update_lora_row,
+)
+from runpod_sdxl_image_studio.ui.tabs.drive_sync_tab import (
+    build_drive_sync_tab,
+    make_drive_connection_handler,
+    make_drive_discovery_handler,
+    make_drive_manifest_handler,
+    make_drive_resync_handler,
+    make_drive_retry_failed_handler,
+    make_drive_retry_selected_handler,
+    make_drive_sync_refresh_handler,
 )
 from runpod_sdxl_image_studio.ui.tabs.history_tab import (
     begin_regeneration,
@@ -207,15 +223,20 @@ class ApplicationRuntime:
 
     demo: gr.Blocks
     queue_runtime: GenerationQueueRuntime
+    drive_sync_runtime: DriveSyncRuntime | None = None
 
     def start(self) -> None:
         """Start the process-level queue worker."""
 
         self.queue_runtime.start()
+        if self.drive_sync_runtime is not None:
+            self.drive_sync_runtime.start()
 
     def stop(self) -> None:
         """Stop the process-level queue worker."""
 
+        if self.drive_sync_runtime is not None:
+            self.drive_sync_runtime.stop()
         self.queue_runtime.stop()
 
 
@@ -237,6 +258,7 @@ def build_app(
     job_repository = GenerationJobRepository(session_factory)
     queue_repository = GenerationQueueRepository(session_factory)
     dispatch_queue_repository = GenerationDispatchQueueRepository(session_factory)
+    drive_sync_repository = DriveSyncRepository(session_factory)
     start_repository = GenerationStartRepository(session_factory)
     progress_repository = GenerationProgressRepository(session_factory)
     catalog_service = LoraCatalogService(
@@ -305,6 +327,15 @@ def build_app(
         metadata_import_repository=metadata_import_repository,
         imported_image_storage=imported_image_storage,
     )
+    drive_sync_service = DriveSyncService(
+        drive_sync_repository,
+        generation_repository,
+        artifact_repository,
+        app_settings,
+        GoogleDriveAdapter(app_settings),
+        metadata_repair_handler=generation_service.repair_optional_artifacts,
+    )
+    generation_service.set_drive_sync_enqueue_handler(drive_sync_service.enqueue_generation)
     cancellation_adapter = ComfyUICancellationAdapter(client, app_settings)
     queue_service = GenerationQueueService(
         dispatch_queue_repository,
@@ -359,6 +390,12 @@ def build_app(
         completed_optional_artifact_handler=repair_one_optional_artifact,
     )
     queue_runtime = GenerationQueueRuntime(queue_worker)
+    drive_sync_worker = DriveSyncWorker(
+        drive_sync_repository,
+        drive_sync_service,
+        app_settings,
+    )
+    drive_sync_runtime = DriveSyncRuntime(drive_sync_worker)
     queue_service.set_wake_callback(queue_runtime.wake)
     preset_repository = PresetRepository(session_factory)
     preset_service = PresetService(preset_repository, app_settings)
@@ -402,6 +439,71 @@ def build_app(
             presets = build_preset_tab()
         with gr.Tab("外部metadata"):
             metadata_import = build_metadata_import_tab(app_settings.max_loras)
+        with gr.Tab("同期・設定"):
+            drive_sync = build_drive_sync_tab()
+
+        drive_sync.refresh_button.click(
+            fn=make_drive_sync_refresh_handler(drive_sync_service),
+            outputs=[
+                drive_sync.selected_job,
+                drive_sync.summary,
+                drive_sync.jobs,
+                drive_sync.message,
+            ],
+        )
+        drive_sync.connection_button.click(
+            fn=lambda: gr.Button(interactive=False),
+            outputs=[drive_sync.connection_button],
+            queue=False,
+        ).then(
+            fn=make_drive_connection_handler(drive_sync_service),
+            outputs=[
+                drive_sync.connection_button,
+                drive_sync.connection_status,
+                drive_sync.message,
+            ],
+        )
+        drive_sync.discovery_button.click(
+            fn=lambda: gr.Button(interactive=False),
+            outputs=[drive_sync.discovery_button],
+            queue=False,
+        ).then(
+            fn=make_drive_discovery_handler(drive_sync_service),
+            outputs=[drive_sync.discovery_button, drive_sync.message],
+        )
+        drive_sync.retry_selected_button.click(
+            fn=lambda: gr.Button(interactive=False),
+            outputs=[drive_sync.retry_selected_button],
+            queue=False,
+        ).then(
+            fn=make_drive_retry_selected_handler(drive_sync_service),
+            inputs=[drive_sync.selected_job],
+            outputs=[drive_sync.retry_selected_button, drive_sync.message],
+        )
+        drive_sync.retry_failed_button.click(
+            fn=lambda: gr.Button(interactive=False),
+            outputs=[drive_sync.retry_failed_button],
+            queue=False,
+        ).then(
+            fn=make_drive_retry_failed_handler(drive_sync_service),
+            outputs=[drive_sync.retry_failed_button, drive_sync.message],
+        )
+        drive_sync.resync_button.click(
+            fn=lambda: gr.Button(interactive=False),
+            outputs=[drive_sync.resync_button],
+            queue=False,
+        ).then(
+            fn=make_drive_resync_handler(drive_sync_service),
+            outputs=[drive_sync.resync_button, drive_sync.message],
+        )
+        drive_sync.manifest_button.click(
+            fn=lambda: gr.Button(interactive=False),
+            outputs=[drive_sync.manifest_button],
+            queue=False,
+        ).then(
+            fn=make_drive_manifest_handler(drive_sync_service),
+            outputs=[drive_sync.manifest_button, drive_sync.message],
+        )
 
         metadata_import_outputs = [
             metadata_import.import_id,
@@ -1519,6 +1621,7 @@ def build_app(
             concurrency_limit=1,
         )
     demo.generation_queue_runtime = queue_runtime
+    demo.drive_sync_runtime = drive_sync_runtime
     return demo
 
 
@@ -1529,7 +1632,14 @@ def build_application_runtime(settings: Settings | None = None) -> ApplicationRu
     runtime = getattr(demo, "generation_queue_runtime", None)
     if not isinstance(runtime, GenerationQueueRuntime):
         raise RuntimeError("generation queue runtime was not configured")
-    return ApplicationRuntime(demo=demo, queue_runtime=runtime)
+    drive_runtime = getattr(demo, "drive_sync_runtime", None)
+    if not isinstance(drive_runtime, DriveSyncRuntime):
+        raise RuntimeError("drive sync runtime was not configured")
+    return ApplicationRuntime(
+        demo=demo,
+        queue_runtime=runtime,
+        drive_sync_runtime=drive_runtime,
+    )
 
 
 def _filter_lora_category(

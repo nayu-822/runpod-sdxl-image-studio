@@ -206,6 +206,9 @@ def test_phase5_migration_runs_from_empty_and_phase4_database(tmp_path: Path) ->
             ).scalar_one()
             == job_id
         )
+    command.downgrade(_alembic_config(phase4_url), "0012_phase6_legacy_metadata_candidates")
+    assert not inspect(engine).has_table("drive_sync_records")
+    assert not inspect(engine).has_table("drive_sync_jobs")
     command.downgrade(_alembic_config(phase4_url), "-1")
     assert inspect(engine).has_table("metadata_imports")
     command.downgrade(_alembic_config(phase4_url), "-1")
