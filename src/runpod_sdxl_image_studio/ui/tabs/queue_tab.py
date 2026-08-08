@@ -30,7 +30,7 @@ def build_queue_tab() -> tuple[
     gr.Button,
 ]:
     gr.Markdown("## 生成キュー")
-    with gr.Row():
+    with gr.Row(elem_classes=["queue-actions"]):
         refresh = gr.Button("キューを更新", variant="primary")
         status = gr.Dropdown(
             [("すべて", ""), *((_status_label(item), item.value) for item in GenerationStatus)],
@@ -40,10 +40,10 @@ def build_queue_tab() -> tuple[
         batch_filter = gr.Textbox(label="バッチ ID", placeholder="任意のUUID")
     jobs = gr.Dropdown([], label="ジョブ", allow_custom_value=False)
     detail = gr.Markdown("ジョブを選択してください")
-    with gr.Row():
-        cancel = gr.Button("選択ジョブをキャンセル")
-        retry = gr.Button("選択ジョブを再試行")
-        retry_batch = gr.Button("失敗バッチを再試行")
+    with gr.Row(elem_classes=["queue-actions"]):
+        cancel = gr.Button("選択ジョブをキャンセル", elem_classes=["mobile-tap-button"])
+        retry = gr.Button("選択ジョブを再試行", elem_classes=["mobile-tap-button"])
+        retry_batch = gr.Button("失敗バッチを再試行", elem_classes=["mobile-tap-button"])
     ambiguous_prompt_id = gr.Dropdown(
         label="解決するprompt ID（Generation / Job / 手入力）",
         choices=[],
@@ -51,7 +51,7 @@ def build_queue_tab() -> tuple[
         visible=False,
         interactive=False,
     )
-    with gr.Row():
+    with gr.Row(elem_classes=["queue-actions"]):
         ambiguous_link = gr.Button("prompt IDを紐付け", visible=False, interactive=False)
         ambiguous_fail = gr.Button(
             "prompt不在を確認して失敗確定",

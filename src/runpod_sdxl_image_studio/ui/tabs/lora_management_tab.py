@@ -53,7 +53,7 @@ class LoraManagementTabComponents:
 def build_lora_management_tab(catalog: LoraCatalogService) -> LoraManagementTabComponents:
     del catalog
     gr.Markdown("## LoRA管理")
-    with gr.Row():
+    with gr.Row(elem_classes=["metadata-actions"]):
         search = gr.Textbox(label="検索", placeholder="file name / display name / trigger / notes")
         category_filter = gr.Dropdown([], label="カテゴリ", allow_custom_value=False)
         sort = gr.Dropdown(
@@ -66,7 +66,7 @@ def build_lora_management_tab(catalog: LoraCatalogService) -> LoraManagementTabC
             value=LoraSort.FAVORITES_RECENT.value,
             label="並び順",
         )
-    with gr.Row():
+    with gr.Row(elem_classes=["metadata-actions"]):
         favorites_only = gr.Checkbox(label="お気に入りのみ")
         include_missing = gr.Checkbox(label="missingを含める")
         sync_button = gr.Button("ComfyUI一覧と同期", variant="secondary")
@@ -81,7 +81,7 @@ def build_lora_management_tab(catalog: LoraCatalogService) -> LoraManagementTabC
             lines=2,
             max_lines=5,
         )
-        with gr.Row():
+        with gr.Row(elem_classes=["metadata-actions"]):
             recommended_model = gr.Number(label="推奨model strength", minimum=-2, maximum=2)
             recommended_clip = gr.Number(label="推奨clip strength", minimum=-2, maximum=2)
         compatible_models = gr.Textbox(label="対応モデル（カンマ区切り）", lines=2)
@@ -92,7 +92,7 @@ def build_lora_management_tab(catalog: LoraCatalogService) -> LoraManagementTabC
             type="binary",
         )
         thumbnail_preview = gr.Image(label="サムネイル", type="filepath")
-        with gr.Row():
+        with gr.Row(elem_classes=["metadata-actions"]):
             save_button = gr.Button("metadataを保存", variant="primary")
             delete_thumbnail_button = gr.Button("サムネイルを削除")
     message = gr.Markdown("")

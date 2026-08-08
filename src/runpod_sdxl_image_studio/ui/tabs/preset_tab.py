@@ -78,7 +78,7 @@ def build_preset_tab() -> PresetTabComponents:
     """Generation画面へ接続したPreset管理UIを構築する。"""
 
     gr.Markdown("## プリセット")
-    with gr.Row():
+    with gr.Row(elem_classes=["preset-actions"]):
         search = gr.Textbox(label="Preset検索")
         kind = gr.Dropdown(
             [("すべて", ""), *((item.value, item.value) for item in PresetKind)],
@@ -88,10 +88,10 @@ def build_preset_tab() -> PresetTabComponents:
         favorite_only = gr.Checkbox(label="お気に入りのみ")
         refresh = gr.Button("検索")
     results = gr.Dropdown([], label="Preset一覧", allow_custom_value=False)
-    with gr.Row():
+    with gr.Row(elem_classes=["preset-actions"]):
         selected = gr.Dropdown([], label="選択中Preset", allow_custom_value=False)
         clear_button = gr.Button("条件・選択をクリア")
-    with gr.Row():
+    with gr.Row(elem_classes=["preset-actions"]):
         preset_kind = gr.Dropdown(
             [(item.value, item.value) for item in PresetKind],
             value=PresetKind.GENERATION.value,
@@ -101,7 +101,7 @@ def build_preset_tab() -> PresetTabComponents:
         favorite = gr.Checkbox(label="お気に入り")
     description = gr.Textbox(label="説明", lines=2, max_lines=4, max_length=1000)
     payload_summary = gr.Markdown("Payload未選択")
-    with gr.Row():
+    with gr.Row(elem_classes=["preset-actions"]):
         prompt_apply_mode = gr.Dropdown(
             [
                 ("置換", PromptApplyMode.REPLACE.value),
@@ -116,12 +116,12 @@ def build_preset_tab() -> PresetTabComponents:
             value="replace",
             label="LoRA適用方式",
         )
-    with gr.Row():
+    with gr.Row(elem_classes=["preset-actions"]):
         save_button = gr.Button("現在設定から保存", variant="primary")
         update_button = gr.Button("更新")
         duplicate_button = gr.Button("複製")
         apply_button = gr.Button("生成画面へ適用", variant="primary")
-    with gr.Row():
+    with gr.Row(elem_classes=["preset-actions"]):
         delete_confirmation = gr.Checkbox(label="削除を確認しました")
         delete_button = gr.Button("削除")
     with gr.Accordion("最近使った設定", open=False):

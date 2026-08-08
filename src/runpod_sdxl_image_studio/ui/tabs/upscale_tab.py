@@ -69,7 +69,7 @@ def build_upscale_tab(
             if upscaler_catalog is None
             else f"upscalerカタログ: {len(upscaler_choices)}件"
         )
-    with gr.Row():
+    with gr.Row(elem_classes=["comparison-layout"]):
         parent_id = gr.Textbox(label="親Generation ID", placeholder="completed generation UUID")
         source_import_id = gr.Textbox(
             label="外部Import ID",
@@ -90,7 +90,7 @@ def build_upscale_tab(
         value=UpscaleSizingMode.FACTOR.value,
         label="出力サイズ",
     )
-    with gr.Row():
+    with gr.Row(elem_classes=["size-dimensions"]):
         factor = gr.Number(label="倍率", value=2.0, minimum=1.01, maximum=16.0)
         width = gr.Number(label="幅", value=1024, minimum=64, precision=0)
         height = gr.Number(label="高さ", value=1024, minimum=64, precision=0)
@@ -98,10 +98,19 @@ def build_upscale_tab(
     upscaler = gr.Dropdown(list(upscaler_choices), label="Upscaler", allow_custom_value=False)
     denoise = gr.Slider(0, 1, value=0.35, step=0.01, label="Denoise（Latentのみ）")
     plan = gr.Markdown("出力サイズと負荷見積もりは親画像確認後に表示されます。")
-    enqueue_button = gr.Button("アップスケールをキューへ追加", variant="primary")
+    enqueue_button = gr.Button(
+        "アップスケールをキューへ追加",
+        variant="primary",
+        elem_classes=["mobile-tap-button"],
+    )
     status = gr.Markdown()
     result = gr.Image(label="結果", interactive=False)
-    comparison = gr.Gallery(label="親画像と結果の比較", columns=2, rows=1)
+    comparison = gr.Gallery(
+        label="親画像と結果の比較",
+        columns=2,
+        rows=1,
+        elem_classes=["comparison-gallery"],
+    )
     return UpscaleTabComponents(
         parent_id,
         source_import_id,

@@ -342,6 +342,22 @@ Asia/Tokyoの日付別manifest、destination snapshot、転送中progress/PID/lo
 - 生成状況と選択画像が明確
 - 大きい元画像を履歴一覧で直接読み込まない
 
+### 実装状況
+
+フェーズ8を実装済みです。生成画面をスマートフォンでは1カラム、デスクトップでは2カラムへ配置し、Positive/Negative promptの入力高さ、
+LoRAカード、サイズ・Seed入力、高度な設定Accordion、バッチAccordion、stickyな生成ボタンを追加・整理しました。重要なボタンは44px以上の
+tap targetを確保し、safe area、320pxから1024px以上までのresponsive breakpoint、focus outlineを共通CSSへまとめています。
+
+生成中のstatus cardは`GenerationQueueService`と既存履歴Serviceから状態を読み取り、5秒間隔のbounded poll、`demo.load`による初期取得、
+enqueue後の再取得でGeneration ID、Queue position、進捗、現在処理、完了Artifactを表示します。poll障害時は最後の表示を保持して安全な警告だけを表示し、
+DBの状態遷移は変更しません。最近使ったcheckpoint、VAE、LoRA、Presetは既存`RecentSettingsService`とPreset handlerを再利用し、適用操作だけで生成を開始しません。
+
+履歴一覧はthumbnail Artifactだけを使用し、thumbnail欠損時は軽量placeholderを表示します。原寸画像は詳細表示・完了結果表示のService経路だけで復元します。
+履歴filter、Queue、Drive同期、metadata、Preset、upscale比較の既存機能はresponsive classを適用して維持し、LoRAのState・表示行・順序は既存handlerの同一出力で更新します。
+
+Phase 8ではDB schema、migration、Generation/Job/Queue/DriveのDomain仕様を変更していません。Playwrightのviewportテストは任意のローカル起動URLを
+`IMAGE_STUDIO_BROWSER_URL`で指定した場合のみ実行し、未指定時はskipします。375x812、390x844、430x932、1280x800の実機・ブラウザ手動確認は未実施です。
+
 ## フェーズ9: システム状態・エラー履歴・生成前チェック強化
 
 ### 目的

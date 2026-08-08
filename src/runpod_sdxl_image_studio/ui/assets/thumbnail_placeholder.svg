@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="480" viewBox="0 0 640 480" role="img" aria-labelledby="title">
+  <title id="title">サムネイル未生成</title>
+  <rect width="640" height="480" fill="#e5e7eb"/>
+  <path d="M128 352l112-128 88 96 64-72 120 104H128z" fill="#9ca3af"/>
+  <circle cx="424" cy="160" r="36" fill="#9ca3af"/>
+  <text x="320" y="420" fill="#374151" font-family="sans-serif" font-size="28" text-anchor="middle">サムネイル未生成</text>
+</svg>

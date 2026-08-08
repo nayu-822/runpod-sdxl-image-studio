@@ -135,25 +135,36 @@ def build_lora_editor(max_loras: int) -> LoraEditorComponents:
     choices = gr.State(None)
     gr.Markdown("### LoRA")
     for index in range(max(1, max_loras)):
-        with gr.Row(visible=index == 0) as container:
-            name = gr.Dropdown([], label=f"LoRA {index + 1}", interactive=False)
-            model_strength = gr.Number(
-                value=1.0,
-                minimum=-2.0,
-                maximum=2.0,
-                step=0.1,
-                label="Model strength",
+        with (
+            gr.Row(visible=index == 0, elem_classes=["lora-card-row"]) as container,
+            gr.Column(elem_classes=["lora-card"]),
+        ):
+            gr.Markdown(f"**LoRA {index + 1}**")
+            name = gr.Dropdown(
+                [],
+                label="LoRA名",
+                interactive=False,
+                elem_classes=["lora-name"],
             )
-            clip_strength = gr.Number(
-                value=1.0,
-                minimum=-2.0,
-                maximum=2.0,
-                step=0.1,
-                label="CLIP strength",
-            )
-            up_button = gr.Button("↑", min_width=44)
-            down_button = gr.Button("↓", min_width=44)
-            remove_button = gr.Button("×", min_width=44)
+            with gr.Row(elem_classes=["lora-strengths"]):
+                model_strength = gr.Number(
+                    value=1.0,
+                    minimum=-2.0,
+                    maximum=2.0,
+                    step=0.1,
+                    label="モデル強度",
+                )
+                clip_strength = gr.Number(
+                    value=1.0,
+                    minimum=-2.0,
+                    maximum=2.0,
+                    step=0.1,
+                    label="CLIP強度",
+                )
+            with gr.Row(elem_classes=["lora-actions"]):
+                up_button = gr.Button("↑ 上へ", min_width=44)
+                down_button = gr.Button("↓ 下へ", min_width=44)
+                remove_button = gr.Button("削除", min_width=44)
         rows.append(
             LoraRowComponents(
                 container,
@@ -165,7 +176,9 @@ def build_lora_editor(max_loras: int) -> LoraEditorComponents:
                 remove_button,
             )
         )
-    add_button = gr.Button("Add LoRA", interactive=max_loras > 1)
+    add_button = gr.Button(
+        "LoRAを追加", interactive=max_loras > 1, elem_classes=["mobile-tap-button"]
+    )
     trigger_button = gr.Button("選択中LoRAのトリガーワードを追加")
     trigger_message = gr.Markdown("")
     return LoraEditorComponents(

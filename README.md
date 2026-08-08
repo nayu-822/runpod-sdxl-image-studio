@@ -485,3 +485,24 @@ alembic upgrade head
 ```
 
 実Google Driveを使った手動確認は未実施です。自動テストではFake adapter、SQLite、Alembicを使用します。
+
+## Phase 8: モバイルUI改善
+
+生成画面はスマートフォンで1カラム、デスクトップで設定とプレビューの2カラムになります。Positive/Negative promptの入力高さ、LoRAカード、
+sticky生成ボタン、status card、最近使ったcheckpoint・LoRA・Preset、高度な設定Accordionを用意し、主要ボタンは44px以上のtap targetを確保しています。
+320px、375px、390px、430px、768px、1024px以上を共通responsive CSSで扱い、safe areaを考慮します。画面復帰・初期load・5秒pollでは既存のQueue/履歴Serviceから状態を再取得し、
+生成workerを停止せずに完了Generationと主Artifactを復元します。
+
+履歴一覧はthumbnail Artifactのみを表示し、thumbnail欠損時はplaceholderを使います。原寸画像を一覧へfallbackせず、詳細または完了結果でだけ復元します。
+履歴、Queue、アップスケール比較、Drive同期、metadata import、Presetの既存Serviceと状態遷移は維持しています。Phase 8ではDB schema・migrationの変更はありません。
+
+### Phase 8 の確認
+
+```bash
+pytest tests/unit/test_phase8_mobile_ui.py
+pytest tests/integration/test_phase8_mobile_ui_integration.py
+pytest tests/browser/test_phase8_mobile_viewports.py
+```
+
+ブラウザviewportテストは、ローカルで起動したGradio URLを`IMAGE_STUDIO_BROWSER_URL`へ設定した場合のみ実行します。実機での375x812、390x844、430x932、
+1280x800の画面確認、Safari/Chromeのbackground復帰、ソフトキーボード表示中のsticky操作は別途手動確認が必要です。

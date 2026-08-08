@@ -42,18 +42,20 @@ class DriveSyncTabComponents:
 def build_drive_sync_tab() -> DriveSyncTabComponents:
     gr.Markdown("## 同期・設定")
     connection_status = gr.Markdown("接続状態は未確認です")
-    with gr.Row():
-        connection_button = gr.Button("接続確認", variant="primary")
-        refresh_button = gr.Button("同期状態を更新")
-        discovery_button = gr.Button("完了済みを検出")
+    with gr.Row(elem_classes=["drive-actions"]):
+        connection_button = gr.Button(
+            "接続確認", variant="primary", elem_classes=["mobile-tap-button"]
+        )
+        refresh_button = gr.Button("同期状態を更新", elem_classes=["mobile-tap-button"])
+        discovery_button = gr.Button("完了済みを検出", elem_classes=["mobile-tap-button"])
     summary = gr.Markdown("同期状態を更新してください")
     selected_job = gr.Dropdown([], label="対象Generation", allow_custom_value=False)
-    with gr.Row():
-        retry_selected_button = gr.Button("選択を再試行")
-        retry_failed_button = gr.Button("失敗を再試行")
-        resync_button = gr.Button("同期済みを再同期")
-        manifest_button = gr.Button("Manifest再構築を登録")
-        failed_manifest_button = gr.Button("失敗日付を再構築")
+    with gr.Row(elem_classes=["drive-actions"]):
+        retry_selected_button = gr.Button("選択を再試行", elem_classes=["mobile-tap-button"])
+        retry_failed_button = gr.Button("失敗を再試行", elem_classes=["mobile-tap-button"])
+        resync_button = gr.Button("同期済みを再同期", elem_classes=["mobile-tap-button"])
+        manifest_button = gr.Button("Manifest再構築を登録", elem_classes=["mobile-tap-button"])
+        failed_manifest_button = gr.Button("失敗日付を再構築", elem_classes=["mobile-tap-button"])
     manifest_date = gr.Textbox(
         label="Manifest日付 (YYYY-MM-DD、空欄は今日)",
         placeholder="2026-08-08",

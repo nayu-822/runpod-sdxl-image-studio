@@ -147,9 +147,14 @@ class GenerationQueueService:
         *,
         statuses: Sequence[GenerationStatus] | None = None,
         batch_id: UUID | None = None,
+        limit: int = 200,
     ) -> tuple[GenerationQueueItem, ...]:
         try:
-            return self._repository.list_queue(statuses=statuses, batch_id=batch_id)
+            return self._repository.list_queue(
+                statuses=statuses,
+                batch_id=batch_id,
+                limit=min(max(1, limit), 200),
+            )
         except GenerationDispatchQueueRepositoryError as exc:
             raise GenerationQueueServiceError("キューを取得できませんでした。") from exc
 

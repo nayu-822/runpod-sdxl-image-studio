@@ -41,6 +41,9 @@ where = ["src"]
 [tool.setuptools.package-dir]
 "" = "src"
 
+[tool.setuptools.package-data]
+runpod_sdxl_image_studio = ["ui/assets/*.svg"]
+
 [tool.ruff]
 target-version = "py311"
 line-length = 100

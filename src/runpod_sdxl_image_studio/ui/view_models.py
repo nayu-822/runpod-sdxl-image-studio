@@ -2,11 +2,52 @@
 
 from __future__ import annotations
 
+import html
+from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from runpod_sdxl_image_studio.adapters.comfyui.models import ComfyUICapabilities
 from runpod_sdxl_image_studio.domain.system_status import ComfyUIStatus
+
+
+@dataclass(frozen=True)
+class GenerationStatusCardView:
+    """DBから取得した生成状態をスマホ向け表示へ変換したview model。"""
+
+    generation_id: str | None
+    status: str
+    queue_position: int | None
+    progress_percentage: float | None
+    current_step: str | None
+    message: str
+
+
+def generation_status_card_markdown(view: GenerationStatusCardView) -> str:
+    """Render a short status card without exposing prompt text or local paths."""
+
+    generation_id = _short_generation_id(view.generation_id)
+    queue_position = str(view.queue_position) if view.queue_position is not None else "-"
+    progress = f"{view.progress_percentage:.0f}%" if view.progress_percentage is not None else "-"
+    current_step = html.escape((view.current_step or "-")[:120])
+    message = html.escape((view.message or "-")[:500])
+    return "\n".join(
+        (
+            "### 生成ステータス",
+            f"**状態:** `{html.escape(view.status)}`",
+            f"**Generation ID:** `{html.escape(generation_id)}`",
+            f"**Queue position:** `{queue_position}`",
+            f"**進捗:** `{progress}`",
+            f"**現在処理:** `{current_step}`",
+            f"**メッセージ:** {message}",
+        )
+    )
+
+
+def _short_generation_id(value: str | None) -> str:
+    if not value:
+        return "-"
+    return value.replace("\r", "").replace("\n", "")[:12]
 
 
 def initial_status_markdown() -> str:

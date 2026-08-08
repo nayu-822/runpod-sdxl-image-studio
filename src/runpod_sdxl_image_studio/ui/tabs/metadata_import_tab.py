@@ -59,7 +59,7 @@ def build_metadata_import_tab(max_loras: int = 8) -> MetadataImportTabComponents
         "画像と任意のsidecar JSONを解析し、内容を確認してから生成フォームまたは"
         "アップスケールへ適用します。アップロードだけでは実行しません。"
     )
-    with gr.Row():
+    with gr.Row(elem_classes=["metadata-actions"]):
         image = gr.File(label="画像（PNG / WebP）", file_types=[".png", ".webp"], type="filepath")
         sidecar = gr.File(label="sidecar JSON（任意）", file_types=[".json"], type="filepath")
     parse_button = gr.Button("metadataを解析", variant="primary")
@@ -96,9 +96,13 @@ def build_metadata_import_tab(max_loras: int = 8) -> MetadataImportTabComponents
         lines=5,
     )
     apply_mapping = gr.Button("model mappingを適用")
-    with gr.Row():
-        apply_generation = gr.Button("生成フォームへ適用", interactive=False)
-        apply_upscale = gr.Button("アップスケールへ適用", interactive=False)
+    with gr.Row(elem_classes=["metadata-actions"]):
+        apply_generation = gr.Button(
+            "生成フォームへ適用", interactive=False, elem_classes=["mobile-tap-button"]
+        )
+        apply_upscale = gr.Button(
+            "アップスケールへ適用", interactive=False, elem_classes=["mobile-tap-button"]
+        )
     return MetadataImportTabComponents(
         image=image,
         sidecar=sidecar,

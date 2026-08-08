@@ -27,6 +27,9 @@ from runpod_sdxl_image_studio.services.lora_catalog_service import (
     LoraCatalogError,
     LoraCatalogService,
 )
+from runpod_sdxl_image_studio.ui.components.generation_status_card import (
+    build_generation_status_card,
+)
 from runpod_sdxl_image_studio.ui.components.lora_editor import (
     LoraEditorComponents,
     build_lora_editor,
@@ -91,6 +94,30 @@ class GenerationTabComponents:
     restored_from_generation: gr.State
     regeneration_valid: gr.State
     regeneration_requested: gr.State
+    positive_clear_button: gr.Button
+    negative_clear_button: gr.Button
+    recent_refresh: gr.Button
+    recent_checkpoints: gr.Dropdown
+    recent_checkpoint_apply: gr.Button
+    recent_vaes: gr.Dropdown
+    recent_vae_apply: gr.Button
+    recent_loras: gr.Dropdown
+    recent_lora_add: gr.Button
+    recent_generation_presets: gr.Dropdown
+    recent_prompt_presets: gr.Dropdown
+    recent_lora_presets: gr.Dropdown
+    recent_preset_apply: gr.Button
+    recent_message: gr.Markdown
+    status_card: gr.Markdown
+    active_generation_id: gr.State
+    status_poll_timer: gr.Timer
+    result_seed: gr.Textbox
+    result_favorite: gr.Checkbox
+    result_regenerate_button: gr.Button
+    result_edit_button: gr.Button
+    result_upscale_button: gr.Button
+    result_seed_copy_button: gr.Button
+    result_message: gr.Markdown
 
 
 def capability_refresh_outputs(generation: GenerationTabComponents) -> tuple[Any, ...]:
@@ -120,7 +147,7 @@ def build_system_tab(comfyui_url: str, initial_markdown: str) -> SystemTabCompon
     gr.Markdown("## システム")
     gr.Markdown(f"**接続先 URL:** `{comfyui_url}`")
     status = gr.Markdown(initial_markdown, elem_id="comfyui-status")
-    with gr.Row():
+    with gr.Row(elem_classes=["system-actions"]):
         connection_button = gr.Button("接続確認", variant="primary", min_width=140)
         refresh_button = gr.Button("モデル一覧を更新", min_width=180)
     capability_message = gr.Markdown("")
@@ -131,60 +158,125 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
     """Build a mobile-friendly fixed-workflow SDXL generation form."""
 
     gr.Markdown("## 画像生成")
-    checkpoint = gr.Dropdown([], label="checkpoint", interactive=False)
     checkpoint_choices = gr.State(None)
-    positive_prompt = gr.Textbox(label="Positive prompt", lines=5, max_lines=12)
-    negative_prompt = gr.Textbox(label="Negative prompt", lines=3, max_lines=8)
-    with gr.Row():
-        size_preset = gr.Dropdown(
-            ["1024 × 1024", "832 × 1216", "1216 × 832", "896 × 1152", "1152 × 896", "Custom"],
-            value="1024 × 1024",
-            label="Size",
-        )
-        width = gr.Number(value=1024, precision=0, label="Width")
-        height = gr.Number(value=1024, precision=0, label="Height")
-    with gr.Row():
-        seed_mode = gr.Radio(
-            ["Random", "Fixed", "Previous seed"], value="Random", label="Seed mode"
-        )
-        seed = gr.Number(value=-1, precision=0, label="Seed")
-    with gr.Accordion("Advanced", open=False):
-        with gr.Row():
+    vae_choices = gr.State(None)
+    with gr.Row(elem_classes=["generation-layout"]):
+        with gr.Column(elem_classes=["generation-primary"]):
+            with gr.Accordion("最近使った項目", open=True, elem_classes=["recent-settings"]):
+                recent_refresh = gr.Button(
+                    "生成の最近項目を更新", elem_classes=["mobile-tap-button"]
+                )
+                recent_checkpoints = gr.Dropdown([], label="最近のcheckpoint")
+                recent_checkpoint_apply = gr.Button(
+                    "checkpointを反映", elem_classes=["mobile-tap-button"]
+                )
+                recent_vaes = gr.Dropdown([], label="最近のVAE")
+                recent_vae_apply = gr.Button("VAEを反映", elem_classes=["mobile-tap-button"])
+                recent_loras = gr.Dropdown([], label="最近のLoRA")
+                recent_lora_add = gr.Button("最近のLoRAを追加", elem_classes=["mobile-tap-button"])
+                recent_generation_presets = gr.Dropdown([], label="最近のPreset")
+                recent_preset_apply = gr.Button(
+                    "最近のPresetを適用", elem_classes=["mobile-tap-button"]
+                )
+                recent_prompt_presets = gr.Dropdown([], visible=False)
+                recent_lora_presets = gr.Dropdown([], visible=False)
+                recent_message = gr.Markdown("")
+
+            checkpoint = gr.Dropdown([], label="checkpoint", interactive=False)
+            with gr.Column(elem_classes=["prompt-editor"]):
+                positive_prompt = gr.Textbox(
+                    label="Positive prompt",
+                    lines=6,
+                    max_lines=16,
+                    elem_classes=["prompt-editor"],
+                )
+                positive_clear_button = gr.Button(
+                    "Positive promptをクリア", elem_classes=["mobile-tap-button"]
+                )
+                negative_prompt = gr.Textbox(
+                    label="Negative prompt",
+                    lines=4,
+                    max_lines=12,
+                    elem_classes=["prompt-editor", "negative"],
+                )
+                negative_clear_button = gr.Button(
+                    "Negative promptをクリア", elem_classes=["mobile-tap-button"]
+                )
+            lora_list = gr.Markdown("**LoRA一覧:** 未取得")
+            lora_editor = build_lora_editor(max_loras)
+            lora_category_filter = gr.Dropdown([], label="LoRAカテゴリ", interactive=False)
+            size_preset = gr.Dropdown(
+                ["1024 × 1024", "832 × 1216", "1216 × 832", "896 × 1152", "1152 × 896", "Custom"],
+                value="1024 × 1024",
+                label="サイズプリセット",
+            )
+            with gr.Row(elem_classes=["size-dimensions"]):
+                width = gr.Number(value=1024, precision=0, label="幅")
+                height = gr.Number(value=1024, precision=0, label="高さ")
+            with gr.Row(elem_classes=["seed-controls"]):
+                seed_mode = gr.Radio(
+                    ["Random", "Fixed", "Previous seed"], value="Random", label="Seed方式"
+                )
+                seed = gr.Number(value=-1, precision=0, label="Seed")
+            with gr.Column(elem_classes=["generation-sticky-action"]):
+                generate_button = gr.Button(
+                    "生成をキューへ追加",
+                    variant="primary",
+                    interactive=False,
+                    size="lg",
+                    elem_classes=["mobile-tap-button"],
+                )
+
+        with gr.Column(elem_classes=["generation-preview"]):
+            status_components = build_generation_status_card()
+            progress = gr.Markdown("")
+            result_image = gr.Image(label="生成画像", type="filepath")
+            result_details = gr.Markdown("")
+            with gr.Row(elem_classes=["result-actions"]):
+                result_regenerate_button = gr.Button(
+                    "同条件で再生成", elem_classes=["mobile-tap-button"]
+                )
+                result_edit_button = gr.Button("設定を編集", elem_classes=["mobile-tap-button"])
+                result_upscale_button = gr.Button(
+                    "アップスケール", elem_classes=["mobile-tap-button"]
+                )
+                result_seed_copy_button = gr.Button(
+                    "Seedをコピー", elem_classes=["mobile-tap-button"]
+                )
+                result_favorite = gr.Checkbox(label="お気に入り", value=False)
+            result_seed = gr.Textbox(label="実使用Seed", interactive=False)
+            result_message = gr.Markdown("")
+
+    with gr.Accordion("高度な設定", open=False, elem_classes=["generation-advanced"]):
+        with gr.Row(elem_classes=["size-dimensions"]):
             steps = gr.Number(value=28, precision=0, label="Steps")
             cfg_scale = gr.Number(value=5.5, label="CFG")
-        with gr.Row():
-            sampler = gr.Dropdown([], label="sampler", interactive=False)
-            scheduler = gr.Dropdown([], label="scheduler", interactive=False)
-        with gr.Row():
+        with gr.Row(elem_classes=["size-dimensions"]):
+            sampler = gr.Dropdown([], label="Sampler", interactive=False)
+            scheduler = gr.Dropdown([], label="Scheduler", interactive=False)
+        with gr.Row(elem_classes=["size-dimensions"]):
             vae = gr.Dropdown(
                 [("Checkpoint内蔵VAE", None)],
                 value=None,
                 label="VAE",
                 interactive=True,
             )
-            vae_choices = gr.State(None)
-            upscaler = gr.Dropdown([], label="upscaler", interactive=False)
-    lora_list = gr.Markdown("**LoRA list:** unavailable")
-    lora_editor = build_lora_editor(max_loras)
-    lora_category_filter = gr.Dropdown([], label="LoRAカテゴリ", interactive=False)
-    generate_button = gr.Button(
-        "生成をキューへ追加", variant="primary", interactive=False, size="lg"
-    )
-    with gr.Accordion("バッチ生成", open=False):
+            upscaler = gr.Dropdown([], label="アップスケーラー", interactive=False)
+
+    with gr.Accordion("バッチ生成", open=False, elem_classes=["generation-batch"]):
         batch_count = gr.Number(value=2, precision=0, label="生成枚数")
         batch_seed_strategy = gr.Radio(
             [("ランダム", "random"), ("連番", "sequential")],
             value="random",
-            label="seed方式",
+            label="Seed方式",
         )
-        batch_start_seed = gr.Number(value=0, precision=0, label="開始seed")
-        batch_seed_step = gr.Number(value=1, precision=0, label="seed増分")
+        batch_start_seed = gr.Number(value=0, precision=0, label="開始Seed")
+        batch_seed_step = gr.Number(value=1, precision=0, label="Seed増分")
         batch_name = gr.Textbox(value="Batch", label="バッチ名", max_length=200)
-        batch_enqueue_button = gr.Button("バッチをキューへ追加", variant="primary")
+        batch_enqueue_button = gr.Button(
+            "バッチをキューへ追加", variant="primary", elem_classes=["mobile-tap-button"]
+        )
         batch_message = gr.Markdown("")
-    progress = gr.Markdown("")
-    result_image = gr.Image(label="Generated image", type="filepath")
-    result_details = gr.Markdown("")
     return GenerationTabComponents(
         checkpoint=checkpoint,
         vae=vae,
@@ -219,6 +311,30 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
         restored_from_generation=gr.State(None),
         regeneration_valid=gr.State(False),
         regeneration_requested=gr.State(False),
+        positive_clear_button=positive_clear_button,
+        negative_clear_button=negative_clear_button,
+        recent_refresh=recent_refresh,
+        recent_checkpoints=recent_checkpoints,
+        recent_checkpoint_apply=recent_checkpoint_apply,
+        recent_vaes=recent_vaes,
+        recent_vae_apply=recent_vae_apply,
+        recent_loras=recent_loras,
+        recent_lora_add=recent_lora_add,
+        recent_generation_presets=recent_generation_presets,
+        recent_preset_apply=recent_preset_apply,
+        recent_prompt_presets=recent_prompt_presets,
+        recent_lora_presets=recent_lora_presets,
+        recent_message=recent_message,
+        status_card=status_components.card,
+        active_generation_id=status_components.active_generation_id,
+        status_poll_timer=status_components.poll_timer,
+        result_seed=result_seed,
+        result_favorite=result_favorite,
+        result_regenerate_button=result_regenerate_button,
+        result_edit_button=result_edit_button,
+        result_upscale_button=result_upscale_button,
+        result_seed_copy_button=result_seed_copy_button,
+        result_message=result_message,
     )
 
 

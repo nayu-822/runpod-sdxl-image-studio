@@ -109,6 +109,10 @@ from runpod_sdxl_image_studio.ui.components.lora_editor import (
     render_state_updates,
     update_lora_row,
 )
+from runpod_sdxl_image_studio.ui.components.mobile_actions import (
+    make_mobile_status_refresh_handler,
+)
+from runpod_sdxl_image_studio.ui.mobile_styles import mobile_ui_css
 from runpod_sdxl_image_studio.ui.tabs.drive_sync_tab import (
     build_drive_sync_tab,
     make_drive_connection_handler,
@@ -209,13 +213,7 @@ from runpod_sdxl_image_studio.ui.view_models import initial_status_markdown
 from runpod_sdxl_image_studio.workflows.loader import load_txt2img_template, load_workflow_template
 
 APP_TITLE = "RunPod SDXL Image Studio"
-APP_CSS = """
-.gradio-container { max-width: 960px !important; width: 100% !important; }
-@media (max-width: 640px) {
-  .gradio-container { padding: 0.75rem !important; }
-  button { min-height: 2.75rem; }
-}
-"""
+APP_CSS = mobile_ui_css()
 
 
 @dataclass(frozen=True)
@@ -406,6 +404,10 @@ def build_app(
         limit=app_settings.recent_settings_limit,
     )
     generation_diff_service = GenerationDiffService()
+    mobile_status_handler = make_mobile_status_refresh_handler(
+        queue_service,
+        history_service,
+    )
     with gr.Blocks(title=APP_TITLE, css=APP_CSS) as demo:
         gr.Markdown(f"# {APP_TITLE}")
         with gr.Tab("生成"):
@@ -442,6 +444,53 @@ def build_app(
             metadata_import = build_metadata_import_tab(app_settings.max_loras)
         with gr.Tab("同期・設定"):
             drive_sync = build_drive_sync_tab()
+
+        mobile_status_inputs = [
+            generation.active_generation_id,
+            generation.status_card,
+            generation.result_image,
+            generation.result_details,
+            generation.result_seed,
+            generation.result_favorite,
+        ]
+        mobile_status_outputs = [
+            generation.active_generation_id,
+            generation.status_card,
+            generation.result_image,
+            generation.result_details,
+            generation.result_seed,
+            generation.result_favorite,
+            generation.result_message,
+        ]
+        generation.status_poll_timer.tick(
+            fn=mobile_status_handler,
+            inputs=mobile_status_inputs,
+            outputs=mobile_status_outputs,
+            concurrency_limit=1,
+        )
+        demo.load(
+            fn=mobile_status_handler,
+            inputs=mobile_status_inputs,
+            outputs=mobile_status_outputs,
+            concurrency_limit=1,
+        )
+        demo.load(
+            fn=make_recent_settings_handler(recent_settings_service, preset_service),
+            inputs=[
+                generation.checkpoint_choices,
+                generation.vae_choices,
+                generation.lora_editor.choices,
+            ],
+            outputs=[
+                generation.recent_checkpoints,
+                generation.recent_vaes,
+                generation.recent_loras,
+                generation.recent_generation_presets,
+                generation.recent_prompt_presets,
+                generation.recent_lora_presets,
+                generation.recent_message,
+            ],
+        )
 
         drive_sync.refresh_button.click(
             fn=make_drive_sync_refresh_handler(drive_sync_service),
@@ -674,6 +723,16 @@ def build_app(
             inputs=[generation.size_preset],
             outputs=[generation.width, generation.height],
         )
+        generation.positive_clear_button.click(
+            fn=lambda: "",
+            outputs=[generation.positive_prompt],
+            queue=False,
+        )
+        generation.negative_clear_button.click(
+            fn=lambda: "",
+            outputs=[generation.negative_prompt],
+            queue=False,
+        )
         batch_enqueue_event = generation.batch_enqueue_button.click(
             fn=disable_batch_enqueue_button,
             outputs=[generation.batch_enqueue_button],
@@ -706,6 +765,11 @@ def build_app(
                 generation.progress,
                 generation.batch_message,
             ],
+            concurrency_limit=1,
+        ).then(
+            fn=mobile_status_handler,
+            inputs=mobile_status_inputs,
+            outputs=mobile_status_outputs,
             concurrency_limit=1,
         )
         queue_refresh.click(
@@ -1013,6 +1077,23 @@ def build_app(
                 presets.message,
             ],
         )
+        generation.recent_refresh.click(
+            fn=make_recent_settings_handler(recent_settings_service, preset_service),
+            inputs=[
+                generation.checkpoint_choices,
+                generation.vae_choices,
+                generation.lora_editor.choices,
+            ],
+            outputs=[
+                generation.recent_checkpoints,
+                generation.recent_vaes,
+                generation.recent_loras,
+                generation.recent_generation_presets,
+                generation.recent_prompt_presets,
+                generation.recent_lora_presets,
+                generation.recent_message,
+            ],
+        )
         presets.recent_checkpoint_apply.click(
             fn=make_recent_checkpoint_handler(),
             inputs=[presets.recent_checkpoints, generation.checkpoint_choices],
@@ -1022,6 +1103,16 @@ def build_app(
             fn=make_recent_vae_handler(),
             inputs=[presets.recent_vaes, generation.vae_choices],
             outputs=[generation.vae, presets.message],
+        )
+        generation.recent_checkpoint_apply.click(
+            fn=make_recent_checkpoint_handler(),
+            inputs=[generation.recent_checkpoints, generation.checkpoint_choices],
+            outputs=[generation.checkpoint, generation.recent_message],
+        )
+        generation.recent_vae_apply.click(
+            fn=make_recent_vae_handler(),
+            inputs=[generation.recent_vaes, generation.vae_choices],
+            outputs=[generation.vae, generation.recent_message],
         )
         presets.recent_lora_add.click(
             fn=make_recent_lora_add_handler(app_settings.max_loras),
@@ -1036,6 +1127,71 @@ def build_app(
                 generation.lora_editor.add_button,
                 presets.message,
             ],
+        )
+        generation.recent_lora_add.click(
+            fn=make_recent_lora_add_handler(app_settings.max_loras),
+            inputs=[
+                generation.recent_loras,
+                generation.lora_editor.state,
+                generation.lora_editor.choices,
+            ],
+            outputs=[
+                generation.lora_editor.state,
+                *component_outputs(generation.lora_editor),
+                generation.lora_editor.add_button,
+                generation.recent_message,
+            ],
+        )
+        recent_preset_apply_outputs = [
+            generation.recent_message,
+            generation.checkpoint,
+            generation.vae,
+            generation.positive_prompt,
+            generation.negative_prompt,
+            generation.width,
+            generation.height,
+            generation.seed_mode,
+            generation.seed,
+            generation.steps,
+            generation.cfg_scale,
+            generation.sampler,
+            generation.scheduler,
+            generation.lora_editor.state,
+            *component_outputs(generation.lora_editor),
+            generation.lora_editor.add_button,
+            generation.restored_from_generation,
+            generation.regeneration_valid,
+        ]
+        if len(recent_preset_apply_outputs) != preset_apply_output_count(app_settings.max_loras):
+            raise RuntimeError("最近のPreset適用イベントのoutputs数が不一致です。")
+        generation.recent_preset_apply.click(
+            fn=make_preset_apply_handler(
+                preset_service,
+                app_settings.max_loras,
+                generation.lora_editor,
+            ),
+            inputs=[
+                generation.recent_generation_presets,
+                presets.prompt_apply_mode,
+                presets.lora_apply_mode,
+                generation.positive_prompt,
+                generation.negative_prompt,
+                generation.width,
+                generation.height,
+                generation.seed_mode,
+                generation.seed,
+                generation.steps,
+                generation.cfg_scale,
+                generation.sampler,
+                generation.scheduler,
+                generation.checkpoint,
+                generation.vae,
+                generation.lora_editor.state,
+                generation.checkpoint_choices,
+                generation.vae_choices,
+                generation.lora_editor.choices,
+            ],
+            outputs=recent_preset_apply_outputs,
         )
         for recent in (
             presets.recent_generation_presets,
@@ -1588,6 +1744,11 @@ def build_app(
             queue=False,
         )
         regenerate_event = regenerate_event.then(
+            fn=lambda: None,
+            outputs=[generation.active_generation_id],
+            queue=False,
+        )
+        regenerate_event = regenerate_event.then(
             fn=make_restore_handler(history_service, app_settings.max_loras),
             inputs=[
                 history.selected,
@@ -1612,13 +1773,22 @@ def build_app(
         regeneration_generation_event.then(
             fn=enable_regeneration_button,
             outputs=[history.regenerate_button],
+        ).then(
+            fn=mobile_status_handler,
+            inputs=mobile_status_inputs,
+            outputs=mobile_status_outputs,
         )
         generate_event = generation.generate_button.click(
             fn=disable_generate_button,
             outputs=[generation.generate_button],
             queue=False,
         )
-        generate_event.then(
+        generate_event = generate_event.then(
+            fn=lambda: None,
+            outputs=[generation.active_generation_id],
+            queue=True,
+        )
+        generation_enqueue_event = generate_event.then(
             fn=make_enqueue_handler(queue_service, app_settings.max_loras),
             inputs=generation_inputs,
             outputs=[
@@ -1628,6 +1798,82 @@ def build_app(
                 generation.result_details,
                 generation.regeneration_requested,
             ],
+            concurrency_limit=1,
+        )
+        generation_enqueue_event.then(
+            fn=mobile_status_handler,
+            inputs=mobile_status_inputs,
+            outputs=mobile_status_outputs,
+            concurrency_limit=1,
+        )
+        generation.result_edit_button.click(
+            fn=make_restore_handler(history_service, app_settings.max_loras),
+            inputs=[
+                generation.active_generation_id,
+                generation.checkpoint_choices,
+                generation.vae_choices,
+                generation.lora_editor.choices,
+            ],
+            outputs=restore_outputs,
+            concurrency_limit=1,
+        )
+        generation.result_upscale_button.click(
+            fn=make_parent_selection_handler(upscale_enqueue_service),
+            inputs=[generation.active_generation_id],
+            outputs=[upscale.parent_generation_id, upscale.source_preview, upscale.status],
+            concurrency_limit=1,
+        )
+        generation.result_seed_copy_button.click(
+            fn=lambda seed: f"Seed `{seed}`をコピーできます。",
+            inputs=[generation.result_seed],
+            outputs=[generation.result_message],
+            queue=False,
+        )
+        generation.result_favorite.input(
+            fn=make_history_favorite_handler(history_service),
+            inputs=[generation.active_generation_id, generation.result_favorite],
+            outputs=[generation.result_favorite, generation.result_message],
+        )
+        result_regenerate_event = generation.result_regenerate_button.click(
+            fn=lambda: gr.Button(value="再生成中…", interactive=False),
+            outputs=[generation.result_regenerate_button],
+            queue=False,
+        )
+        result_regenerate_event = result_regenerate_event.then(
+            fn=make_restore_handler(history_service, app_settings.max_loras),
+            inputs=[
+                generation.active_generation_id,
+                generation.checkpoint_choices,
+                generation.vae_choices,
+                generation.lora_editor.choices,
+            ],
+            outputs=restore_outputs,
+            concurrency_limit=1,
+        )
+        result_regenerate_event = result_regenerate_event.then(
+            fn=lambda: None,
+            outputs=[generation.active_generation_id],
+            queue=False,
+        )
+        result_regenerate_enqueue_event = result_regenerate_event.then(
+            fn=make_enqueue_handler(queue_service, app_settings.max_loras),
+            inputs=generation_inputs,
+            outputs=[
+                generation.generate_button,
+                generation.progress,
+                generation.result_image,
+                generation.result_details,
+                generation.regeneration_requested,
+            ],
+            concurrency_limit=1,
+        )
+        result_regenerate_enqueue_event.then(
+            fn=lambda: gr.Button(value="同条件で再生成", interactive=True),
+            outputs=[generation.result_regenerate_button],
+        ).then(
+            fn=mobile_status_handler,
+            inputs=mobile_status_inputs,
+            outputs=mobile_status_outputs,
             concurrency_limit=1,
         )
     demo.generation_queue_runtime = queue_runtime

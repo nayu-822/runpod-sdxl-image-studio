@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from enum import StrEnum
+from pathlib import Path
 from typing import TypeVar
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -38,6 +39,9 @@ from runpod_sdxl_image_studio.ui.components.lora_editor import (
 )
 
 _HistoryEnum = TypeVar("_HistoryEnum", bound=StrEnum)
+_THUMBNAIL_PLACEHOLDER = (
+    Path(__file__).resolve().parents[1] / "assets" / "thumbnail_placeholder.svg"
+)
 
 
 @dataclass(frozen=True)
@@ -98,12 +102,12 @@ def enable_regeneration_button() -> gr.Button:
 
 def build_history_tab() -> HistoryTabComponents:
     gr.Markdown("## 生成履歴")
-    with gr.Accordion("高度な履歴検索", open=False):
+    with gr.Accordion("高度な履歴検索", open=False, elem_classes=["advanced-history-filter"]):
         search_text = gr.Textbox(label="検索テキスト", lines=2, max_lines=4, max_length=500)
-        with gr.Row():
+        with gr.Row(elem_classes=["history-filter"]):
             date_from_search = gr.Textbox(label="開始日（YYYY-MM-DD）")
             date_to_search = gr.Textbox(label="終了日（YYYY-MM-DD）")
-        with gr.Row():
+        with gr.Row(elem_classes=["history-filter"]):
             status_search = gr.Dropdown(
                 [(status.value, status.value) for status in GenerationStatus],
                 value=[],
@@ -116,10 +120,10 @@ def build_history_tab() -> HistoryTabComponents:
                 multiselect=True,
                 label="kind（複数可）",
             )
-        with gr.Row():
+        with gr.Row(elem_classes=["history-filter"]):
             checkpoint_search = gr.Textbox(label="checkpoint（単一指定）")
             vae_search = gr.Textbox(label="VAE（単一指定）")
-        with gr.Row():
+        with gr.Row(elem_classes=["history-filter"]):
             lora_search = gr.Textbox(label="LoRA（カンマ区切り）")
             lora_search_mode = gr.Dropdown(
                 [
@@ -129,7 +133,7 @@ def build_history_tab() -> HistoryTabComponents:
                 value=LoraSearchMode.ANY.value,
                 label="LoRA検索方式",
             )
-        with gr.Row():
+        with gr.Row(elem_classes=["history-filter"]):
             seed_search = gr.Number(label="seed", precision=0)
             width_search = gr.Number(label="幅", precision=0)
             height_search = gr.Number(label="高さ", precision=0)
@@ -147,7 +151,7 @@ def build_history_tab() -> HistoryTabComponents:
             value=GenerationHistorySort.NEWEST.value,
             label="並び順",
         )
-    with gr.Row():
+    with gr.Row(elem_classes=["history-filter"]):
         date_filter = gr.Textbox(label="日付 (YYYY-MM-DD)", placeholder="2026-07-26")
         status_filter = gr.Dropdown(
             [("すべて", "")] + [(status.value, status.value) for status in GenerationStatus],
@@ -164,23 +168,24 @@ def build_history_tab() -> HistoryTabComponents:
             value="",
             label="favorite",
         )
-    with gr.Row():
+    with gr.Row(elem_classes=["history-actions"]):
         refresh_button = gr.Button("履歴を検索", min_width=140)
         clear_button = gr.Button("検索条件をクリア")
     page_state = gr.State(1)
     cards = gr.Markdown("履歴を読み込んでください。")
     thumbnail_gallery = gr.Gallery(
         label="履歴サムネイル",
-        columns=2,
+        columns=4,
         rows=2,
         object_fit="contain",
         height="auto",
+        elem_classes=["history-gallery"],
     )
-    with gr.Row():
+    with gr.Row(elem_classes=["history-actions"]):
         previous_button = gr.Button("前へ", interactive=False)
         page = gr.Markdown("1ページ目")
         next_button = gr.Button("次へ", interactive=False)
-    selected = gr.Dropdown([], label="Generation", allow_custom_value=False)
+    selected = gr.Dropdown([], label="選択中Generation", allow_custom_value=False)
     detail = gr.Markdown("")
     image = gr.Image(label="履歴画像", type="filepath")
     seed_copy = gr.Textbox(
@@ -190,12 +195,12 @@ def build_history_tab() -> HistoryTabComponents:
     )
     favorite = gr.Checkbox(label="お気に入り")
     note = gr.Textbox(label="メモ", lines=3, max_lines=8, max_length=2000)
-    with gr.Row():
+    with gr.Row(elem_classes=["history-actions"]):
         save_note_button = gr.Button("メモを保存")
         restore_button = gr.Button("設定を生成画面へ復元")
         regenerate_button = gr.Button("同条件で再生成")
     message = gr.Markdown("")
-    with gr.Row():
+    with gr.Row(elem_classes=["history-actions"]):
         diff_button = gr.Button("親Generationとの差分")
         diff_view = gr.Markdown("")
     query_summary = gr.Markdown("検索条件: 全件")
@@ -684,16 +689,13 @@ def render_history_thumbnails(
 ) -> list[tuple[str, str]]:
     values: list[tuple[str, str]] = []
     for item in items:
-        if item.thumbnail_path is None:
-            continue
         path = service.absolute_data_path(item.thumbnail_path)
-        if path is not None:
-            values.append(
-                (
-                    str(path),
-                    f"{item.created_at_text} / {item.status_text} / seed {item.seed_text}",
-                )
-            )
+        if path is None:
+            path = _THUMBNAIL_PLACEHOLDER
+            label = f"{item.created_at_text} / サムネイル未生成 / seed {item.seed_text}"
+        else:
+            label = f"{item.created_at_text} / {item.status_text} / seed {item.seed_text}"
+        values.append((str(path), label))
     return values
 
 
