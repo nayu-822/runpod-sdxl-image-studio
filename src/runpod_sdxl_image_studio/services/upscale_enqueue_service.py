@@ -25,6 +25,10 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_reposito
 from runpod_sdxl_image_studio.adapters.database.repositories.metadata_import_repository import (
     MetadataImportRepositoryProtocol,
 )
+from runpod_sdxl_image_studio.adapters.database.repositories.upscale_settings_repository import (
+    UpscaleSettingsRepositoryError,
+    UpscaleSettingsRepositoryProtocol,
+)
 from runpod_sdxl_image_studio.adapters.storage.imported_image_storage import ImportedImageStorage
 from runpod_sdxl_image_studio.config import Settings
 from runpod_sdxl_image_studio.domain.generation import GenerationKind, GenerationStatus
@@ -74,6 +78,12 @@ _BLOCKING_METADATA_WARNINGS = frozenset(
         "metadata_import_model_catalog_unavailable",
         "metadata_import_mapping_invalid",
         "metadata_import_unresolved",
+        "metadata_import_invalid_json",
+        "metadata_import_invalid_utf8",
+        "metadata_import_unsupported_schema",
+        "metadata_import_too_large",
+        "metadata_import_parse_failed",
+        "metadata_import_png_prompt_invalid",
     }
 )
 
@@ -104,7 +114,7 @@ class UpscaleParentSelection:
 
 @dataclass(frozen=True)
 class UpscaleComparison:
-    parent_generation_id: UUID
+    parent_generation_id: UUID | None
     result_generation_id: UUID
     result_path: Path
     gallery: tuple[tuple[str, str], ...]
@@ -121,6 +131,7 @@ class UpscaleEnqueueService:
         catalog: UpscalerCatalog | None = None,
         metadata_import_repository: MetadataImportRepositoryProtocol | None = None,
         imported_image_storage: ImportedImageStorage | None = None,
+        upscale_settings_repository: UpscaleSettingsRepositoryProtocol | None = None,
         capabilities: ComfyUICapabilities | None = None,
     ) -> None:
         self._generations = generation_repository
@@ -130,6 +141,7 @@ class UpscaleEnqueueService:
         self._catalog = catalog or UpscalerCatalog.scan(settings.upscaler_dir)
         self._metadata_import_repository = metadata_import_repository
         self._imported_image_storage = imported_image_storage
+        self._upscale_settings_repository = upscale_settings_repository
         self._capabilities = capabilities
 
     def set_capabilities(self, capabilities: ComfyUICapabilities | None) -> None:
@@ -188,18 +200,47 @@ class UpscaleEnqueueService:
                 raise UpscaleEnqueueError(
                     "upscale_result_not_completed", "the upscale result is not completed"
                 )
+            result_artifact = self._artifacts.get_primary_image(generation_id)
+            if result_artifact is None:
+                raise UpscaleEnqueueError(
+                    "upscale_result_artifact_missing", "the comparison images are unavailable"
+                )
+            result = verify_source_artifact(result_artifact, self._settings)
+            if self._upscale_settings_repository is not None:
+                snapshot = self._upscale_settings_repository.get_by_generation(generation_id)
+            else:
+                snapshot = None
+            if snapshot is not None and snapshot.source_kind is UpscaleSourceKind.METADATA_IMPORT:
+                if (
+                    snapshot.source_import_id is None
+                    or self._metadata_import_repository is None
+                    or self._imported_image_storage is None
+                ):
+                    raise UpscaleEnqueueError(
+                        "upscale_result_unavailable", "the metadata import source is unavailable"
+                    )
+                imported = self._metadata_import_repository.get_by_id(snapshot.source_import_id)
+                if imported is None:
+                    raise UpscaleEnqueueError(
+                        "upscale_result_unavailable", "the metadata import source was not found"
+                    )
+                source_path = self._imported_image_storage.absolute_path(imported.imported_image)
+                return UpscaleComparison(
+                    None,
+                    generation_id,
+                    result.path,
+                    ((str(source_path), "source"), (str(result.path), "upscaled")),
+                )
             if generation.parent_generation_id is None:
                 raise UpscaleEnqueueError(
                     "upscale_parent_not_found", "the upscale parent was not found"
                 )
             parent_artifact = self._artifacts.get_primary_image(generation.parent_generation_id)
-            result_artifact = self._artifacts.get_primary_image(generation_id)
-            if parent_artifact is None or result_artifact is None:
+            if parent_artifact is None:
                 raise UpscaleEnqueueError(
                     "upscale_result_artifact_missing", "the comparison images are unavailable"
                 )
             parent = verify_source_artifact(parent_artifact, self._settings)
-            result = verify_source_artifact(result_artifact, self._settings)
             return UpscaleComparison(
                 generation.parent_generation_id,
                 generation_id,
@@ -208,7 +249,12 @@ class UpscaleEnqueueService:
             )
         except UpscaleEnqueueError:
             raise
-        except (GenerationRepositoryError, ValueError, OSError) as exc:
+        except (
+            GenerationRepositoryError,
+            UpscaleSettingsRepositoryError,
+            ValueError,
+            OSError,
+        ) as exc:
             raise UpscaleEnqueueError(
                 "upscale_result_unavailable", "the comparison images could not be read"
             ) from exc

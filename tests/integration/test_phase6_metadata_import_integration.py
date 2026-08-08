@@ -53,6 +53,12 @@ from runpod_sdxl_image_studio.adapters.database.repositories.metadata_import_rep
 from runpod_sdxl_image_studio.adapters.database.repositories.upscale_settings_repository import (
     UpscaleSettingsRepository,
 )
+from runpod_sdxl_image_studio.adapters.metadata.comfyui_prompt_metadata_adapter import (
+    parse_comfyui_prompt_metadata,
+)
+from runpod_sdxl_image_studio.adapters.metadata.sidecar_metadata_adapter import (
+    parse_sidecar_metadata,
+)
 from runpod_sdxl_image_studio.adapters.storage.imported_image_storage import ImportedImageStorage
 from runpod_sdxl_image_studio.adapters.storage.local_storage import LocalStorageAdapter
 from runpod_sdxl_image_studio.config import Settings
@@ -352,6 +358,100 @@ def test_phase6_migration_backfills_legacy_artifact_sources_without_data_loss(
         ).scalar_one() == str(job_id)
 
 
+def test_phase6_migration_repairs_legacy_ambiguous_candidates_without_auto_selecting(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "legacy-ambiguous.sqlite3"
+    config = _alembic_config(database_path)
+    command.upgrade(config, "0010_phase6_metadata_imports")
+    engine = create_image_studio_engine(
+        Settings(
+            _env_file=None,
+            environment="test",
+            data_dir=tmp_path,
+            database_url=f"sqlite:///{database_path.as_posix()}",
+        )
+    )
+    now = datetime.now(UTC)
+    import_id = uuid4()
+    source_hash = "a" * 64
+    png_candidate = parse_comfyui_prompt_metadata(_prompt_graph()).candidate
+    sidecar_payload = {
+        "schema_version": 1,
+        "settings": {
+            "positive_prompt": "sidecar candidate",
+            "negative_prompt": "blur",
+            "seed": 42,
+            "width": 512,
+            "height": 512,
+            "steps": 20,
+            "cfg_scale": 7.0,
+            "sampler_name": "euler",
+            "scheduler_name": "normal",
+            "checkpoint_name": "model.safetensors",
+            "vae_name": None,
+            "loras": [],
+        },
+    }
+    sidecar_result = parse_sidecar_metadata(json.dumps(sidecar_payload))
+    raw_metadata = json.dumps(
+        {
+            "schema_version": 1,
+            "sources": [
+                {
+                    "kind": "comfyui_prompt",
+                    "raw_text": json.dumps(_prompt_graph()),
+                    "sha256": "1" * 64,
+                },
+                sidecar_result.raw_source.model_dump(mode="json"),
+            ],
+        },
+        ensure_ascii=False,
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO metadata_imports "
+                "(id, original_filename, stored_image_path, source_image_sha256, "
+                "stored_image_sha256, image_width, image_height, image_mime_type, "
+                "metadata_source, metadata_status, raw_metadata_json, raw_metadata_sha256, "
+                "candidate_json, normalized_snapshot_json, normalized_snapshot_schema_version, "
+                "manual_mapping_json, warnings_json, created_at, updated_at) "
+                "VALUES (:id, 'legacy.png', 'imports/legacy.png', :source_hash, :source_hash, "
+                "512, 512, 'image/png', 'none', 'needs_mapping', :raw_metadata, :raw_hash, "
+                ":candidate_json, NULL, NULL, '[]', '[\"metadata_import_ambiguous\"]', "
+                ":created_at, :updated_at)"
+            ),
+            {
+                "id": str(import_id),
+                "source_hash": source_hash,
+                "raw_metadata": raw_metadata,
+                "raw_hash": "b" * 64,
+                "candidate_json": png_candidate.model_dump_json(),
+                "created_at": now,
+                "updated_at": now,
+            },
+        )
+
+    command.upgrade(config, "head")
+    with engine.connect() as connection:
+        row = connection.execute(
+            text(
+                "SELECT candidate_json, candidate_options_json, selected_metadata_source, "
+                "metadata_status FROM metadata_imports WHERE id=:id"
+            ),
+            {"id": str(import_id)},
+        ).one()
+    options = json.loads(row.candidate_options_json)
+    assert row.candidate_json is None
+    assert row.selected_metadata_source is None
+    assert row.metadata_status == "needs_mapping"
+    assert {option["source_kind"] for option in options} == {
+        "comfyui_prompt",
+        "app_sidecar",
+    }
+
+
 @pytest.mark.parametrize(
     ("method", "operation"),
     [
@@ -447,6 +547,7 @@ def test_external_upscale_runs_through_worker_with_import_provenance(
         catalog=UpscalerCatalog(("4x.pth",)),
         metadata_import_repository=metadata_repository,
         imported_image_storage=imported_storage,
+        upscale_settings_repository=UpscaleSettingsRepository(factory),
         capabilities=capabilities,
     )
     item = enqueue.enqueue_import(
@@ -588,6 +689,12 @@ def test_external_upscale_runs_through_worker_with_import_provenance(
         assert client.uploads == 0
         assert client.prompts == 0
         return
+    comparison = enqueue.comparison_for_generation(item.generation.id)
+    assert comparison.parent_generation_id is None
+    assert comparison.gallery[0][1] == "source"
+    assert comparison.gallery[1][1] == "upscaled"
+    assert Path(comparison.gallery[0][0]).exists()
+    assert Path(comparison.gallery[1][0]).exists()
     assert persisted_generation.status is GenerationStatus.COMPLETED, (
         persisted_generation.error_code,
         persisted_generation.error_summary,

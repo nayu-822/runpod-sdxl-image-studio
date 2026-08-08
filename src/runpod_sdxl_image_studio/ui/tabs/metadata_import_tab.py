@@ -267,9 +267,24 @@ def make_metadata_mapping_handler(
             preview = service.apply_model_mapping(UUID(import_id), mappings)
             return _preview_outputs(service, preview)
         except (MetadataImportError, ValueError, TypeError, json.JSONDecodeError):
+            if import_id:
+                try:
+                    preview = service.get_preview(UUID(import_id))
+                    warning = "metadata_import_mapping_invalid"
+                    preview = preview.model_copy(
+                        update={"warnings": tuple(dict.fromkeys((*preview.warnings, warning)))}
+                    )
+                    return _preview_outputs(service, preview)
+                except Exception:  # noqa: BLE001 - retain safe error fallback
+                    pass
             return _import_error_outputs()
         except Exception:  # noqa: BLE001 - UI boundary hides internal details
             logger.exception("Metadata mapping handler failed")
+            if import_id:
+                try:
+                    return _preview_outputs(service, service.get_preview(UUID(import_id)))
+                except Exception:  # noqa: BLE001 - retain safe error fallback
+                    pass
             return _import_internal_error_outputs()
 
     return handler
@@ -297,7 +312,9 @@ def _preview_outputs(
     service: MetadataImportService, preview: MetadataImportPreview
 ) -> tuple[object, ...]:
     image_path = _gradio_image_path(service, preview.id)
-    raw_text = "\n\n".join(source.raw_text for source in preview.raw_sources)
+    raw_text = "\n\n".join(
+        source.raw_text for source in preview.raw_sources if source.raw_text is not None
+    )
     settings = preview.candidate.model_dump(mode="json") if preview.candidate else {}
     source_choices = [candidate.source_kind.value for candidate in preview.candidates]
     selected_source = (
@@ -341,11 +358,11 @@ def _import_error_outputs() -> tuple[object, ...]:
         "",
         "",
         "",
-        "",
-        None,
-        False,
+        gr.Radio(choices=[], value=None, interactive=False),
+        gr.Checkbox(value=False, interactive=False),
         gr.Button(interactive=False),
         _SAFE_IMPORT_ERROR,
+        "",
         "",
         "",
         "",
@@ -362,11 +379,11 @@ def _import_internal_error_outputs() -> tuple[object, ...]:
         "",
         "",
         "",
-        "",
-        None,
-        False,
+        gr.Radio(choices=[], value=None, interactive=False),
+        gr.Checkbox(value=False, interactive=False),
         gr.Button(interactive=False),
         _SAFE_INTERNAL_ERROR,
+        "",
         "",
         "",
         "",

@@ -24,9 +24,18 @@ SUPPORTED_SIDECAR_SCHEMA_VERSION = 1
 class SidecarMetadataError(ValueError):
     """Safe parsing error carrying a stable import error code."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        raw_text: str | None = None,
+        raw_sha256: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.raw_text = raw_text
+        self.raw_sha256 = raw_sha256
 
 
 @dataclass(frozen=True)
@@ -53,22 +62,50 @@ def parse_sidecar_metadata(
     max_raw_bytes: int = 4_000_000,
 ) -> SidecarMetadataResult:
     raw_bytes = payload.encode("utf-8") if isinstance(payload, str) else bytes(payload)
+    raw_sha256 = hashlib.sha256(raw_bytes).hexdigest()
     if len(raw_bytes) > max_raw_bytes:
-        raise SidecarMetadataError("metadata_import_too_large", "sidecar exceeds the size limit")
-    raw_text = raw_bytes.decode("utf-8", errors="strict")
+        raise SidecarMetadataError(
+            "metadata_import_too_large",
+            "sidecar exceeds the size limit",
+            raw_sha256=raw_sha256,
+        )
+    try:
+        raw_text = raw_bytes.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise SidecarMetadataError(
+            "metadata_import_invalid_utf8",
+            "sidecar is not valid UTF-8",
+            raw_sha256=raw_sha256,
+        ) from exc
     try:
         parsed = json.loads(raw_text)
     except (UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise SidecarMetadataError(
-            "metadata_import_invalid_json", "sidecar JSON is invalid"
+            "metadata_import_invalid_json",
+            "sidecar JSON is invalid",
+            raw_text=raw_text,
+            raw_sha256=raw_sha256,
         ) from exc
     if not isinstance(parsed, dict):
-        raise SidecarMetadataError("metadata_import_invalid_json", "sidecar JSON must be an object")
-    parsed = migrate_import_schema_v1(parsed)
+        raise SidecarMetadataError(
+            "metadata_import_invalid_json",
+            "sidecar JSON must be an object",
+            raw_text=raw_text,
+            raw_sha256=raw_sha256,
+        )
+    try:
+        parsed = migrate_import_schema_v1(parsed)
+    except SidecarMetadataError as exc:
+        raise SidecarMetadataError(
+            exc.code,
+            str(exc),
+            raw_text=raw_text,
+            raw_sha256=raw_sha256,
+        ) from exc
     raw_source = MetadataRawSource(
         kind=MetadataSourceKind.APP_SIDECAR,
         raw_text=raw_text,
-        sha256=hashlib.sha256(raw_bytes).hexdigest(),
+        sha256=raw_sha256,
     )
     warnings: list[str] = []
     image = parsed.get("image")

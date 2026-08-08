@@ -64,8 +64,20 @@ class ImportedImageStorage:
         timestamp = created_at or datetime.now(UTC)
         local_date = timestamp.astimezone(self._timezone).date().isoformat()
         relative_path = Path("imports") / local_date / "images" / f"{image_id}.png"
-        target = self._settings.data_dir / relative_path
-        target.parent.mkdir(parents=True, exist_ok=True)
+        data_root, safe_parent = _prepare_safe_directory(
+            self._settings.data_dir, relative_path.parent
+        )
+        target = safe_parent / relative_path.name
+        try:
+            target.resolve(strict=False).relative_to(data_root)
+        except (OSError, ValueError) as exc:
+            raise ImportedImageStorageError(
+                "metadata_import_storage_failed", "import image path is outside the data root"
+            ) from exc
+        if target.is_symlink() or target.exists():
+            raise ImportedImageStorageError(
+                "metadata_import_storage_failed", "import image already exists"
+            )
         temporary: Path | None = None
         try:
             with NamedTemporaryFile(
@@ -76,11 +88,12 @@ class ImportedImageStorage:
                 file.flush()
                 os.fsync(file.fileno())
             os.link(temporary, target)
+            target.resolve(strict=True).relative_to(data_root)
         except FileExistsError as exc:
             raise ImportedImageStorageError(
                 "metadata_import_storage_failed", "import image already exists"
             ) from exc
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             raise ImportedImageStorageError(
                 "metadata_import_storage_failed", "import image could not be stored"
             ) from exc
@@ -245,6 +258,43 @@ def _safe_relative_path(value: str) -> Path:
             "metadata_import_source_changed", "imported image path is unsafe"
         )
     return Path(*normalized.split("/"))
+
+
+def _prepare_safe_directory(data_dir: Path, relative: Path) -> tuple[Path, Path]:
+    """Create a relative directory while rejecting symlink escapes."""
+
+    try:
+        data_root = data_dir.resolve()
+        data_root.mkdir(parents=True, exist_ok=True)
+        if not data_root.is_dir():
+            raise OSError("configured data root is not a directory")
+        current = data_root
+        for component in relative.parts:
+            candidate = current / component
+            if candidate.is_symlink():
+                resolved = candidate.resolve(strict=True)
+                resolved.relative_to(data_root)
+                if not resolved.is_dir():
+                    raise OSError("storage parent is not a directory")
+                current = resolved
+                continue
+            if candidate.exists():
+                if not candidate.is_dir():
+                    raise OSError("storage parent is not a directory")
+                resolved = candidate.resolve(strict=True)
+                resolved.relative_to(data_root)
+                current = resolved
+                continue
+            candidate.mkdir()
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(data_root)
+            current = resolved
+        current.resolve(strict=True).relative_to(data_root)
+        return data_root, current
+    except (OSError, ValueError) as exc:
+        raise ImportedImageStorageError(
+            "metadata_import_storage_failed", "import image storage path is unsafe"
+        ) from exc
 
 
 __all__ = ["ImportedImageStorage", "ImportedImageStorageError"]

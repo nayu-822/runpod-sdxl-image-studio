@@ -352,8 +352,7 @@ def _external_vae(
         if node.get("class_type") == "VAEDecode"
         and _link(_inputs(node).get("samples")) == (sampler_id, 0)
     ]
-    decoders = [node_id for node_id, node in nodes.items() if node.get("class_type") == "VAEDecode"]
-    if len(decoders) != 1 or len(matches) != 1:
+    if len(matches) != 1:
         return _UNRESOLVED
     vae_ref = _link(_inputs(nodes[matches[0]]).get("vae"))
     if vae_ref is None:

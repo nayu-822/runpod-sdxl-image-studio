@@ -449,7 +449,7 @@ capability不足時のfailed確定、再起動後のhistory復旧、誤寸法出
 
 フェーズ6を実装済みです。PNG/WebPの安全な検証とcanonical PNG保存、SHA-256・寸法・形式の記録、ComfyUI既知prompt graphと
 本アプリsidecar schema v1の候補解析、raw metadata保持、未解決項目のpreview、明示的なmodel mapping、SQLite `metadata_imports`
-repository、0010/0011 migrationを追加しました。workflow metadataはraw-onlyで保持し、実行・eval・exec・pickle・shellは行いません。
+repository、0010/0011/0012 migrationを追加しました。workflow metadataはraw-onlyで保持し、実行・eval・exec・pickle・shellは行いません。sidecarのmalformed JSON、invalid UTF-8、unsupported schemaはcanonical画像保存と分離し、画像upscaleだけを許可します。保存先のparent symlinkはdata root外への解決を拒否し、legacy ambiguous rowはraw sourceから候補を再構築して自動選択しません。
 
 previewからの生成条件適用は明示操作に限定し、外部画像はmetadataなしでも画像アップスケールへ利用できます。Latentアップスケールは
 完全に解決済みのGenerationSettingsだけを受け付け、Queue投入を既存のSQLite transactionへ接続しました。sidecarのprompt空白、LoRAの

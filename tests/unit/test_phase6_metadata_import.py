@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 from uuid import UUID
@@ -61,16 +62,18 @@ from runpod_sdxl_image_studio.services.upscale_enqueue_service import (
 )
 from runpod_sdxl_image_studio.ui.tabs.metadata_import_tab import (
     make_metadata_import_handler,
+    make_metadata_mapping_handler,
     make_metadata_source_selection_handler,
 )
 
 
-def _settings(tmp_path: Path) -> Settings:
+def _settings(tmp_path: Path, *, max_metadata_sidecar_bytes: int = 4_000_000) -> Settings:
     return Settings(
         _env_file=None,
         environment="test",
         data_dir=tmp_path,
         database_url=f"sqlite:///{(tmp_path / 'image-studio.sqlite3').as_posix()}",
+        max_metadata_sidecar_bytes=max_metadata_sidecar_bytes,
     )
 
 
@@ -167,10 +170,13 @@ def _sidecar_settings(**overrides: object) -> dict[str, object]:
 
 
 def _service(
-    tmp_path: Path, capabilities: ComfyUICapabilities | None = None
+    tmp_path: Path,
+    capabilities: ComfyUICapabilities | None = None,
+    *,
+    max_metadata_sidecar_bytes: int = 4_000_000,
 ) -> tuple[MetadataImportService, MetadataImportRepository, ImportedImageStorage]:
     tmp_path.mkdir(parents=True, exist_ok=True)
-    settings = _settings(tmp_path)
+    settings = _settings(tmp_path, max_metadata_sidecar_bytes=max_metadata_sidecar_bytes)
     engine = create_engine(settings.database_url or "sqlite:///:memory:")
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
@@ -295,6 +301,165 @@ def test_external_image_is_canonicalized_and_raw_known_metadata_is_retained(tmp_
     assert any(source.kind.value == "workflow" for source in record.raw_sources)
     assert storage.absolute_path(record.imported_image).exists()
     assert storage.absolute_path(record.imported_image).read_bytes() != payload
+
+
+def _make_directory_symlink(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+
+@pytest.mark.parametrize("symlink_level", ["imports", "images"])
+def test_import_storage_rejects_symlink_escape_before_writing(
+    tmp_path: Path, symlink_level: str
+) -> None:
+    service, repository, storage = _service(tmp_path, _capabilities())
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if symlink_level == "imports":
+        _make_directory_symlink(tmp_path / "imports", outside)
+    else:
+        (tmp_path / "imports" / "2025-01-02").mkdir(parents=True)
+        _make_directory_symlink(tmp_path / "imports" / "2025-01-02" / "images", outside)
+
+    with pytest.raises(ImportedImageStorageError) as error:
+        service.import_image(_png(), "outside.png")
+
+    assert error.value.code == "metadata_import_storage_failed"
+    assert not list(outside.glob("*.png"))
+    assert repository.list_recent() == ()
+    assert storage.data_dir == tmp_path
+
+
+def test_import_storage_allows_symlink_that_resolves_inside_data_root(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    storage = ImportedImageStorage(settings)
+    internal = tmp_path / "internal-images"
+    internal.mkdir()
+    (tmp_path / "imports" / "2025-01-02").mkdir(parents=True)
+    _make_directory_symlink(tmp_path / "imports" / "2025-01-02" / "images", internal)
+
+    imported = storage.store(_png(), "internal.png", created_at=datetime(2025, 1, 2, tzinfo=UTC))
+
+    assert (internal / f"{imported.id}.png").exists()
+    assert storage.verify(imported).id == imported.id
+
+
+@pytest.mark.parametrize(
+    "sidecar_bytes",
+    [
+        b"{malformed",
+        b"\xff\xfe\x00\x01",
+        json.dumps({"schema_version": 99, "settings": {}}).encode("utf-8"),
+    ],
+)
+def test_invalid_sidecar_does_not_cancel_canonical_image_import(
+    tmp_path: Path, sidecar_bytes: bytes
+) -> None:
+    service, repository, storage = _service(tmp_path, _capabilities())
+
+    preview = service.import_image(_png(), "invalid-sidecar.png", sidecar_bytes=sidecar_bytes)
+    record = repository.get_by_id(preview.id)
+
+    assert record is not None
+    assert preview.status is MetadataImportStatus.INVALID_METADATA
+    assert storage.absolute_path(record.imported_image).exists()
+    assert any(source.kind is MetadataSourceKind.APP_SIDECAR for source in record.raw_sources)
+    assert any(
+        warning in preview.warnings
+        for warning in (
+            "metadata_import_invalid_json",
+            "metadata_import_invalid_utf8",
+            "metadata_import_unsupported_schema",
+        )
+    )
+    with pytest.raises(MetadataImportError):
+        service.build_generation_settings(preview.id)
+
+
+def test_invalid_sidecar_allows_image_upscale_but_rejects_latent_upscale(tmp_path: Path) -> None:
+    service, metadata_repository, storage = _service(tmp_path, _capabilities())
+    preview = service.import_image(_png(), sidecar_bytes=b"not-json")
+    settings = _settings(tmp_path)
+    engine = create_engine(settings.database_url or "sqlite:///:memory:")
+    factory = create_session_factory(engine)
+    dispatch = GenerationDispatchQueueRepository(factory)
+    enqueue = UpscaleEnqueueService(
+        GenerationRepository(factory),
+        GenerationArtifactRepository(factory),
+        dispatch,
+        settings,
+        catalog=UpscalerCatalog(("4x.pth",)),
+        metadata_import_repository=metadata_repository,
+        imported_image_storage=storage,
+        capabilities=_capabilities(),
+    )
+
+    image_item = enqueue.enqueue_import(
+        preview.id,
+        UpscaleSettings(
+            method=UpscaleMethod.IMAGE,
+            sizing_mode=UpscaleSizingMode.FACTOR,
+            scale_factor=2,
+            upscaler_name="4x.pth",
+        ),
+    )
+    assert image_item.generation.parent_generation_id is None
+    with pytest.raises(UpscaleEnqueueError) as error:
+        enqueue.enqueue_import(
+            preview.id,
+            UpscaleSettings(
+                method=UpscaleMethod.LATENT,
+                sizing_mode=UpscaleSizingMode.FACTOR,
+                scale_factor=2,
+                denoise=0.35,
+            ),
+        )
+    assert error.value.code == "metadata_import_unresolved"
+
+
+def test_invalid_png_prompt_is_distinguished_from_missing_metadata(tmp_path: Path) -> None:
+    output = BytesIO()
+    metadata = PngImagePlugin.PngInfo()
+    metadata.add_text("prompt", "{malformed")
+    Image.new("RGB", (512, 512), "white").save(output, format="PNG", pnginfo=metadata)
+    service, repository, storage = _service(tmp_path, _capabilities())
+
+    preview = service.import_image(output.getvalue(), "invalid-prompt.png")
+    record = repository.get_by_id(preview.id)
+
+    assert record is not None
+    assert preview.status is MetadataImportStatus.INVALID_METADATA
+    assert "metadata_import_png_prompt_invalid" in preview.warnings
+    assert any(
+        source.kind is MetadataSourceKind.COMFYUI_PROMPT and source.raw_text == "{malformed"
+        for source in record.raw_sources
+    )
+    assert storage.absolute_path(record.imported_image).exists()
+
+
+def test_oversized_sidecar_keeps_hash_warning_without_storing_raw_text(tmp_path: Path) -> None:
+    service, repository, storage = _service(
+        tmp_path,
+        _capabilities(),
+        max_metadata_sidecar_bytes=16,
+    )
+    sidecar_bytes = b"x" * 17
+
+    preview = service.import_image(_png(), sidecar_bytes=sidecar_bytes)
+    record = repository.get_by_id(preview.id)
+
+    assert record is not None
+    assert preview.status is MetadataImportStatus.INVALID_METADATA
+    assert "metadata_import_too_large" in preview.warnings
+    sidecar_sources = [
+        source for source in record.raw_sources if source.kind is MetadataSourceKind.APP_SIDECAR
+    ]
+    assert len(sidecar_sources) == 1
+    assert sidecar_sources[0].raw_text is None
+    assert sidecar_sources[0].sha256 == hashlib.sha256(sidecar_bytes).hexdigest()
+    assert storage.absolute_path(record.imported_image).exists()
 
 
 def test_png_sidecar_conflict_requires_persisted_source_selection_and_hash_confirmation(
@@ -552,7 +717,15 @@ def test_comfy_parser_rejects_other_vae_branch_and_malformed_connection() -> Non
         "inputs": {"samples": ["4", 0], "vae": ["1", 2]},
     }
     parsed = parse_comfyui_prompt_metadata(graph)
-    assert "vae" in parsed.unresolved_fields
+    assert "vae" not in parsed.unresolved_fields
+
+    duplicate_target = _prompt_graph()
+    duplicate_target["9"] = {
+        "class_type": "VAEDecode",
+        "inputs": {"samples": ["5", 0], "vae": ["1", 2]},
+    }
+    duplicate_result = parse_comfyui_prompt_metadata(duplicate_target)
+    assert "vae" in duplicate_result.unresolved_fields
 
     malformed = _prompt_graph()
     malformed["5"]["inputs"]["model"] = ["1"]  # type: ignore[index]
@@ -677,6 +850,8 @@ def test_metadata_import_ui_reenables_parse_after_success_and_failure(tmp_path: 
     failure = handler(None, None)
     assert len(failure) == 16
     assert failure[0] is None
+    assert failure[7].interactive is False
+    assert "image" in failure[8] or "metadata" in failure[8]
     assert failure[13].interactive is False
     assert failure[14].interactive is False
     assert failure[15].interactive is True
@@ -703,3 +878,17 @@ def test_metadata_source_selection_error_preserves_preview_and_parse_state(
     assert selected[13].interactive is True
     assert selected[14].interactive is True
     assert selected[15].interactive is True
+
+
+def test_metadata_mapping_error_preserves_preview_and_parse_state(tmp_path: Path) -> None:
+    service, _, _ = _service(tmp_path, _capabilities())
+    preview = service.import_image(_png(prompt=_prompt_graph()))
+    handler = make_metadata_mapping_handler(service)
+
+    failed = handler(str(preview.id), "{malformed")
+
+    assert len(failed) == 16
+    assert failed[0] == str(preview.id)
+    assert failed[1] is not None
+    assert "metadata_import_mapping_invalid" in failed[9]
+    assert failed[15].interactive is True

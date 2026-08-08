@@ -56,12 +56,14 @@ class MetadataRawSource(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     kind: MetadataSourceKind
-    raw_text: str
+    raw_text: str | None = None
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @field_validator("raw_text")
     @classmethod
-    def validate_raw_text_size(cls, value: str) -> str:
+    def validate_raw_text_size(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         if len(value.encode("utf-8")) > MAX_METADATA_RAW_BYTES:
             raise ValueError("raw metadata exceeds the UTF-8 byte limit")
         return value

@@ -270,6 +270,7 @@ def build_app(
         catalog=upscale_catalog,
         metadata_import_repository=metadata_import_repository,
         imported_image_storage=imported_image_storage,
+        upscale_settings_repository=upscale_settings_repository,
     )
 
     def set_phase6_capabilities(capabilities: ComfyUICapabilities | None) -> None:

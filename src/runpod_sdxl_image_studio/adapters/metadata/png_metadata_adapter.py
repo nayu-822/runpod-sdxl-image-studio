@@ -59,7 +59,9 @@ def parse_png_metadata(
             try:
                 parsed = source_value if isinstance(source_value, dict) else json.loads(raw_text)
             except (TypeError, ValueError, json.JSONDecodeError):
-                warnings.append("metadata_import_parse_failed")
+                warnings.extend(
+                    ("metadata_import_parse_failed", "metadata_import_png_prompt_invalid")
+                )
                 continue
             if isinstance(parsed, dict):
                 prompt = parsed

@@ -43,6 +43,16 @@ from runpod_sdxl_image_studio.domain.metadata_import import (
 
 logger = logging.getLogger(__name__)
 
+_INVALID_METADATA_WARNINGS = frozenset(
+    {
+        "metadata_import_invalid_json",
+        "metadata_import_invalid_utf8",
+        "metadata_import_unsupported_schema",
+        "metadata_import_too_large",
+        "metadata_import_parse_failed",
+        "metadata_import_png_prompt_invalid",
+    }
+)
 _BLOCKING_WARNINGS = frozenset(
     {
         "metadata_import_sidecar_hash_mismatch",
@@ -52,6 +62,7 @@ _BLOCKING_WARNINGS = frozenset(
         "metadata_import_mapping_invalid",
         "metadata_import_unresolved",
     }
+    | _INVALID_METADATA_WARNINGS
 )
 _CAPABILITY_WARNINGS = frozenset(
     {
@@ -119,20 +130,25 @@ class MetadataImportService:
                 image_bytes,
                 max_raw_bytes=self._settings.max_metadata_raw_bytes,
             )
-            sidecar_result = (
-                parse_sidecar_metadata(
-                    sidecar_bytes,
-                    source_image_sha256=imported.source_image_sha256,
-                    max_raw_bytes=self._settings.max_metadata_sidecar_bytes,
-                )
-                if sidecar_bytes is not None
-                else None
-            )
             warnings: list[str] = [*png_result.warnings]
             raw_sources: list[MetadataRawSource] = [*png_result.raw_sources]
+            sidecar_result = None
+            sidecar_error_source: MetadataRawSource | None = None
+            if sidecar_bytes is not None:
+                try:
+                    sidecar_result = parse_sidecar_metadata(
+                        sidecar_bytes,
+                        source_image_sha256=imported.source_image_sha256,
+                        max_raw_bytes=self._settings.max_metadata_sidecar_bytes,
+                    )
+                except SidecarMetadataError as exc:
+                    warnings.append(exc.code)
+                    sidecar_error_source = _sidecar_error_source(exc, sidecar_bytes)
             if sidecar_result is not None:
                 raw_sources.append(sidecar_result.raw_source)
                 warnings.extend(sidecar_result.warnings)
+            elif sidecar_error_source is not None:
+                raw_sources.append(sidecar_error_source)
 
             candidates: list[MetadataImportCandidate] = []
             if png_result.prompt is not None:
@@ -151,15 +167,16 @@ class MetadataImportService:
             candidate_warnings = candidate.warnings if candidate is not None else ()
             all_warnings = tuple(dict.fromkeys((*warnings, *candidate_warnings)))
             status = _status_for(candidate, all_warnings)
+            selection_blocked = bool(
+                set(all_warnings)
+                & (_INVALID_METADATA_WARNINGS | {"metadata_import_sidecar_hash_mismatch"})
+            )
             record = MetadataImportRecord(
                 id=imported.id,
                 imported_image=imported,
                 metadata_source=source_kind,
                 selected_metadata_source=(
-                    source_kind
-                    if candidate is not None
-                    and "metadata_import_sidecar_hash_mismatch" not in all_warnings
-                    else None
+                    source_kind if candidate is not None and not selection_blocked else None
                 ),
                 metadata_status=status,
                 raw_sources=tuple(raw_sources),
@@ -497,6 +514,18 @@ def _same_import_inputs(
     return existing_sidecars[0].sha256 == hashlib.sha256(raw_bytes).hexdigest()
 
 
+def _sidecar_error_source(
+    error: SidecarMetadataError,
+    payload: bytes | str | bytearray,
+) -> MetadataRawSource:
+    raw_bytes = payload.encode("utf-8") if isinstance(payload, str) else bytes(payload)
+    return MetadataRawSource(
+        kind=MetadataSourceKind.APP_SIDECAR,
+        raw_text=error.raw_text,
+        sha256=error.raw_sha256 or hashlib.sha256(raw_bytes).hexdigest(),
+    )
+
+
 def _candidate_for_source(
     record: MetadataImportRecord,
     source_kind: MetadataSourceKind,
@@ -559,6 +588,8 @@ def _status_for(
     candidate: MetadataImportCandidate | None,
     warnings: Sequence[str],
 ) -> MetadataImportStatus:
+    if set(warnings) & _INVALID_METADATA_WARNINGS:
+        return MetadataImportStatus.INVALID_METADATA
     if candidate is None:
         if "metadata_import_ambiguous" in warnings:
             return MetadataImportStatus.NEEDS_MAPPING
