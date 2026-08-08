@@ -306,11 +306,12 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 
 ### 実装状況
 
-フェーズ7を実装済みです。rcloneの引数配列Adapter、SQLiteの`drive_sync_records`／`drive_sync_jobs`、
+フェーズ7を実装済みです。rcloneの引数配列Adapter、SQLiteの`drive_sync_records`／`drive_sync_jobs`／`drive_manifest_jobs`、
 単一Workerのlease・heartbeat・stale復旧、生成完了後のenqueue、起動時のbounded discovery、手動retry／resync、
-Asia/Tokyoの日付別manifest、ローカル容量・未同期容量・削除候補表示、同期・設定UIを追加しました。
+Asia/Tokyoの日付別manifest、destination snapshot、転送中progress/PID/log、ローカル容量・未同期容量・削除候補表示、同期・設定UIを追加しました。
 画像とsidecar JSONは検証後に`copyto`で順に保存し、partial failureでもローカルを削除しません。
 `rclone sync`、remote削除、複数Worker、自動retry、Driveからのdownloadは実装していません。
+0014はmanifest再構築要求の追加だけを行い、0013以前のGeneration／Artifact／MetadataImportデータを変更しません。
 
 ## フェーズ8: モバイル UI 改善
 

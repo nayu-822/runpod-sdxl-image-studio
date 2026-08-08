@@ -15,6 +15,7 @@ from runpod_sdxl_image_studio.adapters.database.repositories.drive_sync_reposito
 )
 from runpod_sdxl_image_studio.config import Settings
 from runpod_sdxl_image_studio.domain.drive_sync import (
+    DriveManifestJob,
     DriveSyncErrorCode,
     DriveSyncJob,
 )
@@ -123,7 +124,7 @@ class DriveSyncWorker:
             logger.warning("drive sync job claim failed", exc_info=True)
             return False
         if job is None:
-            return False
+            return await self._run_manifest_once()
         heartbeat = asyncio.create_task(self._heartbeat(job.id))
         try:
             await self._service.process_job(job, self.worker_id)
@@ -148,6 +149,38 @@ class DriveSyncWorker:
                 await heartbeat
         return True
 
+    async def _run_manifest_once(self) -> bool:
+        if self._stop_requested.is_set():
+            return False
+        try:
+            job = self._repository.claim_next_manifest(
+                self.worker_id,
+                lease_seconds=self._settings.drive_sync_lease_seconds,
+            )
+        except DriveSyncRepositoryError:
+            logger.warning("drive manifest job claim failed", exc_info=True)
+            return False
+        if job is None:
+            return False
+        heartbeat = asyncio.create_task(self._manifest_heartbeat(job.id))
+        try:
+            await self._service.process_manifest_job(job, self.worker_id)
+        except DriveSyncServiceError as exc:
+            self._mark_manifest_failed(job, exc.code, str(exc), retryable=exc.retryable)
+        except Exception:  # noqa: BLE001 - one manifest failure must not stop the worker
+            logger.error("drive manifest job failed job=%s", job.id, exc_info=True)
+            self._mark_manifest_failed(
+                job,
+                DriveSyncErrorCode.MANIFEST_FAILED.value,
+                "Drive manifest rebuild failed",
+                retryable=True,
+            )
+        finally:
+            heartbeat.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat
+        return True
+
     async def _heartbeat(self, job_id: UUID) -> None:
         while True:
             await asyncio.sleep(self._settings.drive_sync_heartbeat_seconds)
@@ -159,6 +192,18 @@ class DriveSyncWorker:
                 )
             except DriveSyncRepositoryError:
                 logger.warning("drive sync lease renewal failed", exc_info=True)
+
+    async def _manifest_heartbeat(self, job_id: UUID) -> None:
+        while True:
+            await asyncio.sleep(self._settings.drive_sync_heartbeat_seconds)
+            try:
+                self._repository.renew_manifest_lease(
+                    job_id,
+                    self.worker_id,
+                    lease_seconds=self._settings.drive_sync_lease_seconds,
+                )
+            except DriveSyncRepositoryError:
+                logger.warning("drive manifest lease renewal failed", exc_info=True)
 
     def _mark_failed(
         self,
@@ -178,6 +223,25 @@ class DriveSyncWorker:
             )
         except DriveSyncRepositoryError:
             logger.warning("drive sync failure could not be persisted", exc_info=True)
+
+    def _mark_manifest_failed(
+        self,
+        job: DriveManifestJob,
+        error_code: str,
+        error_summary: str,
+        *,
+        retryable: bool,
+    ) -> None:
+        try:
+            self._repository.mark_manifest_failed(
+                job.id,
+                self.worker_id,
+                error_code,
+                error_summary,
+                retryable=retryable,
+            )
+        except DriveSyncRepositoryError:
+            logger.warning("drive manifest failure could not be persisted", exc_info=True)
 
 
 class DriveSyncRuntime:

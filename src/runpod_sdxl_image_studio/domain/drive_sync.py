@@ -39,6 +39,19 @@ class DriveSyncErrorCode(StrEnum):
     STALE = "drive_sync_stale"
     PERSISTENCE_FAILED = "drive_persistence_failed"
     MANIFEST_FAILED = "drive_manifest_failed"
+    DESTINATION_CHANGED = "drive_destination_changed"
+
+
+@dataclass(frozen=True)
+class DriveDestination:
+    """Immutable rclone destination captured when work is queued."""
+
+    remote_name: str
+    base_path: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "remote_name", validate_remote_name(self.remote_name))
+        object.__setattr__(self, "base_path", validate_remote_base_path(self.base_path))
 
 
 @dataclass(frozen=True)
@@ -105,6 +118,39 @@ class DriveSyncJob:
     metadata_size_bytes: int | None
     created_at: datetime
     updated_at: datetime
+
+
+@dataclass(frozen=True)
+class DriveManifestJob:
+    """Durable request for rebuilding and uploading one destination manifest."""
+
+    id: UUID
+    local_date: str
+    status: DriveSyncStatus
+    remote_name: str
+    remote_base_path: str
+    remote_manifest_path: str
+    queue_sequence: int
+    progress_bytes: int
+    total_bytes: int
+    progress_percentage: float
+    current_artifact: str | None
+    worker_id: str | None
+    pid: int | None
+    claimed_at: datetime | None
+    lease_expires_at: datetime | None
+    started_at: datetime | None
+    completed_at: datetime | None
+    error_code: str | None
+    error_summary: str | None
+    retryable: bool
+    log_path: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    @property
+    def destination(self) -> DriveDestination:
+        return DriveDestination(self.remote_name, self.remote_base_path)
 
 
 @dataclass(frozen=True)
@@ -215,6 +261,8 @@ __all__ = [
     "DriveCacheCandidate",
     "DriveCapacity",
     "DriveConnectionResult",
+    "DriveDestination",
+    "DriveManifestJob",
     "DriveConnectionStatus",
     "DriveRemotePaths",
     "DriveSyncErrorCode",

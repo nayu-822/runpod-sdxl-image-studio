@@ -29,6 +29,8 @@ class DriveSyncTabComponents:
     retry_failed_button: gr.Button
     resync_button: gr.Button
     manifest_button: gr.Button
+    failed_manifest_button: gr.Button
+    manifest_date: gr.Textbox
     selected_job: gr.Dropdown
     connection_status: gr.Markdown
     summary: gr.Markdown
@@ -49,7 +51,12 @@ def build_drive_sync_tab() -> DriveSyncTabComponents:
         retry_selected_button = gr.Button("選択を再試行")
         retry_failed_button = gr.Button("失敗を再試行")
         resync_button = gr.Button("同期済みを再同期")
-        manifest_button = gr.Button("Manifest再構築")
+        manifest_button = gr.Button("Manifest再構築を登録")
+        failed_manifest_button = gr.Button("失敗日付を再構築")
+    manifest_date = gr.Textbox(
+        label="Manifest日付 (YYYY-MM-DD、空欄は今日)",
+        placeholder="2026-08-08",
+    )
     jobs = gr.Markdown("")
     message = gr.Markdown("")
     return DriveSyncTabComponents(
@@ -60,6 +67,8 @@ def build_drive_sync_tab() -> DriveSyncTabComponents:
         retry_failed_button=retry_failed_button,
         resync_button=resync_button,
         manifest_button=manifest_button,
+        failed_manifest_button=failed_manifest_button,
+        manifest_date=manifest_date,
         selected_job=selected_job,
         connection_status=connection_status,
         summary=summary,
@@ -161,13 +170,26 @@ def make_drive_resync_handler(
 
 def make_drive_manifest_handler(
     service: DriveSyncService,
-) -> Callable[[], Awaitable[tuple[object, str]]]:
-    async def handler() -> tuple[object, str]:
+) -> Callable[[str | None], tuple[object, str]]:
+    def handler(local_date: str | None = None) -> tuple[object, str]:
         try:
-            await service.rebuild_manifest_async()
-            return gr.Button(interactive=True), "Manifestを再構築しました"
+            service.enqueue_manifest_rebuild(local_date or None)
+            return gr.Button(interactive=True), "Manifest再構築をWorkerへ登録しました"
         except Exception:
-            return gr.Button(interactive=True), "Manifestの再構築に失敗しました"
+            return gr.Button(interactive=True), "Manifest再構築の登録に失敗しました"
+
+    return handler
+
+
+def make_drive_failed_manifest_handler(
+    service: DriveSyncService,
+) -> Callable[[], tuple[object, str]]:
+    def handler() -> tuple[object, str]:
+        try:
+            count = len(service.retry_failed_manifests())
+            return gr.Button(interactive=True), f"{count}件の失敗日付を再構築キューへ登録しました"
+        except Exception:
+            return gr.Button(interactive=True), "失敗manifestの再構築登録に失敗しました"
 
     return handler
 
@@ -178,6 +200,11 @@ def render_drive_sync_outputs(
     counts = service.status_counts()
     capacity = service.capacity()
     jobs = service.list_jobs(50)
+    manifest_jobs = service.list_manifest_jobs(50)
+    manifest_failures = service.list_manifest_failure_targets(100)
+    failure_dates = (
+        ", ".join(sorted({target.local_date for target in manifest_failures})[:10]) or "-"
+    )
     choices = [
         (f"{job.status.value} / {job.generation_id}", str(job.generation_id)) for job in jobs
     ]
@@ -190,6 +217,8 @@ def render_drive_sync_outputs(
         f"空き容量: {_bytes(capacity.free_bytes)} / "
         f"未同期: {_bytes(capacity.unsynced_bytes)} / "
         f"同期済みキャッシュ候補: {_bytes(capacity.synced_cache_bytes)}"
+        f"\n\nmanifest失敗: {len(manifest_failures)}件"
+        f" / 対象日付: {failure_dates}"
     )
     lines = ["| 状態 | Generation | 進捗 | エラー |", "|---|---|---:|---|"]
     for job in jobs:
@@ -197,6 +226,12 @@ def render_drive_sync_outputs(
         lines.append(
             f"| `{job.status.value}` | `{job.generation_id}` | "
             f"{job.progress_percentage:.1f}% | `{error}` |"
+        )
+    for manifest_job in manifest_jobs[:10]:
+        lines.append(
+            f"| `manifest:{manifest_job.status.value}` | `{manifest_job.local_date}` | "
+            f"{manifest_job.progress_percentage:.1f}% | `{manifest_job.error_code or '-'}:` "
+            f"{manifest_job.remote_name}:{manifest_job.remote_base_path} |"
         )
     return choices, summary, "\n".join(lines)
 
@@ -227,6 +262,7 @@ __all__ = [
     "make_drive_connection_handler",
     "make_drive_discovery_handler",
     "make_drive_manifest_handler",
+    "make_drive_failed_manifest_handler",
     "make_drive_resync_handler",
     "make_drive_retry_failed_handler",
     "make_drive_retry_selected_handler",

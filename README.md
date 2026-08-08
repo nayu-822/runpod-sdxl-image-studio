@@ -466,12 +466,15 @@ source選択の候補と確認状態は `0011_phase6_metadata_source_selection` 
 ## Phase 7: Google Drive保存・再同期・容量可視化
 
 「同期・設定」タブからrclone接続確認、未同期Generationの検出、失敗Jobの手動再試行、同期済みの明示的な再同期、
-manifest再構築、ローカル容量と未同期容量を確認できます。Google Driveが未設定でも生成・履歴・ローカル保存は継続します。
+manifest再構築要求、ローカル容量と未同期容量を確認できます。manifest転送も独立したWorker Jobとして処理され、失敗した日付を再構築できます。
+Google Driveが未設定でも生成・履歴・ローカル保存は継続します。
 
 同期対象はcompleted Generationの主画像とsidecar JSONです。Asia/Tokyoの日付で`generated/`または`upscaled/`へ保存し、
 画像・JSONの両方が成功した後にSQLiteのSyncRecordを`synced`へ確定します。転送はrclone `copyto`だけを使い、
 同期失敗時もローカルファイルとremote上の既存ファイルを削除しません。日次JSONL manifestは同期済みDB行から決定的に再構築します。
 `RCLONE_CONFIG`はrcloneの引数へだけ渡し、DB・UI・manifest・ログへ保存しません。
+同期Jobにはenqueue時点のremote名・base pathを保存し、起動後の設定変更で既存pending Jobの送信先が変わらないようにしています。
+接続確認timeoutとファイル転送timeoutは分離し、転送中はWorkerのlease heartbeatとrclone statsで進捗を更新します。
 
 Phase 7 migration確認:
 

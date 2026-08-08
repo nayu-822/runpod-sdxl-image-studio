@@ -186,6 +186,9 @@ class Settings(BaseSettings):
     rclone_connection_timeout_seconds: float = Field(
         20.0, validation_alias="IMAGE_STUDIO_RCLONE_CONNECTION_TIMEOUT_SECONDS"
     )
+    rclone_transfer_timeout_seconds: float | None = Field(
+        None, validation_alias="IMAGE_STUDIO_RCLONE_TRANSFER_TIMEOUT_SECONDS"
+    )
 
     @field_validator("rclone_remote")
     @classmethod
@@ -305,6 +308,13 @@ class Settings(BaseSettings):
         if value <= 0:
             raise ValueError("queue timing values must be greater than zero")
         return value
+
+    @field_validator("rclone_transfer_timeout_seconds")
+    @classmethod
+    def validate_rclone_transfer_timeout(cls, value: float | None) -> float | None:
+        if value is not None and value < 0:
+            raise ValueError("rclone_transfer_timeout_seconds must be zero or greater")
+        return None if value == 0 else value
 
     @field_validator("reconciliation_grace_seconds", "queue_auto_refresh_seconds")
     @classmethod

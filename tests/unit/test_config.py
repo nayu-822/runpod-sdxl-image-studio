@@ -36,6 +36,19 @@ def test_optional_artifact_repair_batch_is_small_and_bounded_by_recovery_limit()
         )
 
 
+def test_rclone_connection_and_transfer_timeouts_are_separate() -> None:
+    settings = Settings(
+        _env_file=None,
+        rclone_connection_timeout_seconds=20,
+        rclone_transfer_timeout_seconds=0,
+    )
+    assert settings.rclone_connection_timeout_seconds == 20
+    assert settings.rclone_transfer_timeout_seconds is None
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, rclone_transfer_timeout_seconds=-1)
+
+
 def test_environment_variables_override_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("IMAGE_STUDIO_HOST", "0.0.0.0")
     monkeypatch.setenv("IMAGE_STUDIO_PORT", "9000")

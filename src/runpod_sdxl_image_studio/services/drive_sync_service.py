@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import logging
@@ -20,6 +19,7 @@ from uuid import UUID, uuid4
 from PIL import Image, UnidentifiedImageError
 
 from runpod_sdxl_image_studio.adapters.database.repositories.drive_sync_repository import (
+    DriveManifestFailureTarget,
     DriveManifestRecord,
     DriveSyncRepositoryProtocol,
 )
@@ -32,6 +32,8 @@ from runpod_sdxl_image_studio.domain.drive_sync import (
     DriveCacheCandidate,
     DriveCapacity,
     DriveConnectionResult,
+    DriveDestination,
+    DriveManifestJob,
     DriveRemotePaths,
     DriveSyncErrorCode,
     DriveSyncJob,
@@ -48,6 +50,8 @@ from runpod_sdxl_image_studio.domain.generation_artifact import ArtifactType, Ge
 logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[DriveSyncProgress], Awaitable[None] | None]
+ProcessStartedCallback = Callable[[int], Awaitable[None] | None]
+ProcessFinishedCallback = Callable[[], Awaitable[None] | None]
 MetadataRepairHandler = Callable[[UUID], object]
 
 
@@ -57,10 +61,15 @@ class DriveAdapterProtocol(Protocol):
     async def copy_file(
         self,
         local_path: Path,
+        destination: DriveDestination,
         relative_remote_path: str,
         *,
         progress_callback: ProgressCallback | None = None,
         total_bytes: int = 0,
+        current_artifact: str | None = None,
+        process_started_callback: ProcessStartedCallback | None = None,
+        process_finished_callback: ProcessFinishedCallback | None = None,
+        log_path: str | None = None,
     ) -> None: ...
 
 
@@ -188,7 +197,12 @@ class DriveSyncService:
 
         artifacts = self._artifacts_with_repair(generation_id)
         image, metadata = _select_required_artifacts(artifacts)
-        paths = _paths_from_record_or_generation(existing, generation, self._settings.timezone)
+        paths = build_remote_paths(
+            generation.id,
+            generation.kind.value,
+            generation.created_at,
+            timezone_name=self._settings.timezone,
+        )
         updated_record, job = self._build_record_and_job(
             generation,
             image,
@@ -284,7 +298,7 @@ class DriveSyncService:
         try:
             record = self._repository.get_by_generation(job.generation_id)
             generation = self._generation_repository.get_by_id(job.generation_id)
-            artifacts = self._artifact_repository.list_by_generation(job.generation_id)
+            artifacts = self._artifacts_with_repair(job.generation_id)
             if record is None or generation is None:
                 raise DriveSyncServiceError(
                     DriveSyncErrorCode.PERSISTENCE_FAILED.value,
@@ -332,6 +346,7 @@ class DriveSyncService:
             validate_remote_relative_path(record.remote_image_path)
             validate_remote_relative_path(record.remote_metadata_path)
             total_bytes = image.size_bytes + metadata.size_bytes
+            destination = DriveDestination(record.remote_name, record.remote_base_path)
         except DriveSyncServiceError as exc:
             return self._failed(job, worker_id, exc)
         except Exception as exc:  # noqa: BLE001 - fail closed before any copy
@@ -356,6 +371,7 @@ class DriveSyncService:
                 job,
                 worker_id,
                 image_path,
+                destination,
                 record.remote_image_path,
                 image.size_bytes,
                 total_bytes,
@@ -367,6 +383,7 @@ class DriveSyncService:
                 job,
                 worker_id,
                 metadata_path,
+                destination,
                 record.remote_metadata_path,
                 metadata.size_bytes,
                 total_bytes,
@@ -402,18 +419,19 @@ class DriveSyncService:
                 ),
             )
         try:
-            await self.rebuild_manifest_async(
-                _local_date(generation.created_at, self._settings.timezone)
+            self.enqueue_manifest_rebuild(
+                _local_date(generation.created_at, self._settings.timezone),
+                destination=destination,
             )
         except Exception as exc:  # noqa: BLE001 - manifest is outside the sync transaction
             logger.warning(
-                "Drive manifest update failed generation=%s error=%s",
+                "Drive manifest request failed generation=%s error=%s",
                 job.generation_id,
                 type(exc).__name__,
                 exc_info=True,
             )
             try:
-                self._repository.mark_manifest_warning(synced.id, "Drive manifest update failed")
+                self._repository.mark_manifest_warning(synced.id, "Drive manifest request failed")
             except Exception:
                 logger.warning("Drive manifest warning could not be persisted", exc_info=True)
         return synced
@@ -435,8 +453,13 @@ class DriveSyncService:
     def cache_candidates(self, limit: int = 100) -> tuple[DriveCacheCandidate, ...]:
         return self._repository.cache_candidates(limit)
 
-    def rebuild_manifest(self, local_date: str | None = None) -> Path:
-        if not self._settings.rclone_remote:
+    def enqueue_manifest_rebuild(
+        self,
+        local_date: str | None = None,
+        *,
+        destination: DriveDestination | None = None,
+    ) -> DriveManifestJob:
+        if not self._settings.rclone_remote and destination is None:
             raise DriveSyncServiceError(
                 DriveSyncErrorCode.NOT_CONFIGURED.value,
                 "Google Drive is not configured",
@@ -450,34 +473,142 @@ class DriveSyncService:
                 "manifest date is invalid",
                 retryable=False,
             ) from exc
-        target = self._write_manifest(normalized_date)
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            pass
-        else:
-            raise DriveSyncServiceError(
-                DriveSyncErrorCode.MANIFEST_FAILED.value,
-                "manifest copy requires an asynchronous boundary",
-            )
-        asyncio.run(self._copy_manifest(target, f"{normalized_date}/manifests/manifest.jsonl"))
-        return target
-
-    async def rebuild_manifest_async(self, local_date: str | None = None) -> Path:
-        if not self._settings.rclone_remote:
+        resolved_destination = destination or self._current_destination()
+        if not resolved_destination.remote_name:
             raise DriveSyncServiceError(
                 DriveSyncErrorCode.NOT_CONFIGURED.value,
                 "Google Drive is not configured",
             )
-        normalized_date = local_date or _local_date(datetime.now(UTC), self._settings.timezone)
-        target = self._write_manifest(normalized_date)
-        await self._copy_manifest(target, f"{normalized_date}/manifests/manifest.jsonl")
-        return target
+        now = datetime.now(UTC)
+        job = DriveManifestJob(
+            id=self._id_factory(),
+            local_date=normalized_date,
+            status=DriveSyncStatus.PENDING,
+            remote_name=resolved_destination.remote_name,
+            remote_base_path=resolved_destination.base_path,
+            remote_manifest_path=f"{normalized_date}/manifests/manifest.jsonl",
+            queue_sequence=0,
+            progress_bytes=0,
+            total_bytes=0,
+            progress_percentage=0.0,
+            current_artifact=None,
+            worker_id=None,
+            pid=None,
+            claimed_at=None,
+            lease_expires_at=None,
+            started_at=None,
+            completed_at=None,
+            error_code=None,
+            error_summary=None,
+            retryable=True,
+            log_path=f"logs/drive_sync/manifest-{normalized_date}-{self._id_factory().hex}.log",
+            created_at=now,
+            updated_at=now,
+        )
+        return self._repository.enqueue_manifest(job)
 
-    async def _copy_manifest(self, target: Path, relative_path: str) -> None:
-        await self._adapter.copy_file(target, relative_path, total_bytes=target.stat().st_size)
+    def retry_failed_manifests(self, limit: int = 100) -> tuple[str, ...]:
+        queued: list[str] = []
+        for target in self._repository.list_manifest_failure_targets(limit):
+            try:
+                self.enqueue_manifest_rebuild(
+                    target.local_date,
+                    destination=DriveDestination(target.remote_name, target.remote_base_path),
+                )
+            except Exception as exc:  # noqa: BLE001 - one target must not block the batch
+                logger.warning(
+                    "Drive manifest retry could not be queued date=%s error=%s",
+                    target.local_date,
+                    type(exc).__name__,
+                )
+                continue
+            queued.append(target.local_date)
+        return tuple(queued)
 
-    def _write_manifest(self, normalized_date: str) -> Path:
+    def rebuild_manifest(self, local_date: str | None = None) -> DriveManifestJob:
+        """Register a manifest rebuild; the Drive worker performs the transfer."""
+
+        return self.enqueue_manifest_rebuild(local_date)
+
+    def list_manifest_jobs(self, limit: int = 50) -> tuple[DriveManifestJob, ...]:
+        return self._repository.list_manifest_jobs(limit)
+
+    def list_manifest_failure_targets(
+        self, limit: int = 100
+    ) -> tuple[DriveManifestFailureTarget, ...]:
+        return self._repository.list_manifest_failure_targets(limit)
+
+    async def process_manifest_job(
+        self, job: DriveManifestJob, worker_id: str
+    ) -> DriveManifestJob | None:
+        destination = job.destination
+        try:
+            target = self._write_manifest(job.local_date, destination)
+            total_bytes = target.stat().st_size
+            await self._update_manifest_progress(
+                job, worker_id, 0, total_bytes, "manifest", percentage=0.0
+            )
+
+            async def report(progress: DriveSyncProgress) -> None:
+                await self._update_manifest_progress(
+                    job,
+                    worker_id,
+                    min(total_bytes, max(0, progress.progress_bytes)),
+                    total_bytes,
+                    "manifest",
+                    percentage=(
+                        progress.progress_bytes * 100.0 / total_bytes if total_bytes else 100.0
+                    ),
+                )
+
+            async def process_started(pid: int) -> None:
+                if not self._repository.mark_manifest_process_started(job.id, worker_id, pid):
+                    raise DriveSyncServiceError(
+                        DriveSyncErrorCode.PERSISTENCE_FAILED.value,
+                        "manifest process lease is no longer owned",
+                    )
+
+            async def process_finished() -> None:
+                self._repository.mark_manifest_process_finished(job.id, worker_id)
+
+            await self._adapter.copy_file(
+                target,
+                destination,
+                job.remote_manifest_path,
+                progress_callback=report,
+                total_bytes=total_bytes,
+                current_artifact="manifest",
+                process_started_callback=process_started,
+                process_finished_callback=process_finished,
+                log_path=job.log_path,
+            )
+            await self._update_manifest_progress(
+                job, worker_id, total_bytes, total_bytes, None, percentage=100.0
+            )
+            synced = self._repository.mark_manifest_synced(job.id, worker_id, datetime.now(UTC))
+            self._repository.clear_manifest_warning(job.local_date, destination)
+            return synced
+        except Exception as exc:  # noqa: BLE001 - manifest failure is independent of sync state
+            code = getattr(exc, "code", DriveSyncErrorCode.MANIFEST_FAILED.value)
+            if not isinstance(code, str):
+                code = DriveSyncErrorCode.MANIFEST_FAILED.value
+            try:
+                failed = self._repository.mark_manifest_failed(
+                    job.id, worker_id, code, "Drive manifest rebuild failed", retryable=True
+                )
+                self._repository.mark_manifest_warning_for_destination(
+                    job.local_date, destination, "Drive manifest rebuild failed"
+                )
+                return failed
+            except Exception:  # noqa: BLE001 - preserve the original worker-safe failure
+                logger.warning(
+                    "Drive manifest failure could not be persisted date=%s",
+                    job.local_date,
+                    exc_info=True,
+                )
+                return None
+
+    def _write_manifest(self, normalized_date: str, destination: DriveDestination) -> Path:
         try:
             date.fromisoformat(normalized_date)
         except ValueError as exc:
@@ -486,9 +617,10 @@ class DriveSyncService:
                 "manifest date is invalid",
                 retryable=False,
             ) from exc
-        records = self._repository.list_manifest_records(normalized_date)
-        target_dir = self._settings.data_dir / ".drive-sync-manifests" / normalized_date
-        target_dir.mkdir(parents=True, exist_ok=True)
+        records = self._repository.list_manifest_records(
+            normalized_date, destination.remote_name, destination.base_path
+        )
+        target_dir = _safe_manifest_directory(self._settings.data_dir, normalized_date)
         target = target_dir / "manifest.jsonl"
         temporary: Path | None = None
         try:
@@ -521,6 +653,9 @@ class DriveSyncService:
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
+
+    def _current_destination(self) -> DriveDestination:
+        return DriveDestination(self._settings.rclone_remote, self._settings.rclone_base_path)
 
     def _get_completed_generation(self, generation_id: UUID) -> Generation:
         generation = self._generation_repository.get_by_id(generation_id)
@@ -648,6 +783,7 @@ class DriveSyncService:
         job: DriveSyncJob,
         worker_id: str,
         local_path: Path,
+        destination: DriveDestination,
         relative_remote_path: str,
         artifact_size: int,
         total_bytes: int,
@@ -668,11 +804,26 @@ class DriveSyncService:
                 percentage=percentage,
             )
 
+        async def process_started(pid: int) -> None:
+            if not self._repository.mark_process_started(job.id, worker_id, pid):
+                raise DriveSyncServiceError(
+                    DriveSyncErrorCode.PERSISTENCE_FAILED.value,
+                    "Drive process lease is no longer owned",
+                )
+
+        async def process_finished() -> None:
+            self._repository.mark_process_finished(job.id, worker_id)
+
         await self._adapter.copy_file(
             local_path,
+            destination,
             relative_remote_path,
             progress_callback=report,
             total_bytes=artifact_size,
+            current_artifact=artifact_name,
+            process_started_callback=process_started,
+            process_finished_callback=process_finished,
+            log_path=job.log_path,
         )
         await self._update_progress(
             job,
@@ -703,6 +854,28 @@ class DriveSyncService:
             current_artifact=current_artifact,
         )
         self._repository.update_progress(job.id, worker_id, progress)
+
+    async def _update_manifest_progress(
+        self,
+        job: DriveManifestJob,
+        worker_id: str,
+        progress_bytes: int,
+        total_bytes: int,
+        current_artifact: str | None,
+        *,
+        percentage: float | None = None,
+    ) -> None:
+        progress = DriveSyncProgress(
+            progress_bytes=min(total_bytes, max(0, progress_bytes)),
+            total_bytes=total_bytes,
+            progress_percentage=(
+                percentage
+                if percentage is not None
+                else (progress_bytes * 100.0 / total_bytes if total_bytes else 100.0)
+            ),
+            current_artifact=current_artifact,
+        )
+        self._repository.update_manifest_progress(job.id, worker_id, progress)
 
 
 def _select_required_artifacts(
@@ -863,6 +1036,40 @@ def _local_date(value: datetime, timezone_name: str) -> str:
         ) from exc
 
 
+def _safe_manifest_directory(data_dir: Path, local_date: str) -> Path:
+    """Resolve manifest directories before creating files and reject symlink escapes."""
+
+    try:
+        root = data_dir.resolve(strict=True)
+        manifest_root = data_dir / ".drive-sync-manifests"
+        if manifest_root.exists() or manifest_root.is_symlink():
+            if manifest_root.is_symlink():
+                raise ValueError("manifest root must not be a symlink")
+            resolved_root = manifest_root.resolve(strict=True)
+            resolved_root.relative_to(root)
+        else:
+            manifest_root.mkdir(parents=True, exist_ok=True)
+            resolved_root = manifest_root.resolve(strict=True)
+            resolved_root.relative_to(root)
+
+        date_dir = manifest_root / local_date
+        if date_dir.exists() or date_dir.is_symlink():
+            if date_dir.is_symlink():
+                raise ValueError("manifest date directory must not be a symlink")
+            resolved_date = date_dir.resolve(strict=True)
+        else:
+            date_dir.mkdir(parents=False, exist_ok=True)
+            resolved_date = date_dir.resolve(strict=True)
+        resolved_date.relative_to(resolved_root)
+        resolved_date.relative_to(root)
+        return resolved_date
+    except (OSError, ValueError) as exc:
+        raise DriveSyncServiceError(
+            DriveSyncErrorCode.MANIFEST_FAILED.value,
+            "manifest directory is unsafe",
+        ) from exc
+
+
 def _manifest_line(record: DriveManifestRecord, local_date: str) -> dict[str, object]:
     return {
         "local_date": local_date,
@@ -871,6 +1078,8 @@ def _manifest_line(record: DriveManifestRecord, local_date: str) -> dict[str, ob
         "created_at": utc(record.created_at).isoformat(),
         "remote_image_path": record.remote_image_path,
         "remote_metadata_path": record.remote_metadata_path,
+        "remote_name": record.remote_name,
+        "remote_base_path": record.remote_base_path,
         "image_sha256": record.image_sha256,
         "metadata_sha256": record.metadata_sha256,
         "image_size_bytes": record.image_size_bytes,

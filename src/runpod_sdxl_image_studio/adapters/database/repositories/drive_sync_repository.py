@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from runpod_sdxl_image_studio.adapters.database.engine import session_scope
 from runpod_sdxl_image_studio.adapters.database.models import (
+    DriveManifestJobModel,
     DriveSyncJobModel,
     DriveSyncRecordModel,
     GenerationArtifactModel,
@@ -23,6 +24,8 @@ from runpod_sdxl_image_studio.adapters.database.models import (
 from runpod_sdxl_image_studio.domain.drive_sync import (
     DriveCacheCandidate,
     DriveCapacity,
+    DriveDestination,
+    DriveManifestJob,
     DriveSyncJob,
     DriveSyncProgress,
     DriveSyncRecord,
@@ -56,12 +59,23 @@ class DriveManifestRecord:
     image_size_bytes: int
     metadata_size_bytes: int
     synced_at: datetime
+    remote_name: str
+    remote_base_path: str
+
+
+@dataclass(frozen=True)
+class DriveManifestFailureTarget:
+    local_date: str
+    remote_name: str
+    remote_base_path: str
 
 
 class DriveSyncRepositoryProtocol(Protocol):
     def get_by_generation(self, generation_id: UUID) -> DriveSyncRecord | None: ...
 
     def get_job(self, job_id: UUID) -> DriveSyncJob | None: ...
+
+    def get_manifest_job(self, job_id: UUID) -> DriveManifestJob | None: ...
 
     def enqueue(
         self, record: DriveSyncRecord, job: DriveSyncJob | None
@@ -79,6 +93,10 @@ class DriveSyncRepositoryProtocol(Protocol):
         self, job_id: UUID, worker_id: str, progress: DriveSyncProgress
     ) -> bool: ...
 
+    def mark_process_started(self, job_id: UUID, worker_id: str, pid: int) -> bool: ...
+
+    def mark_process_finished(self, job_id: UUID, worker_id: str) -> bool: ...
+
     def mark_synced(self, job_id: UUID, worker_id: str, synced_at: datetime) -> DriveSyncRecord: ...
 
     def mark_failed(
@@ -92,6 +110,47 @@ class DriveSyncRepositoryProtocol(Protocol):
 
     def mark_manifest_warning(self, record_id: UUID, summary: str) -> None: ...
 
+    def enqueue_manifest(self, job: DriveManifestJob) -> DriveManifestJob: ...
+
+    def claim_next_manifest(
+        self, worker_id: str, lease_seconds: float
+    ) -> DriveManifestJob | None: ...
+
+    def renew_manifest_lease(self, job_id: UUID, worker_id: str, lease_seconds: float) -> bool: ...
+
+    def update_manifest_progress(
+        self, job_id: UUID, worker_id: str, progress: DriveSyncProgress
+    ) -> bool: ...
+
+    def mark_manifest_process_started(self, job_id: UUID, worker_id: str, pid: int) -> bool: ...
+
+    def mark_manifest_process_finished(self, job_id: UUID, worker_id: str) -> bool: ...
+
+    def mark_manifest_synced(
+        self, job_id: UUID, worker_id: str, synced_at: datetime
+    ) -> DriveManifestJob: ...
+
+    def mark_manifest_failed(
+        self,
+        job_id: UUID,
+        worker_id: str | None,
+        error_code: str,
+        error_summary: str,
+        retryable: bool = True,
+    ) -> DriveManifestJob: ...
+
+    def clear_manifest_warning(self, local_date: str, destination: DriveDestination) -> None: ...
+
+    def mark_manifest_warning_for_destination(
+        self, local_date: str, destination: DriveDestination, summary: str
+    ) -> None: ...
+
+    def list_manifest_jobs(self, limit: int = 50) -> tuple[DriveManifestJob, ...]: ...
+
+    def list_manifest_failure_targets(
+        self, limit: int = 100
+    ) -> tuple[DriveManifestFailureTarget, ...]: ...
+
     def reconcile_stale(self, now: datetime | None = None) -> int: ...
 
     def list_jobs(self, limit: int = 50) -> tuple[DriveSyncJob, ...]: ...
@@ -100,7 +159,9 @@ class DriveSyncRepositoryProtocol(Protocol):
 
     def list_discovery_candidates(self, limit: int) -> tuple[DriveSyncDiscoveryCandidate, ...]: ...
 
-    def list_manifest_records(self, local_date: str) -> tuple[DriveManifestRecord, ...]: ...
+    def list_manifest_records(
+        self, local_date: str, remote_name: str, remote_base_path: str
+    ) -> tuple[DriveManifestRecord, ...]: ...
 
     def capacity(self, *, total_bytes: int, used_bytes: int, free_bytes: int) -> DriveCapacity: ...
 
@@ -288,6 +349,34 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
         except (SQLAlchemyError, ValueError) as exc:
             raise DriveSyncRepositoryError("drive sync progress could not be saved") from exc
 
+    def mark_process_started(self, job_id: UUID, worker_id: str, pid: int) -> bool:
+        try:
+            with session_scope(self._session_factory) as session:
+                row = session.get(DriveSyncJobModel, str(job_id))
+                if (
+                    row is None
+                    or row.status != DriveSyncStatus.SYNCING.value
+                    or row.worker_id != worker_id
+                ):
+                    return False
+                row.pid = pid
+                row.updated_at = datetime.now(UTC)
+                return True
+        except SQLAlchemyError as exc:
+            raise DriveSyncRepositoryError("drive sync process start could not be saved") from exc
+
+    def mark_process_finished(self, job_id: UUID, worker_id: str) -> bool:
+        try:
+            with session_scope(self._session_factory) as session:
+                row = session.get(DriveSyncJobModel, str(job_id))
+                if row is None or row.worker_id != worker_id:
+                    return False
+                row.pid = None
+                row.updated_at = datetime.now(UTC)
+                return True
+        except SQLAlchemyError as exc:
+            raise DriveSyncRepositoryError("drive sync process finish could not be saved") from exc
+
     def mark_synced(self, job_id: UUID, worker_id: str, synced_at: datetime) -> DriveSyncRecord:
         timestamp = utc(synced_at)
         try:
@@ -349,7 +438,7 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
                     or row.status == DriveSyncStatus.SYNCED.value
                 ):
                     return _record_domain(record)
-                if worker_id is not None and row.worker_id not in {None, worker_id}:
+                if worker_id is not None and row.worker_id != worker_id:
                     raise DriveSyncRepositoryError("drive sync job lease is no longer owned")
                 row.status = DriveSyncStatus.FAILED.value
                 row.worker_id = None
@@ -387,6 +476,270 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
         except SQLAlchemyError as exc:
             raise DriveSyncRepositoryError("drive manifest warning could not be saved") from exc
 
+    def enqueue_manifest(self, job: DriveManifestJob) -> DriveManifestJob:
+        try:
+            with session_scope(self._session_factory) as session:
+                active = session.scalar(
+                    select(DriveManifestJobModel)
+                    .where(
+                        DriveManifestJobModel.local_date == job.local_date,
+                        DriveManifestJobModel.remote_name == job.remote_name,
+                        DriveManifestJobModel.remote_base_path == job.remote_base_path,
+                        DriveManifestJobModel.status.in_(
+                            [DriveSyncStatus.PENDING.value, DriveSyncStatus.SYNCING.value]
+                        ),
+                    )
+                    .order_by(DriveManifestJobModel.queue_sequence.asc())
+                )
+                if active is not None:
+                    return _manifest_job_domain(active)
+                row = _manifest_job_model(job, session)
+                session.add(row)
+                session.flush()
+                return _manifest_job_domain(row)
+        except (IntegrityError, SQLAlchemyError, ValueError) as exc:
+            raise DriveSyncRepositoryError("drive manifest job could not be queued") from exc
+
+    def get_manifest_job(self, job_id: UUID) -> DriveManifestJob | None:
+        try:
+            with session_scope(self._session_factory) as session:
+                row = session.get(DriveManifestJobModel, str(job_id))
+                return _manifest_job_domain(row) if row is not None else None
+        except (SQLAlchemyError, ValueError) as exc:
+            raise DriveSyncRepositoryError("drive manifest job could not be read") from exc
+
+    def claim_next_manifest(self, worker_id: str, lease_seconds: float) -> DriveManifestJob | None:
+        now = datetime.now(UTC)
+        try:
+            with session_scope(self._session_factory) as session:
+                row = session.scalar(
+                    select(DriveManifestJobModel)
+                    .where(DriveManifestJobModel.status == DriveSyncStatus.PENDING.value)
+                    .order_by(DriveManifestJobModel.queue_sequence.asc())
+                    .limit(1)
+                )
+                if row is None:
+                    return None
+                row.status = DriveSyncStatus.SYNCING.value
+                row.worker_id = worker_id
+                row.claimed_at = now
+                row.lease_expires_at = now + timedelta(seconds=lease_seconds)
+                row.started_at = row.started_at or now
+                row.error_code = None
+                row.error_summary = None
+                row.updated_at = now
+                session.flush()
+                return _manifest_job_domain(row)
+        except SQLAlchemyError as exc:
+            raise DriveSyncRepositoryError("drive manifest job could not be claimed") from exc
+
+    def renew_manifest_lease(self, job_id: UUID, worker_id: str, lease_seconds: float) -> bool:
+        now = datetime.now(UTC)
+        try:
+            with session_scope(self._session_factory) as session:
+                row = session.get(DriveManifestJobModel, str(job_id))
+                if (
+                    row is None
+                    or row.status != DriveSyncStatus.SYNCING.value
+                    or row.worker_id != worker_id
+                ):
+                    return False
+                row.lease_expires_at = now + timedelta(seconds=lease_seconds)
+                row.updated_at = now
+                return True
+        except SQLAlchemyError as exc:
+            raise DriveSyncRepositoryError("drive manifest lease could not be renewed") from exc
+
+    def update_manifest_progress(
+        self, job_id: UUID, worker_id: str, progress: DriveSyncProgress
+    ) -> bool:
+        try:
+            with session_scope(self._session_factory) as session:
+                row = session.get(DriveManifestJobModel, str(job_id))
+                if (
+                    row is None
+                    or row.status != DriveSyncStatus.SYNCING.value
+                    or row.worker_id != worker_id
+                ):
+                    return False
+                row.progress_bytes = progress.progress_bytes
+                row.total_bytes = progress.total_bytes
+                row.progress_percentage = progress.progress_percentage
+                row.current_artifact = progress.current_artifact
+                row.updated_at = datetime.now(UTC)
+                return True
+        except (SQLAlchemyError, ValueError) as exc:
+            raise DriveSyncRepositoryError("drive manifest progress could not be saved") from exc
+
+    def mark_manifest_process_started(self, job_id: UUID, worker_id: str, pid: int) -> bool:
+        try:
+            with session_scope(self._session_factory) as session:
+                row = session.get(DriveManifestJobModel, str(job_id))
+                if (
+                    row is None
+                    or row.status != DriveSyncStatus.SYNCING.value
+                    or row.worker_id != worker_id
+                ):
+                    return False
+                row.pid = pid
+                row.updated_at = datetime.now(UTC)
+                return True
+        except SQLAlchemyError as exc:
+            raise DriveSyncRepositoryError(
+                "drive manifest process start could not be saved"
+            ) from exc
+
+    def mark_manifest_process_finished(self, job_id: UUID, worker_id: str) -> bool:
+        try:
+            with session_scope(self._session_factory) as session:
+                row = session.get(DriveManifestJobModel, str(job_id))
+                if row is None or row.worker_id != worker_id:
+                    return False
+                row.pid = None
+                row.updated_at = datetime.now(UTC)
+                return True
+        except SQLAlchemyError as exc:
+            raise DriveSyncRepositoryError(
+                "drive manifest process finish could not be saved"
+            ) from exc
+
+    def mark_manifest_synced(
+        self, job_id: UUID, worker_id: str, synced_at: datetime
+    ) -> DriveManifestJob:
+        timestamp = utc(synced_at)
+        try:
+            with session_scope(self._session_factory) as session:
+                row = session.get(DriveManifestJobModel, str(job_id))
+                if row is None or row.worker_id != worker_id:
+                    raise DriveSyncRepositoryError("drive manifest job lease is no longer owned")
+                if row.status != DriveSyncStatus.SYNCING.value:
+                    if row.status == DriveSyncStatus.SYNCED.value:
+                        return _manifest_job_domain(row)
+                    raise DriveSyncRepositoryError("drive manifest job is no longer active")
+                row.status = DriveSyncStatus.SYNCED.value
+                row.progress_bytes = row.total_bytes
+                row.progress_percentage = 100.0
+                row.current_artifact = None
+                row.worker_id = None
+                row.pid = None
+                row.claimed_at = None
+                row.lease_expires_at = None
+                row.completed_at = timestamp
+                row.error_code = None
+                row.error_summary = None
+                row.retryable = False
+                row.updated_at = timestamp
+                session.flush()
+                return _manifest_job_domain(row)
+        except DriveSyncRepositoryError:
+            raise
+        except (SQLAlchemyError, ValueError) as exc:
+            raise DriveSyncRepositoryError("drive manifest success could not be saved") from exc
+
+    def mark_manifest_failed(
+        self,
+        job_id: UUID,
+        worker_id: str | None,
+        error_code: str,
+        error_summary: str,
+        retryable: bool = True,
+    ) -> DriveManifestJob:
+        now = datetime.now(UTC)
+        try:
+            with session_scope(self._session_factory) as session:
+                row = session.get(DriveManifestJobModel, str(job_id))
+                if row is None:
+                    raise DriveSyncRepositoryError("drive manifest job was not found")
+                if row.status == DriveSyncStatus.SYNCED.value:
+                    return _manifest_job_domain(row)
+                if worker_id is not None and row.worker_id != worker_id:
+                    raise DriveSyncRepositoryError("drive manifest job lease is no longer owned")
+                row.status = DriveSyncStatus.FAILED.value
+                row.worker_id = None
+                row.pid = None
+                row.claimed_at = None
+                row.lease_expires_at = None
+                row.completed_at = now
+                row.error_code = error_code
+                row.error_summary = error_summary[:1000]
+                row.retryable = retryable
+                row.updated_at = now
+                session.flush()
+                return _manifest_job_domain(row)
+        except DriveSyncRepositoryError:
+            raise
+        except (SQLAlchemyError, ValueError) as exc:
+            raise DriveSyncRepositoryError("drive manifest failure could not be saved") from exc
+
+    def clear_manifest_warning(self, local_date: str, destination: DriveDestination) -> None:
+        self._update_manifest_warning(local_date, destination, None)
+
+    def mark_manifest_warning_for_destination(
+        self, local_date: str, destination: DriveDestination, summary: str
+    ) -> None:
+        self._update_manifest_warning(local_date, destination, summary)
+
+    def _update_manifest_warning(
+        self, local_date: str, destination: DriveDestination, summary: str | None
+    ) -> None:
+        try:
+            with session_scope(self._session_factory) as session:
+                rows = session.scalars(
+                    select(DriveSyncRecordModel).where(
+                        DriveSyncRecordModel.status == DriveSyncStatus.SYNCED.value,
+                        DriveSyncRecordModel.remote_name == destination.remote_name,
+                        DriveSyncRecordModel.remote_base_path == destination.base_path,
+                    )
+                ).all()
+                for row in rows:
+                    generation = session.get(GenerationModel, row.generation_id)
+                    if generation is None or _tokyo_date(generation.created_at) != local_date:
+                        continue
+                    if summary is None:
+                        if row.error_code == "drive_manifest_failed":
+                            row.error_code = None
+                            row.error_summary = None
+                    else:
+                        row.error_code = "drive_manifest_failed"
+                        row.error_summary = summary[:1000]
+                    row.updated_at = datetime.now(UTC)
+        except SQLAlchemyError as exc:
+            raise DriveSyncRepositoryError("drive manifest warning could not be saved") from exc
+
+    def list_manifest_jobs(self, limit: int = 50) -> tuple[DriveManifestJob, ...]:
+        try:
+            with session_scope(self._session_factory) as session:
+                rows = session.scalars(
+                    select(DriveManifestJobModel)
+                    .order_by(DriveManifestJobModel.queue_sequence.desc())
+                    .limit(min(max(1, limit), 100))
+                ).all()
+                return tuple(_manifest_job_domain(row) for row in rows)
+        except (SQLAlchemyError, ValueError) as exc:
+            raise DriveSyncRepositoryError("drive manifest jobs could not be listed") from exc
+
+    def list_manifest_failure_targets(
+        self, limit: int = 100
+    ) -> tuple[DriveManifestFailureTarget, ...]:
+        try:
+            with session_scope(self._session_factory) as session:
+                rows = session.scalars(
+                    select(DriveManifestJobModel).order_by(
+                        DriveManifestJobModel.queue_sequence.desc()
+                    )
+                ).all()
+                latest: dict[tuple[str, str, str], DriveManifestJobModel] = {}
+                for row in rows:
+                    key = (row.local_date, row.remote_name, row.remote_base_path)
+                    latest.setdefault(key, row)
+                return tuple(
+                    DriveManifestFailureTarget(local_date, remote_name, remote_base_path)
+                    for (local_date, remote_name, remote_base_path), row in latest.items()
+                    if row.status == DriveSyncStatus.FAILED.value and row.retryable
+                )[: min(max(1, limit), 100)]
+        except SQLAlchemyError as exc:
+            raise DriveSyncRepositoryError("drive manifest failures could not be listed") from exc
+
     def reconcile_stale(self, now: datetime | None = None) -> int:
         timestamp = utc(now or datetime.now(UTC))
         count = 0
@@ -417,6 +770,25 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
                     record.error_code = "drive_sync_stale"
                     record.error_summary = "同期Jobが期限切れになりました。"
                     record.updated_at = timestamp
+                    count += 1
+                manifest_rows = session.scalars(
+                    select(DriveManifestJobModel).where(
+                        DriveManifestJobModel.status == DriveSyncStatus.SYNCING.value,
+                        DriveManifestJobModel.lease_expires_at.is_not(None),
+                        DriveManifestJobModel.lease_expires_at <= timestamp,
+                    )
+                ).all()
+                for row in manifest_rows:
+                    row.status = DriveSyncStatus.FAILED.value
+                    row.worker_id = None
+                    row.pid = None
+                    row.claimed_at = None
+                    row.lease_expires_at = None
+                    row.completed_at = timestamp
+                    row.error_code = "drive_sync_stale"
+                    row.error_summary = "同期Jobが期限切れになりました。"
+                    row.retryable = True
+                    row.updated_at = timestamp
                     count += 1
                 return count
         except SQLAlchemyError as exc:
@@ -478,7 +850,9 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
         except (SQLAlchemyError, ValueError) as exc:
             raise DriveSyncRepositoryError("drive sync discovery could not be read") from exc
 
-    def list_manifest_records(self, local_date: str) -> tuple[DriveManifestRecord, ...]:
+    def list_manifest_records(
+        self, local_date: str, remote_name: str, remote_base_path: str
+    ) -> tuple[DriveManifestRecord, ...]:
         try:
             with session_scope(self._session_factory) as session:
                 rows = session.execute(
@@ -491,7 +865,11 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
                         GenerationModel,
                         GenerationModel.id == DriveSyncRecordModel.generation_id,
                     )
-                    .where(DriveSyncRecordModel.status == DriveSyncStatus.SYNCED.value)
+                    .where(
+                        DriveSyncRecordModel.status == DriveSyncStatus.SYNCED.value,
+                        DriveSyncRecordModel.remote_name == remote_name,
+                        DriveSyncRecordModel.remote_base_path == remote_base_path,
+                    )
                     .order_by(GenerationModel.created_at.asc(), GenerationModel.id.asc())
                 ).all()
                 result: list[DriveManifestRecord] = []
@@ -515,6 +893,8 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
                             image_size_bytes=record.image_size_bytes,
                             metadata_size_bytes=record.metadata_size_bytes or 0,
                             synced_at=_utc(record.synced_at),
+                            remote_name=record.remote_name,
+                            remote_base_path=record.remote_base_path,
                         )
                     )
                 return tuple(result)
@@ -697,6 +1077,35 @@ def _job_model(job: DriveSyncJob, record_id: str, session: Session) -> DriveSync
     )
 
 
+def _manifest_job_model(job: DriveManifestJob, session: Session) -> DriveManifestJobModel:
+    max_sequence = session.scalar(select(func.max(DriveManifestJobModel.queue_sequence))) or 0
+    return DriveManifestJobModel(
+        id=str(job.id),
+        local_date=job.local_date,
+        remote_name=job.remote_name,
+        remote_base_path=job.remote_base_path,
+        remote_manifest_path=job.remote_manifest_path,
+        queue_sequence=int(max_sequence) + 1,
+        status=DriveSyncStatus.PENDING.value,
+        progress_bytes=0,
+        total_bytes=job.total_bytes,
+        progress_percentage=0.0,
+        current_artifact=None,
+        worker_id=None,
+        pid=None,
+        claimed_at=None,
+        lease_expires_at=None,
+        started_at=None,
+        completed_at=None,
+        error_code=None,
+        error_summary=None,
+        retryable=True,
+        log_path=job.log_path,
+        created_at=utc(job.created_at),
+        updated_at=utc(job.updated_at),
+    )
+
+
 def _record_domain(row: DriveSyncRecordModel) -> DriveSyncRecord:
     return DriveSyncRecord(
         id=UUID(row.id),
@@ -754,6 +1163,34 @@ def _job_domain(row: DriveSyncJobModel) -> DriveSyncJob:
     )
 
 
+def _manifest_job_domain(row: DriveManifestJobModel) -> DriveManifestJob:
+    return DriveManifestJob(
+        id=UUID(row.id),
+        local_date=row.local_date,
+        status=DriveSyncStatus(row.status),
+        remote_name=row.remote_name,
+        remote_base_path=row.remote_base_path,
+        remote_manifest_path=row.remote_manifest_path,
+        queue_sequence=row.queue_sequence,
+        progress_bytes=row.progress_bytes,
+        total_bytes=row.total_bytes,
+        progress_percentage=row.progress_percentage,
+        current_artifact=row.current_artifact,
+        worker_id=row.worker_id,
+        pid=row.pid,
+        claimed_at=_optional_utc(row.claimed_at),
+        lease_expires_at=_optional_utc(row.lease_expires_at),
+        started_at=_optional_utc(row.started_at),
+        completed_at=_optional_utc(row.completed_at),
+        error_code=row.error_code,
+        error_summary=row.error_summary,
+        retryable=row.retryable,
+        log_path=row.log_path,
+        created_at=utc(row.created_at),
+        updated_at=utc(row.updated_at),
+    )
+
+
 def _optional_utc(value: datetime | None) -> datetime | None:
     return utc(value) if value is not None else None
 
@@ -766,8 +1203,13 @@ def _tokyo() -> ZoneInfo:
     return ZoneInfo("Asia/Tokyo")
 
 
+def _tokyo_date(value: datetime) -> str:
+    return _utc(value).astimezone(_tokyo()).date().isoformat()
+
+
 __all__ = [
     "DriveManifestRecord",
+    "DriveManifestFailureTarget",
     "DriveSyncDiscoveryCandidate",
     "DriveSyncRepository",
     "DriveSyncRepositoryError",

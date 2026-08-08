@@ -113,6 +113,7 @@ from runpod_sdxl_image_studio.ui.tabs.drive_sync_tab import (
     build_drive_sync_tab,
     make_drive_connection_handler,
     make_drive_discovery_handler,
+    make_drive_failed_manifest_handler,
     make_drive_manifest_handler,
     make_drive_resync_handler,
     make_drive_retry_failed_handler,
@@ -502,7 +503,16 @@ def build_app(
             queue=False,
         ).then(
             fn=make_drive_manifest_handler(drive_sync_service),
+            inputs=[drive_sync.manifest_date],
             outputs=[drive_sync.manifest_button, drive_sync.message],
+        )
+        drive_sync.failed_manifest_button.click(
+            fn=lambda: gr.Button(interactive=False),
+            outputs=[drive_sync.failed_manifest_button],
+            queue=False,
+        ).then(
+            fn=make_drive_failed_manifest_handler(drive_sync_service),
+            outputs=[drive_sync.failed_manifest_button, drive_sync.message],
         )
 
         metadata_import_outputs = [

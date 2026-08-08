@@ -461,6 +461,45 @@ class DriveSyncJobModel(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class DriveManifestJobModel(Base):
+    """Durable worker request for a destination-scoped manifest rebuild."""
+
+    __tablename__ = "drive_manifest_jobs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'syncing', 'synced', 'failed')",
+            name="ck_drive_manifest_job_status",
+        ),
+        UniqueConstraint("queue_sequence", name="uq_drive_manifest_job_sequence"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    local_date: Mapped[str] = mapped_column(String(10), nullable=False)
+    remote_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    remote_base_path: Mapped[str] = mapped_column(String(1000), nullable=False)
+    remote_manifest_path: Mapped[str] = mapped_column(String(1000), nullable=False)
+    queue_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    progress_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    progress_percentage: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    current_artifact: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    worker_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retryable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    log_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 Index("ix_generations_created_at", GenerationModel.created_at)
 Index("ix_generations_status", GenerationModel.status)
 Index("ix_generations_kind", GenerationModel.kind)
@@ -508,6 +547,20 @@ Index(
     DriveSyncJobModel.sync_record_id,
     unique=True,
     sqlite_where=DriveSyncJobModel.status.in_(["pending", "syncing"]),
+)
+Index(
+    "ix_drive_manifest_jobs_status_sequence",
+    DriveManifestJobModel.status,
+    DriveManifestJobModel.queue_sequence,
+)
+Index("ix_drive_manifest_jobs_lease", DriveManifestJobModel.lease_expires_at)
+Index(
+    "uq_drive_manifest_active_destination",
+    DriveManifestJobModel.local_date,
+    DriveManifestJobModel.remote_name,
+    DriveManifestJobModel.remote_base_path,
+    unique=True,
+    sqlite_where=DriveManifestJobModel.status.in_(["pending", "syncing"]),
 )
 Index(
     "uq_generations_retry_of_generation",
