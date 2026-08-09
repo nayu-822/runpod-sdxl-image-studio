@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 from uuid import UUID, uuid4
 
@@ -20,13 +20,24 @@ MAX_ERROR_DETAILS_LENGTH = 2_000
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-_SECRET_RE = re.compile(
-    r"(?i)\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|authorization|bearer|"
-    r"rclone[_ -]?config|client[_ -]?secret)\b\s*[:=]\s*[^\s,;]+"
+_SECRET_PATTERNS = (
+    re.compile(
+        r"(?i)\b(?:authorization(?:\s+header)?|cookie|set-cookie)\b\s*:\s*"
+        r"(?:bearer\s+)?[^\s,;]+(?:\s+[^\s,;]+)?"
+    ),
+    re.compile(r"(?i)\bbearer\b\s+[^\s,;]+"),
+    re.compile(
+        r"(?i)\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|password|"
+        r"client[_ -]?secret|rclone[_ -]?config|rclone[_ -]?credential)\b"
+        r"\s*(?:[:=]\s*)?[^\s,;]+"
+    ),
 )
 _ABSOLUTE_PATH_RE = re.compile(
-    r"(?:(?:[A-Za-z]:[\\/]|/(?:workspace|home|root|tmp|var|etc)/)[^\s,;]+)"
+    r"(?:(?:[A-Za-z]:[\\/]|\\\\[^\\/\s,;]+[\\/]|"
+    r"(?<![A-Za-z0-9:/])/(?!/))[^\s,;]*)"
 )
+
+SYSTEM_ERROR_DEDUPE_WINDOW_SECONDS = 300
 
 
 class SystemErrorEventRepositoryError(RuntimeError):
@@ -56,8 +67,14 @@ class SystemErrorEventRepositoryProtocol(Protocol):
 class SystemErrorEventRepository(SystemErrorEventRepositoryProtocol):
     """Append-only repository with a bounded read surface."""
 
-    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+    def __init__(
+        self,
+        session_factory: sessionmaker[Session],
+        *,
+        dedupe_window_seconds: int = SYSTEM_ERROR_DEDUPE_WINDOW_SECONDS,
+    ) -> None:
         self._session_factory = session_factory
+        self._dedupe_window_seconds = max(0, dedupe_window_seconds)
 
     def append(self, event: SystemErrorEvent) -> SystemErrorEvent:
         safe_event = sanitize_event(event)
@@ -75,6 +92,26 @@ class SystemErrorEventRepository(SystemErrorEventRepositoryProtocol):
         )
         try:
             with session_scope(self._session_factory) as session:
+                if self._dedupe_window_seconds:
+                    cutoff = _utc(safe_event.created_at) - timedelta(
+                        seconds=self._dedupe_window_seconds
+                    )
+                    existing = session.scalar(
+                        select(SystemErrorEventModel)
+                        .where(
+                            SystemErrorEventModel.category == safe_event.category,
+                            SystemErrorEventModel.error_code == safe_event.error_code,
+                            SystemErrorEventModel.created_at >= cutoff,
+                            SystemErrorEventModel.created_at <= _utc(safe_event.created_at),
+                        )
+                        .order_by(
+                            SystemErrorEventModel.created_at.desc(),
+                            SystemErrorEventModel.id.desc(),
+                        )
+                        .limit(1)
+                    )
+                    if existing is not None:
+                        return _to_domain(existing)
                 session.add(row)
                 session.flush()
             return safe_event
@@ -133,7 +170,8 @@ def sanitize_error_text(value: str | None, *, max_length: int) -> str | None:
         return None
     normalized = _ANSI_ESCAPE_RE.sub("", str(value))
     normalized = _CONTROL_RE.sub(" ", normalized)
-    normalized = _SECRET_RE.sub("<redacted-secret>", normalized)
+    for pattern in _SECRET_PATTERNS:
+        normalized = pattern.sub("<redacted-secret>", normalized)
     normalized = _ABSOLUTE_PATH_RE.sub("<redacted-path>", normalized)
     normalized = " ".join(normalized.split())
     if not normalized:
@@ -193,6 +231,7 @@ def _utc(value: datetime) -> datetime:
 __all__ = [
     "MAX_ERROR_DETAILS_LENGTH",
     "MAX_ERROR_SUMMARY_LENGTH",
+    "SYSTEM_ERROR_DEDUPE_WINDOW_SECONDS",
     "SystemErrorEventRepository",
     "SystemErrorEventRepositoryError",
     "SystemErrorEventRepositoryProtocol",

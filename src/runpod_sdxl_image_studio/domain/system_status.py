@@ -44,6 +44,13 @@ class SystemHealthStatus(StrEnum):
     ERROR = "error"
 
 
+class QueueHealthAvailability(StrEnum):
+    """Whether the queue health query completed successfully."""
+
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+
+
 class ErrorSeverity(StrEnum):
     """Severity values persisted for operational error history."""
 
@@ -92,6 +99,7 @@ class DriveHealthView:
     last_sync_at: datetime | None
     pending_sync_count: int
     failed_sync_count: int
+    last_failure_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -132,6 +140,7 @@ class SystemHealthView:
     drive: DriveHealthView
     models: ModelHealthView
     recent_errors: tuple[SystemErrorEvent, ...] = ()
+    queue_available: QueueHealthAvailability = QueueHealthAvailability.AVAILABLE
 
     # Flat aliases keep the DTO convenient for callers that do not need the
     # nested presentation objects and preserve the field vocabulary from the

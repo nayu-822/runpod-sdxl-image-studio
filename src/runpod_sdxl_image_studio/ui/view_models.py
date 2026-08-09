@@ -11,6 +11,7 @@ from runpod_sdxl_image_studio.adapters.comfyui.models import ComfyUICapabilities
 from runpod_sdxl_image_studio.domain.preflight import PreflightResult
 from runpod_sdxl_image_studio.domain.system_status import (
     ComfyUIStatus,
+    QueueHealthAvailability,
     SystemErrorEvent,
     SystemHealthView,
 )
@@ -146,6 +147,10 @@ def system_health_markdown(view: SystemHealthView, timezone_name: str) -> str:
     status = html.escape(str(view.overall_status))
     gpu = html.escape(view.gpu_name or "-")
     comfy_state = "connected" if view.comfyui_connected else "disconnected"
+    queue_unavailable = (
+        getattr(view.queue_available, "value", view.queue_available)
+        == QueueHealthAvailability.UNAVAILABLE.value
+    )
     lines = [
         f"### System Health: `{status}`",
         f"**Checked:** {_format_datetime(view.checked_at, timezone_name)}",
@@ -157,9 +162,13 @@ def system_health_markdown(view: SystemHealthView, timezone_name: str) -> str:
             f"`{_format_bytes(view.vram_free)}` free"
         ),
         (
-            "**Queue:** "
-            f"pending `{view.pending_count}`, running `{view.running_count}`, "
-            f"failed `{view.failed_count}`"
+            "**Queue:** unavailable"
+            if queue_unavailable
+            else (
+                "**Queue:** "
+                f"pending `{view.pending_count}`, running `{view.running_count}`, "
+                f"failed `{view.failed_count}`"
+            )
         ),
         (
             "**Storage:** "
@@ -195,13 +204,16 @@ def system_error_history_markdown(
     for event in events[:100]:
         severity = html.escape(str(event.severity))
         generation = _short_generation_id(str(event.generation_id) if event.generation_id else None)
+        job = _short_generation_id(str(event.job_id) if event.job_id else None)
+        retryable = "yes" if event.retryable else "no"
         lines.append(
             "- "
             f"`{_format_datetime(event.created_at, timezone_name)}` "
             f"`{severity}` `{html.escape(event.category)}` "
             f"`{html.escape(event.error_code)}` "
             f"{html.escape(event.summary)} "
-            f"(Generation: `{html.escape(generation)}`)"
+            f"(Generation: `{html.escape(generation)}`, Job: `{html.escape(job)}`, "
+            f"retryable: `{retryable}`)"
         )
     return "\n".join(lines)
 

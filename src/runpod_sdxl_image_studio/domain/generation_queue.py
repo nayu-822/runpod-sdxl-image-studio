@@ -111,12 +111,22 @@ class GenerationQueueItem:
     batch: GenerationBatch | None = None
 
 
+@dataclass(frozen=True)
+class QueueHealthCounts:
+    """Unbounded queue counters returned by the health query."""
+
+    pending_count: int
+    running_count: int
+    failed_count: int
+
+
 __all__ = [
     "BatchSeedStrategy",
     "CancellationOutcome",
     "GenerationBatch",
     "GenerationQueueEntry",
     "GenerationQueueItem",
+    "QueueHealthCounts",
     "OptionalArtifactRepairCandidate",
     "OptionalArtifactRepairOutcome",
     "ReconciliationOutcome",

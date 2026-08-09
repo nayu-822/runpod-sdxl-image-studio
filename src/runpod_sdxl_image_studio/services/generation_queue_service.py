@@ -23,6 +23,7 @@ from runpod_sdxl_image_studio.domain.generation_queue import (
     CancellationOutcome,
     GenerationBatch,
     GenerationQueueItem,
+    QueueHealthCounts,
     SubmissionState,
 )
 from runpod_sdxl_image_studio.domain.generation_settings import (
@@ -157,6 +158,22 @@ class GenerationQueueService:
             )
         except GenerationDispatchQueueRepositoryError as exc:
             raise GenerationQueueServiceError("キューを取得できませんでした。") from exc
+
+    def get_health_counts(self) -> QueueHealthCounts:
+        """Read queue counters without the bounded FIFO materialization path."""
+
+        try:
+            return self._repository.get_health_counts()
+        except GenerationDispatchQueueRepositoryError as exc:
+            raise GenerationQueueServiceError("queue health counts could not be read") from exc
+
+    def list_recent_failed(self, limit: int = 100) -> tuple[GenerationQueueItem, ...]:
+        """Read only recent failures for the System Health error summary."""
+
+        try:
+            return self._repository.list_recent_failed(min(max(1, limit), 100))
+        except GenerationDispatchQueueRepositoryError as exc:
+            raise GenerationQueueServiceError("recent queue failures could not be read") from exc
 
     def get_job_detail(self, generation_id: UUID) -> GenerationQueueItem | None:
         try:

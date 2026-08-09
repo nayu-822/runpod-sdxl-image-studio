@@ -62,6 +62,7 @@ class GenerationPreflightService:
         *,
         disk_usage_adapter: DiskUsageAdapterProtocol | None = None,
         workflow_template: Mapping[str, object] | None = None,
+        workflow_templates: Mapping[str, Mapping[str, object]] | None = None,
         drive_status_provider: DriveStatusProvider | None = None,
         error_recorder: ErrorEventRecorder | None = None,
         now_factory: Callable[[], datetime] | None = None,
@@ -70,6 +71,9 @@ class GenerationPreflightService:
         self._settings = settings
         self._disk_usage_adapter = disk_usage_adapter
         self._workflow_template = workflow_template or {}
+        self._workflow_templates = dict(workflow_templates or {})
+        if workflow_template is not None:
+            self._workflow_templates.setdefault("sdxl_txt2img", workflow_template)
         self._drive_status_provider = drive_status_provider
         self._error_recorder = error_recorder
         self._now_factory = now_factory or (lambda: datetime.now(UTC))
@@ -114,12 +118,92 @@ class GenerationPreflightService:
             self._check_required_nodes(
                 capabilities,
                 generation_settings,
+                workflow_template_id=generation_settings.workflow_template_id,
                 errors=errors,
             )
 
         self._check_disk(errors, warnings)
         await self._check_drive(warnings)
 
+        if status is not None:
+            warnings.extend(
+                _warning("comfyui_warning", warning) for warning in status.warnings[:10]
+            )
+        result = PreflightResult(
+            is_ready=not errors,
+            errors=tuple(errors),
+            warnings=tuple(warnings),
+            checked_at=checked_at,
+        )
+        self._record_issues(result)
+        return result
+
+    async def check_upscale(
+        self,
+        method: str,
+        *,
+        upscaler_name: str | None,
+        source_settings: GenerationSettings | None = None,
+    ) -> PreflightResult:
+        """Run workflow-specific checks before an image or latent upscale enqueue."""
+
+        checked_at = _utc(self._now_factory())
+        errors: list[PreflightIssue] = []
+        warnings: list[PreflightIssue] = []
+        status = await self._get_status(errors)
+        capabilities = status.capabilities if status is not None else None
+        if status is not None and not status.is_connected:
+            errors.append(
+                _error("comfyui_unavailable", status.message or "ComfyUI is not connected")
+            )
+        if capabilities is None:
+            errors.append(
+                _error(
+                    "comfyui_capabilities_unavailable",
+                    "ComfyUI capabilities could not be read",
+                )
+            )
+        elif method == "image":
+            _require_choice(
+                upscaler_name,
+                capabilities.upscale_models,
+                "upscaler_missing",
+                "Selected upscaler is not available",
+                errors,
+            )
+            self._check_required_nodes(
+                capabilities,
+                None,
+                workflow_template_id="sdxl_image_upscale",
+                errors=errors,
+            )
+        elif method == "latent":
+            if source_settings is None:
+                errors.append(
+                    _error(
+                        "upscale_source_settings_missing",
+                        "Latent upscale requires the parent Generation snapshot",
+                    )
+                )
+            else:
+                self._check_capabilities(
+                    capabilities,
+                    source_settings,
+                    uses_upscaler=False,
+                    upscaler_name=None,
+                    errors=errors,
+                )
+            self._check_required_nodes(
+                capabilities,
+                source_settings,
+                workflow_template_id="sdxl_latent_upscale",
+                errors=errors,
+            )
+        else:
+            errors.append(_error("upscale_method_invalid", "Upscale method is not supported"))
+
+        self._check_disk(errors, warnings)
+        await self._check_drive(warnings)
         if status is not None:
             warnings.extend(
                 _warning("comfyui_warning", warning) for warning in status.warnings[:10]
@@ -217,14 +301,21 @@ class GenerationPreflightService:
     def _check_required_nodes(
         self,
         capabilities: ComfyUICapabilities,
-        generation_settings: GenerationSettings,
+        generation_settings: GenerationSettings | None,
         *,
+        workflow_template_id: str,
         errors: list[PreflightIssue],
     ) -> None:
-        required = _required_node_classes(self._workflow_template)
-        if generation_settings.vae_name is not None:
+        required = _required_node_classes(
+            self._workflow_templates.get(
+                workflow_template_id,
+                self._workflow_template if workflow_template_id == "sdxl_txt2img" else {},
+            ),
+            workflow_template_id=workflow_template_id,
+        )
+        if generation_settings is not None and generation_settings.vae_name is not None:
             required.add("VAELoader")
-        if generation_settings.loras:
+        if generation_settings is not None and generation_settings.loras:
             required.add("LoraLoader")
         missing = sorted(required.difference(capabilities.available_node_classes))
         if missing:
@@ -327,17 +418,47 @@ def _require_choice(
         errors.append(_error(code, message))
 
 
-def _required_node_classes(template: Mapping[str, object]) -> set[str]:
+_DEFAULT_REQUIRED_NODES = {
+    "sdxl_image_upscale": {
+        "LoadImage",
+        "UpscaleModelLoader",
+        "ImageUpscaleWithModel",
+        "ImageScale",
+        "SaveImage",
+    },
+    "sdxl_latent_upscale": {
+        "LoadImage",
+        "CheckpointLoaderSimple",
+        "CLIPTextEncode",
+        "VAEEncode",
+        "LatentUpscale",
+        "KSampler",
+        "VAEDecode",
+        "SaveImage",
+    },
+}
+
+
+def _required_node_classes(
+    template: Mapping[str, object],
+    *,
+    workflow_template_id: str = "sdxl_txt2img",
+) -> set[str]:
     value = template.get("required_node_classes")
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
-        return {
-            "CheckpointLoaderSimple",
-            "CLIPTextEncode",
-            "EmptyLatentImage",
-            "KSampler",
-            "VAEDecode",
-            "SaveImage",
-        }
+        return set(
+            _DEFAULT_REQUIRED_NODES.get(
+                workflow_template_id,
+                {
+                    "CheckpointLoaderSimple",
+                    "CLIPTextEncode",
+                    "EmptyLatentImage",
+                    "KSampler",
+                    "VAEDecode",
+                    "SaveImage",
+                },
+            )
+        )
     return {item for item in value if isinstance(item, str) and item}
 
 

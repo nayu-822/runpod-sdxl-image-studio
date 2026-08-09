@@ -33,6 +33,7 @@ from runpod_sdxl_image_studio.domain.generation_queue import (
     GenerationBatch,
     GenerationQueueEntry,
     GenerationQueueItem,
+    QueueHealthCounts,
     SubmissionState,
 )
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
@@ -176,6 +177,10 @@ class GenerationDispatchQueueRepositoryProtocol(Protocol):
         batch_id: UUID | None = None,
         limit: int = 200,
     ) -> tuple[GenerationQueueItem, ...]: ...
+
+    def get_health_counts(self) -> QueueHealthCounts: ...
+
+    def list_recent_failed(self, limit: int = 100) -> tuple[GenerationQueueItem, ...]: ...
 
     def get_queue_item(self, generation_id: UUID) -> GenerationQueueItem | None: ...
 
@@ -1019,6 +1024,65 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
                 return tuple(_queue_item_from_entry(session, entry) for entry in entries)
         except (SQLAlchemyError, ValueError) as exc:
             raise GenerationDispatchQueueRepositoryError("queue could not be listed") from exc
+
+    def get_health_counts(self) -> QueueHealthCounts:
+        """Count every queued Generation without materializing queue items."""
+
+        statuses = (
+            GenerationStatus.PENDING.value,
+            GenerationStatus.QUEUED.value,
+            GenerationStatus.RUNNING.value,
+            GenerationStatus.FAILED.value,
+        )
+        try:
+            with session_scope(self._session_factory) as session:
+                rows = session.execute(
+                    select(
+                        GenerationModel.status,
+                        func.count(GenerationQueueEntryModel.generation_id),
+                    )
+                    .join(
+                        GenerationQueueEntryModel,
+                        GenerationQueueEntryModel.generation_id == GenerationModel.id,
+                    )
+                    .where(GenerationModel.status.in_(statuses))
+                    .group_by(GenerationModel.status)
+                ).all()
+                counts = {status: 0 for status in statuses}
+                for status, count in rows:
+                    counts[str(status)] = int(count)
+                return QueueHealthCounts(
+                    pending_count=counts[GenerationStatus.PENDING.value]
+                    + counts[GenerationStatus.QUEUED.value],
+                    running_count=counts[GenerationStatus.RUNNING.value],
+                    failed_count=counts[GenerationStatus.FAILED.value],
+                )
+        except (SQLAlchemyError, ValueError) as exc:
+            raise GenerationDispatchQueueRepositoryError(
+                "queue health counts could not be read"
+            ) from exc
+
+    def list_recent_failed(self, limit: int = 100) -> tuple[GenerationQueueItem, ...]:
+        """Return only recent failed items, ordered by Generation update time."""
+
+        try:
+            with session_scope(self._session_factory) as session:
+                statement = (
+                    select(GenerationQueueEntryModel)
+                    .join(
+                        GenerationModel,
+                        GenerationModel.id == GenerationQueueEntryModel.generation_id,
+                    )
+                    .where(GenerationModel.status == GenerationStatus.FAILED.value)
+                    .order_by(GenerationModel.updated_at.desc(), GenerationModel.id.desc())
+                    .limit(min(max(1, limit), 100))
+                )
+                entries = session.scalars(statement).all()
+                return tuple(_queue_item_from_entry(session, entry) for entry in entries)
+        except (SQLAlchemyError, ValueError) as exc:
+            raise GenerationDispatchQueueRepositoryError(
+                "recent failed queue items could not be read"
+            ) from exc
 
     def get_queue_item(self, generation_id: UUID) -> GenerationQueueItem | None:
         try:

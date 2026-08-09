@@ -187,6 +187,56 @@ class UpscaleEnqueueService:
                 "upscale_parent_unavailable", "the selected parent could not be read"
             ) from exc
 
+    def get_parent_generation_settings(self, generation_id: UUID) -> GenerationSettings:
+        """Read the persisted parent snapshot required by latent-upscale preflight."""
+
+        try:
+            generation = self._generations.get_by_id(generation_id)
+            if generation is None:
+                raise UpscaleEnqueueError(
+                    "upscale_parent_not_found", "the selected Generation was not found"
+                )
+            if generation.status is not GenerationStatus.COMPLETED:
+                raise UpscaleEnqueueError(
+                    "upscale_parent_not_completed",
+                    "only completed Generations can be used for latent upscale",
+                )
+            return generation.settings_snapshot.to_generation_settings()
+        except UpscaleEnqueueError:
+            raise
+        except (GenerationRepositoryError, ValueError, OSError) as exc:
+            raise UpscaleEnqueueError(
+                "upscale_parent_unavailable",
+                "the parent Generation snapshot could not be read",
+            ) from exc
+
+    def get_import_generation_settings(self, import_id: UUID) -> GenerationSettings:
+        """Read the validated imported snapshot used by latent-upscale preflight."""
+
+        if self._metadata_import_repository is None:
+            raise UpscaleEnqueueError(
+                "metadata_import_unavailable", "the metadata import is unavailable"
+            )
+        try:
+            record = self._metadata_import_repository.get_by_id(import_id)
+            if (
+                record is None
+                or record.candidate is None
+                or not record.candidate.is_generation_ready
+            ):
+                raise UpscaleEnqueueError(
+                    "metadata_import_unresolved",
+                    "latent upscale requires complete imported metadata",
+                )
+            return record.candidate.to_generation_settings()
+        except UpscaleEnqueueError:
+            raise
+        except (MetadataImportError, ValueError, OSError) as exc:
+            raise UpscaleEnqueueError(
+                "metadata_import_unresolved",
+                "latent upscale metadata could not be read",
+            ) from exc
+
     def comparison_for_generation(self, generation_id: UUID) -> UpscaleComparison:
         """Return two persisted files only for a completed upscale Generation."""
 

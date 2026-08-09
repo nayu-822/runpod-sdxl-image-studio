@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from functools import wraps
 from typing import Any
 from uuid import UUID
 
@@ -768,10 +769,17 @@ def make_batch_enqueue_handler(
             )
             preflight_message = ""
             if preflight_service is not None:
-                preflight = await preflight_service.check(settings)
+                try:
+                    preflight = await preflight_service.check(settings)
+                except Exception:  # noqa: BLE001 - restore the action on preflight failure
+                    return (
+                        gr.Button("バッチをキューへ追加", interactive=True),
+                        "",
+                        "Generation preflight could not be completed; nothing was queued",
+                    )
                 if not preflight.is_ready:
                     return (
-                        gr.Button("Batch", interactive=True),
+                        gr.Button("バッチをキューへ追加", interactive=True),
                         "",
                         preflight_markdown(preflight),
                     )
@@ -802,7 +810,38 @@ def make_batch_enqueue_handler(
             ),
         )
 
-    return handler
+    return _wrap_batch_handler(handler)
+
+
+def _wrap_batch_handler(
+    handler: Callable[..., Awaitable[tuple[object, ...]]],
+) -> Callable[..., Awaitable[tuple[object, ...]]]:
+    """Normalize every Batch outcome to the restored Japanese action label."""
+
+    @wraps(handler)
+    async def wrapped(*args: object, **kwargs: object) -> tuple[object, ...]:
+        try:
+            result = await handler(*args, **kwargs)
+        except Exception:  # noqa: BLE001 - UI boundary must restore the action
+            return (
+                gr.Button(
+                    value="\u30d0\u30c3\u30c1\u3092\u30ad\u30e5\u30fc\u3078\u8ffd\u52a0",
+                    interactive=True,
+                ),
+                "",
+                "Batch enqueue failed; nothing was queued",
+            )
+        if not result:
+            return result
+        return (
+            gr.Button(
+                value="\u30d0\u30c3\u30c1\u3092\u30ad\u30e5\u30fc\u3078\u8ffd\u52a0",
+                interactive=True,
+            ),
+            *result[1:],
+        )
+
+    return wrapped
 
 
 def _legacy_disable_generate_button() -> gr.Button:

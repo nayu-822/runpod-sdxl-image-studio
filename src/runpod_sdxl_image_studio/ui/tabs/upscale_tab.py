@@ -16,10 +16,14 @@ from runpod_sdxl_image_studio.domain.upscale import (
     UpscaleSettings,
     UpscaleSizingMode,
 )
+from runpod_sdxl_image_studio.services.generation_preflight_service import (
+    GenerationPreflightService,
+)
 from runpod_sdxl_image_studio.services.upscale_enqueue_service import (
     UpscaleEnqueueError,
     UpscaleEnqueueService,
 )
+from runpod_sdxl_image_studio.ui.view_models import preflight_markdown
 
 logger = logging.getLogger(__name__)
 
@@ -214,7 +218,8 @@ def begin_upscale_enqueue() -> gr.Button:
 
 def make_upscale_enqueue_details_handler(
     service: UpscaleEnqueueService,
-) -> Callable[..., tuple[Any, str]]:
+    preflight_service: GenerationPreflightService | None = None,
+) -> Callable[..., Any]:
     def handler(
         parent_generation_id: str,
         method: str,
@@ -265,7 +270,75 @@ def make_upscale_enqueue_details_handler(
             logger.exception("Upscale enqueue details failed")
             return gr.Button(interactive=True), _INTERNAL_ERROR
 
-    return handler
+    if preflight_service is None:
+        return handler
+
+    async def preflight_handler(
+        parent_generation_id: str,
+        method: str,
+        sizing_mode: str,
+        scale_factor: float | None,
+        target_width: float | None,
+        target_height: float | None,
+        upscaler_name: str | None,
+        denoise: float | None,
+        source_import_id: str | None = None,
+    ) -> tuple[Any, str]:
+        try:
+            settings = _settings_from_inputs(
+                method,
+                sizing_mode,
+                scale_factor,
+                target_width,
+                target_height,
+                upscaler_name,
+                denoise,
+            )
+            import_id = (
+                UUID(source_import_id.strip())
+                if source_import_id and source_import_id.strip()
+                else None
+            )
+            parent_id = (
+                UUID(parent_generation_id.strip())
+                if parent_generation_id and parent_generation_id.strip()
+                else None
+            )
+            source_settings = None
+            if settings.method is UpscaleMethod.LATENT:
+                if import_id is not None:
+                    source_settings = service.get_import_generation_settings(import_id)
+                elif parent_id is not None:
+                    source_settings = service.get_parent_generation_settings(parent_id)
+            preflight = await preflight_service.check_upscale(
+                settings.method.value,
+                upscaler_name=settings.upscaler_name,
+                source_settings=source_settings,
+            )
+            if not preflight.is_ready:
+                return gr.Button(interactive=True), preflight_markdown(preflight)
+            item = (
+                service.enqueue_import(import_id, settings)
+                if import_id is not None
+                else service.enqueue(parent_id, settings)  # type: ignore[arg-type]
+            )
+            warning = f"\n\n{preflight_markdown(preflight)}" if preflight.warnings else ""
+            return gr.Button(interactive=True), (
+                f"Generation ID: `{item.generation.id}`\n\n"
+                f"Queue position: `{item.entry.sequence}`\n\n"
+                f"Parent Generation ID: `{parent_id}`\n\n"
+                f"Method: `{settings.method.value}` / output size: "
+                f"`{item.generation.settings_snapshot.width} x "
+                f"{item.generation.settings_snapshot.height}`"
+                f"{warning}"
+            )
+        except (ValueError, UpscaleEnqueueError):
+            return gr.Button(interactive=True), _UPSCALE_INPUT_ERROR
+        except Exception:  # noqa: BLE001 - restore the button without exposing internals
+            logger.exception("Upscale enqueue preflight failed")
+            return gr.Button(interactive=True), _INTERNAL_ERROR
+
+    return preflight_handler
 
 
 def make_upscale_enqueue_handler(

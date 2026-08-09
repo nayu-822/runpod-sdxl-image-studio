@@ -359,6 +359,11 @@ def build_app(
         app_settings,
         disk_usage_adapter=disk_usage_adapter,
         workflow_template=loaded_workflow.as_mapping(),
+        workflow_templates={
+            "sdxl_txt2img": loaded_workflow.as_mapping(),
+            "sdxl_image_upscale": loaded_image_upscale.as_mapping(),
+            "sdxl_latent_upscale": loaded_latent_upscale.as_mapping(),
+        },
         drive_status_provider=drive_sync_service.check_connection,
         error_recorder=system_error_repository,
     )
@@ -662,7 +667,10 @@ def build_app(
             outputs=[upscale.enqueue_button],
             queue=False,
         ).then(
-            fn=make_upscale_enqueue_details_handler(upscale_enqueue_service),
+            fn=make_upscale_enqueue_details_handler(
+                upscale_enqueue_service,
+                preflight_service,
+            ),
             inputs=[
                 upscale.parent_generation_id,
                 upscale.method,
