@@ -392,6 +392,30 @@ Safari/Chromeのbackground復帰、ソフトキーボード表示中のsticky操
 - エラーの原因を後から追跡できる
 - システムの健康状態をスマホから確認できる
 
+### Phase 9 実装状況
+
+Phase 9を実装済みです。既存の`ComfyUIService`、`GenerationQueueService`、
+`DriveSyncService`、capability validationを集約し、`SystemHealthService`が
+ComfyUI、GPU/VRAM、生成Queue、ローカルディスク、Google Drive、モデル数を
+1回のスナップとして提供します。Systemタブは`demo.load`と手動更新のみで
+更新し、リアルタイム連続pollは行いません。
+
+Generation enqueue前には、永続化より前に`PreflightResult`を返す共通チェックを実行し、
+ComfyUI接続、checkpoint、LoRA、VAE、upscaler、sampler、scheduler、required node、
+ディスク残量を確認します。Google Driveの同期状態はwarningとし、生成のハードストップにはしません。
+ワーカー側の最終validationは引き続き実行します。
+
+Systemに紐づかない障害も扱うため、sanitizedなappend-only`system_error_events`テーブルと
+Alembic `0015_phase9_system_error_events`を追加しました。API key、token、rclone secret、絶対パス、
+プロンプ全文、生のtracebackは保存せず、最新100件までをSystemタブに表示しま。
+
+`IMAGE_STUDIO_MIN_FREE_DISK_BYTES`が危陷閾値、`IMAGE_STUDIO_WARNING_FREE_DISK_BYTES`がwarning閾値です。
+両者の大小関係は`Settings`で検証します。既存データを変更しない新規テーブルのみを使うため、
+ダウングレードでは既存のGeneration/Job/Artifact/Queue/Driveデータに触れません。
+
+Phase 9の自動確認は`tests/unit/test_phase9_system_health.py`で行い、FakeのComfyUI、Queue、Drive、
+ディスクadapter、SQLiteを使用します。実GPU、実ComfyUI、実RunPod、実Google Driveは要求しません。
+
 ## 将来候補
 
 - img2img

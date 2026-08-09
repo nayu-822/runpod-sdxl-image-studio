@@ -68,6 +68,14 @@ class Settings(BaseSettings):
     data_dir: Path = Field(
         Path("/workspace/image-studio-data"), validation_alias="IMAGE_STUDIO_DATA_DIR"
     )
+    min_free_disk_bytes: int = Field(
+        1_073_741_824,
+        validation_alias="IMAGE_STUDIO_MIN_FREE_DISK_BYTES",
+    )
+    warning_free_disk_bytes: int = Field(
+        5_368_709_120,
+        validation_alias="IMAGE_STUDIO_WARNING_FREE_DISK_BYTES",
+    )
     database_url: str | None = Field(
         None,
         validation_alias="IMAGE_STUDIO_DATABASE_URL",
@@ -253,6 +261,8 @@ class Settings(BaseSettings):
         "queue_max_pending_jobs",
         "batch_max_items",
         "drive_discovery_batch_size",
+        "min_free_disk_bytes",
+        "warning_free_disk_bytes",
     )
     @classmethod
     def validate_positive_integer(cls, value: int) -> int:
@@ -335,6 +345,8 @@ class Settings(BaseSettings):
             raise ValueError(
                 "optional_artifact_repair_batch_size must not exceed recovery_max_items"
             )
+        if self.warning_free_disk_bytes <= self.min_free_disk_bytes:
+            raise ValueError("warning_free_disk_bytes must be greater than min_free_disk_bytes")
         metadata_wait = max(
             self.metadata_request_max_wait_seconds,
             self.metadata_connect_timeout_seconds

@@ -500,6 +500,38 @@ class DriveManifestJobModel(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class SystemErrorEventModel(Base):
+    """Append-only sanitized operational errors not owned by one generation."""
+
+    __tablename__ = "system_error_events"
+    __table_args__ = (
+        CheckConstraint(
+            "severity IN ('info', 'warning', 'error')",
+            name="ck_system_error_event_severity",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    category: Mapped[str] = mapped_column(String(64), nullable=False)
+    severity: Mapped[str] = mapped_column(String(16), nullable=False)
+    error_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    generation_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("generations.id", ondelete="SET NULL"), nullable=True
+    )
+    job_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("generation_jobs.id", ondelete="SET NULL"), nullable=True
+    )
+    retryable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    details: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+Index("ix_system_error_events_created_at", SystemErrorEventModel.created_at)
+Index("ix_system_error_events_category", SystemErrorEventModel.category)
+Index("ix_system_error_events_generation", SystemErrorEventModel.generation_id)
+
+
 Index("ix_generations_created_at", GenerationModel.created_at)
 Index("ix_generations_status", GenerationModel.status)
 Index("ix_generations_kind", GenerationModel.kind)

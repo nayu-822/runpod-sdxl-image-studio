@@ -49,10 +49,14 @@ from runpod_sdxl_image_studio.adapters.database.repositories.metadata_import_rep
 from runpod_sdxl_image_studio.adapters.database.repositories.preset_repository import (
     PresetRepository,
 )
+from runpod_sdxl_image_studio.adapters.database.repositories.system_error_repository import (
+    SystemErrorEventRepository,
+)
 from runpod_sdxl_image_studio.adapters.database.repositories.upscale_settings_repository import (
     UpscaleSettingsRepository,
 )
 from runpod_sdxl_image_studio.adapters.drive.google_drive_adapter import GoogleDriveAdapter
+from runpod_sdxl_image_studio.adapters.storage.disk_usage import LocalDiskUsageAdapter
 from runpod_sdxl_image_studio.adapters.storage.generation_metadata_storage import (
     GenerationMetadataStorage,
 )
@@ -85,6 +89,9 @@ from runpod_sdxl_image_studio.services.generation_history_service import (
 from runpod_sdxl_image_studio.services.generation_persistence import (
     GenerationPersistenceRepositories,
 )
+from runpod_sdxl_image_studio.services.generation_preflight_service import (
+    GenerationPreflightService,
+)
 from runpod_sdxl_image_studio.services.generation_queue_service import GenerationQueueService
 from runpod_sdxl_image_studio.services.generation_recovery_service import (
     GenerationRecoveryService,
@@ -97,6 +104,7 @@ from runpod_sdxl_image_studio.services.lora_catalog_service import (
 from runpod_sdxl_image_studio.services.metadata_import_service import MetadataImportService
 from runpod_sdxl_image_studio.services.preset_service import PresetService
 from runpod_sdxl_image_studio.services.recent_settings_service import RecentSettingsService
+from runpod_sdxl_image_studio.services.system_health_service import SystemHealthService
 from runpod_sdxl_image_studio.services.upscale_enqueue_service import UpscaleEnqueueService
 from runpod_sdxl_image_studio.services.upscale_service import UpscaleService
 from runpod_sdxl_image_studio.ui.components.lora_editor import (
@@ -198,6 +206,7 @@ from runpod_sdxl_image_studio.ui.tabs.system_tab import (
     make_check_connection_handler,
     make_enqueue_handler,
     make_refresh_handler,
+    make_system_health_handler,
     size_preset_values,
 )
 from runpod_sdxl_image_studio.ui.tabs.upscale_tab import (
@@ -259,6 +268,7 @@ def build_app(
     queue_repository = GenerationQueueRepository(session_factory)
     dispatch_queue_repository = GenerationDispatchQueueRepository(session_factory)
     drive_sync_repository = DriveSyncRepository(session_factory)
+    system_error_repository = SystemErrorEventRepository(session_factory)
     start_repository = GenerationStartRepository(session_factory)
     progress_repository = GenerationProgressRepository(session_factory)
     catalog_service = LoraCatalogService(
@@ -342,6 +352,23 @@ def build_app(
         app_settings,
         cancellation_adapter,
         upscale_settings_repository=upscale_settings_repository,
+    )
+    disk_usage_adapter = LocalDiskUsageAdapter()
+    preflight_service = GenerationPreflightService(
+        comfyui_service,
+        app_settings,
+        disk_usage_adapter=disk_usage_adapter,
+        workflow_template=loaded_workflow.as_mapping(),
+        drive_status_provider=drive_sync_service.check_connection,
+        error_recorder=system_error_repository,
+    )
+    system_health_service = SystemHealthService(
+        comfyui_service,
+        queue_service,
+        drive_sync_service,
+        app_settings,
+        disk_usage_adapter=disk_usage_adapter,
+        error_history_repository=system_error_repository,
     )
     execution_service = GenerationExecutionService(
         generation_service,
@@ -449,6 +476,21 @@ def build_app(
             metadata_import = build_metadata_import_tab(app_settings.max_loras)
         with gr.Tab("同期・設定"):
             drive_sync = build_drive_sync_tab()
+
+        health_handler = make_system_health_handler(
+            system_health_service,
+            app_settings.timezone,
+        )
+        demo.load(
+            fn=health_handler,
+            outputs=[system.health_markdown, system.error_history_markdown],
+            concurrency_limit=1,
+        )
+        system.health_refresh_button.click(
+            fn=health_handler,
+            outputs=[system.health_markdown, system.error_history_markdown],
+            concurrency_limit=1,
+        )
 
         mobile_status_inputs = [
             generation.active_generation_id,
@@ -745,7 +787,11 @@ def build_app(
             queue=False,
         )
         batch_enqueue_event.then(
-            fn=make_batch_enqueue_handler(queue_service, app_settings.max_loras),
+            fn=make_batch_enqueue_handler(
+                queue_service,
+                app_settings.max_loras,
+                preflight_service,
+            ),
             inputs=[
                 generation.checkpoint,
                 generation.positive_prompt,
@@ -1760,7 +1806,7 @@ def build_app(
             outputs=restore_outputs,
         )
         regeneration_generation_event = regenerate_event.then(
-            fn=make_enqueue_handler(queue_service, app_settings.max_loras),
+            fn=make_enqueue_handler(queue_service, app_settings.max_loras, preflight_service),
             inputs=generation_inputs,
             outputs=[
                 generation.generate_button,
@@ -1786,7 +1832,7 @@ def build_app(
             queue=False,
         )
         generation_enqueue_event = generate_event.then(
-            fn=make_enqueue_handler(queue_service, app_settings.max_loras),
+            fn=make_enqueue_handler(queue_service, app_settings.max_loras, preflight_service),
             inputs=generation_inputs,
             outputs=[
                 generation.generate_button,
@@ -1843,7 +1889,7 @@ def build_app(
             concurrency_limit=1,
         )
         result_regenerate_enqueue_event = result_regenerate_event.then(
-            fn=make_enqueue_handler(queue_service, app_settings.max_loras),
+            fn=make_enqueue_handler(queue_service, app_settings.max_loras, preflight_service),
             inputs=generation_inputs,
             outputs=[
                 generation.generate_button,

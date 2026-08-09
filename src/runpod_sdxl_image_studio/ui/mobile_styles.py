@@ -43,6 +43,19 @@ MOBILE_UI_CSS = """
   gap: 1rem !important;
 }
 
+.system-health-layout {
+  align-items: stretch !important;
+  gap: 1rem !important;
+}
+
+.system-health-column,
+.system-error-column,
+.system-health-section,
+.system-error-section {
+  min-width: 0 !important;
+  width: 100% !important;
+}
+
 .generation-primary,
 .generation-preview,
 .generation-advanced,
@@ -209,6 +222,11 @@ MOBILE_UI_CSS = """
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   }
 
+  .system-health-layout {
+    display: grid !important;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+
   .comparison-layout {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -223,6 +241,11 @@ MOBILE_UI_CSS = """
     display: grid !important;
     grid-template-columns: minmax(0, 1fr);
   }
+
+  .system-health-layout {
+    display: grid !important;
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 @media (max-width: 639px) {
@@ -231,6 +254,12 @@ MOBILE_UI_CSS = """
   }
 
   .generation-layout {
+    display: grid !important;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.75rem !important;
+  }
+
+  .system-health-layout {
     display: grid !important;
     grid-template-columns: minmax(0, 1fr);
     gap: 0.75rem !important;

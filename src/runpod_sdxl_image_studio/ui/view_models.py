@@ -8,7 +8,12 @@ from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from runpod_sdxl_image_studio.adapters.comfyui.models import ComfyUICapabilities
-from runpod_sdxl_image_studio.domain.system_status import ComfyUIStatus
+from runpod_sdxl_image_studio.domain.preflight import PreflightResult
+from runpod_sdxl_image_studio.domain.system_status import (
+    ComfyUIStatus,
+    SystemErrorEvent,
+    SystemHealthView,
+)
 
 
 @dataclass(frozen=True)
@@ -133,6 +138,85 @@ def lora_markdown(capabilities: ComfyUICapabilities | None) -> str:
     if not capabilities.loras:
         return "**LoRA一覧:** 0件"
     return "**LoRA一覧:**\n" + "\n".join(f"- `{name}`" for name in capabilities.loras)
+
+
+def system_health_markdown(view: SystemHealthView, timezone_name: str) -> str:
+    """Render the aggregated health view as responsive, bounded Markdown."""
+
+    status = html.escape(str(view.overall_status))
+    gpu = html.escape(view.gpu_name or "-")
+    comfy_state = "connected" if view.comfyui_connected else "disconnected"
+    lines = [
+        f"### System Health: `{status}`",
+        f"**Checked:** {_format_datetime(view.checked_at, timezone_name)}",
+        f"**ComfyUI:** `{comfy_state}` — {html.escape(view.comfyui_message or '-')}",
+        f"**ComfyUI version:** `{html.escape(view.comfyui_version or '-')}`",
+        f"**GPU:** `{gpu}`",
+        (
+            f"**VRAM:** `{_format_bytes(view.vram_total)}` total / "
+            f"`{_format_bytes(view.vram_free)}` free"
+        ),
+        (
+            "**Queue:** "
+            f"pending `{view.pending_count}`, running `{view.running_count}`, "
+            f"failed `{view.failed_count}`"
+        ),
+        (
+            "**Storage:** "
+            f"total `{_format_bytes(view.local_total_bytes)}`, "
+            f"used `{_format_bytes(view.local_used_bytes)}`, "
+            f"free `{_format_bytes(view.local_free_bytes)}`, "
+            f"unsynced `{_format_bytes(view.unsynced_bytes)}`"
+        ),
+        (
+            "**Google Drive:** "
+            f"configured `{view.drive_configured}`, connected `{view.drive_connected}`, "
+            f"pending `{view.pending_sync_count}`, failed `{view.failed_sync_count}`, "
+            f"last sync `{_format_datetime(view.last_sync_at, timezone_name)}`"
+        ),
+        (
+            "**Models:** "
+            f"checkpoint `{view.checkpoint_count}`, LoRA `{view.lora_count}`, "
+            f"VAE `{view.vae_count}`, upscaler `{view.upscaler_count}`"
+        ),
+    ]
+    return "\n".join(lines)
+
+
+def system_error_history_markdown(
+    events: tuple[SystemErrorEvent, ...],
+    timezone_name: str,
+) -> str:
+    """Render at most the repository's bounded recent error history."""
+
+    if not events:
+        return "### Recent errors\nNo recent operational errors."
+    lines = ["### Recent errors"]
+    for event in events[:100]:
+        severity = html.escape(str(event.severity))
+        generation = _short_generation_id(str(event.generation_id) if event.generation_id else None)
+        lines.append(
+            "- "
+            f"`{_format_datetime(event.created_at, timezone_name)}` "
+            f"`{severity}` `{html.escape(event.category)}` "
+            f"`{html.escape(event.error_code)}` "
+            f"{html.escape(event.summary)} "
+            f"(Generation: `{html.escape(generation)}`)"
+        )
+    return "\n".join(lines)
+
+
+def preflight_markdown(result: PreflightResult) -> str:
+    """Render preflight errors and warnings without exposing internal paths."""
+
+    if result.is_ready and not result.warnings:
+        return "Preflight: ready"
+    lines = ["Preflight: ready with warnings" if result.is_ready else "Preflight: blocked"]
+    for issue in result.errors:
+        lines.append(f"- ❌ `{html.escape(issue.code)}` {html.escape(issue.message)}")
+    for issue in result.warnings:
+        lines.append(f"- ⚠️ `{html.escape(issue.code)}` {html.escape(issue.message)}")
+    return "\n".join(lines)
 
 
 def preserve_selection(current: str | None, choices: tuple[str, ...]) -> str | None:

@@ -514,3 +514,38 @@ IMAGE_STUDIO_BROWSER_URL=http://127.0.0.1:7860 pytest -q tests/browser/test_phas
 
 CIでは一時SQLiteを使うローカルGradioを起動し、`python -m playwright install --with-deps chromium`後に同じviewportテストを実行します。
 テスト対象は320x568、375x812、390x844、430x932、768x1024、1280x800です。Safari/Chromeのbackground復帰、ソフトキーボード表示中のsticky操作は別途手動確認が必要です。
+
+## Phase 9: システム状態・エラー履歴・生成前チェック強化
+
+Systemタブの`System Health`で、ComfyUI接続、ComfyUI version、GPU/VRAM、生成Queue、
+ローカルディスク、Google Drive同期、checkpoint・LoRA・VAE・upscalerの件数を確認できます。
+`demo.load`と`Refresh system status`の手動更新のみで読み取り、連続的なpollは行いません。
+
+Generationの永続化前に、ComfyUI、選択モデル、required node、ディスク残量をチェックします。
+errorのときはGeneration/Job/Queueを作成せず、warningのときは警告を表示して生成を続行します。
+Google Driveの不接続は生成を停めず、同期失敗は再試行可能な状態として扱います。worker側の最終検証は維持しています。
+
+`Recent errors` は最新100件のサニタイズ済みイベントのみを表示します。API key、token、rclone秘密、絶対パス、
+プロンプ全文、生のtracebackは記録しません。必要な障害詳細はサーバー側の許可されたログで確認し、UIから任意パスのログを読み込みません。
+
+### Phase 9 の設定と確認
+
+```dotenv
+IMAGE_STUDIO_MIN_FREE_DISK_BYTES=1073741824
+IMAGE_STUDIO_WARNING_FREE_DISK_BYTES=5368709120
+```
+
+warning閾値は危険閾値より大きく設定します。確認コマンド:
+
+```bash
+ruff check .
+ruff format --check .
+mypy src
+pytest tests/unit/test_phase9_system_health.py
+pytest
+alembic upgrade head
+alembic downgrade -1
+alembic upgrade head
+```
+
+Phase 9の自動テストはFake adapter、SQLite、Alembicを使い、実GPU・実ComfyUI・実RunPod・実Google Driveを必要としません。

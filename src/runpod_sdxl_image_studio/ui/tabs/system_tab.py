@@ -18,6 +18,9 @@ from runpod_sdxl_image_studio.domain.generation import (
 )
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
 from runpod_sdxl_image_studio.services.comfyui_service import ComfyUIService
+from runpod_sdxl_image_studio.services.generation_preflight_service import (
+    GenerationPreflightService,
+)
 from runpod_sdxl_image_studio.services.generation_queue_service import (
     GenerationQueueService,
     GenerationQueueServiceError,
@@ -27,6 +30,7 @@ from runpod_sdxl_image_studio.services.lora_catalog_service import (
     LoraCatalogError,
     LoraCatalogService,
 )
+from runpod_sdxl_image_studio.services.system_health_service import SystemHealthService
 from runpod_sdxl_image_studio.ui.components.generation_status_card import (
     build_generation_status_card,
 )
@@ -40,8 +44,11 @@ from runpod_sdxl_image_studio.ui.components.lora_editor import (
 from runpod_sdxl_image_studio.ui.view_models import (
     capability_choices,
     lora_markdown,
+    preflight_markdown,
     preserve_selection,
     status_markdown,
+    system_error_history_markdown,
+    system_health_markdown,
 )
 
 _DEFAULT_PROGRESS = gr.Progress()
@@ -55,6 +62,9 @@ class SystemTabComponents:
     connection_button: gr.Button
     refresh_button: gr.Button
     capability_message: gr.Markdown
+    health_markdown: gr.Markdown
+    health_refresh_button: gr.Button
+    error_history_markdown: gr.Markdown
 
 
 @dataclass(frozen=True)
@@ -140,7 +150,12 @@ def capability_refresh_outputs(generation: GenerationTabComponents) -> tuple[Any
     )
 
 
-def build_system_tab(comfyui_url: str, initial_markdown: str) -> SystemTabComponents:
+def build_system_tab(
+    comfyui_url: str,
+    initial_markdown: str,
+    initial_health_markdown: str = "### System Health\nNot checked",
+    initial_error_history_markdown: str = "### Recent errors\nNo recent operational errors.",
+) -> SystemTabComponents:
     """Build the system tab without making a network request."""
 
     gr.Markdown("## システム")
@@ -150,7 +165,30 @@ def build_system_tab(comfyui_url: str, initial_markdown: str) -> SystemTabCompon
         connection_button = gr.Button("接続確認", variant="primary", min_width=140)
         refresh_button = gr.Button("モデル一覧を更新", min_width=180)
     capability_message = gr.Markdown("")
-    return SystemTabComponents(status, connection_button, refresh_button, capability_message)
+    with gr.Row(elem_classes=["system-health-layout"]):
+        with (
+            gr.Column(elem_classes=["system-health-column"]),
+            gr.Accordion("System Health", open=True, elem_classes=["system-health-section"]),
+        ):
+            health_markdown = gr.Markdown(initial_health_markdown, elem_id="system-health")
+            health_refresh_button = gr.Button(
+                "Refresh system status",
+                elem_classes=["mobile-tap-button"],
+            )
+        with (
+            gr.Column(elem_classes=["system-error-column"]),
+            gr.Accordion("Recent errors", open=False, elem_classes=["system-error-section"]),
+        ):
+            error_history_markdown = gr.Markdown(initial_error_history_markdown)
+    return SystemTabComponents(
+        status,
+        connection_button,
+        refresh_button,
+        capability_message,
+        health_markdown,
+        health_refresh_button,
+        error_history_markdown,
+    )
 
 
 def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
@@ -335,6 +373,22 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
         result_upscale_button=result_upscale_button,
         result_message=result_message,
     )
+
+
+def make_system_health_handler(
+    service: SystemHealthService,
+    timezone_name: str,
+) -> Callable[..., Awaitable[tuple[str, str]]]:
+    """Create the manual/demo.load health snapshot handler."""
+
+    async def handler() -> tuple[str, str]:
+        view = await service.get_health()
+        return (
+            system_health_markdown(view, timezone_name),
+            system_error_history_markdown(view.recent_errors, timezone_name),
+        )
+
+    return handler
 
 
 def make_check_connection_handler(
@@ -561,6 +615,7 @@ def make_generate_handler(
 def make_enqueue_handler(
     service: GenerationQueueService,
     max_loras: int,
+    preflight_service: GenerationPreflightService | None = None,
 ) -> Callable[..., Awaitable[tuple[object, object, object, object, object, object]]]:
     """Create the non-blocking UI boundary that only persists queue work."""
 
@@ -634,6 +689,16 @@ def make_enqueue_handler(
                 return failure("再生成元Generationが見つからないため、キューへ追加しませんでした。")
             if parent_item.generation.status is not GenerationStatus.COMPLETED:
                 return failure("完了済みGenerationだけを再生成できます。")
+        preflight_warning = ""
+        if preflight_service is not None:
+            try:
+                preflight = await preflight_service.check(generation_settings)
+            except Exception:  # noqa: BLE001 - hide adapter details at the UI boundary
+                return failure("Generation preflight could not be completed; nothing was queued")
+            if not preflight.is_ready:
+                return failure(preflight_markdown(preflight))
+            if preflight.warnings:
+                preflight_warning = preflight_markdown(preflight)
         try:
             queued = service.enqueue(
                 generation_settings,
@@ -645,6 +710,7 @@ def make_enqueue_handler(
             f"Queued Generation ID: `{queued.item.generation.id}`\n"
             f"Queue position: `{queued.queue_position}`\n"
             f"Seed: `{queued.item.generation.settings_snapshot.seed}`"
+            + (f"\n\n{preflight_warning}" if preflight_warning else "")
         )
         return (
             gr.Button("生成をキューへ追加", interactive=True),
@@ -661,6 +727,7 @@ def make_enqueue_handler(
 def make_batch_enqueue_handler(
     service: GenerationQueueService,
     max_loras: int,
+    preflight_service: GenerationPreflightService | None = None,
 ) -> Callable[..., Awaitable[tuple[object, ...]]]:
     """Create the UI boundary for one atomic batch enqueue."""
 
@@ -699,6 +766,17 @@ def make_batch_enqueue_handler(
                 steps=int(steps),
                 cfg_scale=float(cfg_scale),
             )
+            preflight_message = ""
+            if preflight_service is not None:
+                preflight = await preflight_service.check(settings)
+                if not preflight.is_ready:
+                    return (
+                        gr.Button("Batch", interactive=True),
+                        "",
+                        preflight_markdown(preflight),
+                    )
+                if preflight.warnings:
+                    preflight_message = preflight_markdown(preflight)
             result = service.enqueue_batch(
                 settings,
                 count=int(count),
@@ -718,7 +796,10 @@ def make_batch_enqueue_handler(
         return (
             gr.Button("バッチをキューへ追加", interactive=True),
             "Queued",
-            f"Batch `{result.batch.id}` を{len(result.items)}件キューへ追加しました。",
+            (
+                f"Batch `{result.batch.id}` を{len(result.items)}件キューへ追加しました。"
+                + (f"\n\n{preflight_message}" if preflight_message else "")
+            ),
         )
 
     return handler
