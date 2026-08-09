@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from uuid import UUID
@@ -28,6 +30,9 @@ class GenerationHistoryError(RuntimeError):
     """Safe history service error."""
 
 
+logger = logging.getLogger(__name__)
+
+
 _MISSING_LOCAL_IMAGE_MESSAGE = (
     "このPodにはローカル画像がありません。stateless運用のため詳細画像は利用できません。"
 )
@@ -39,6 +44,8 @@ class GenerationHistoryService:
         generation_repository: GenerationRepositoryProtocol,
         artifact_repository: GenerationArtifactRepositoryProtocol,
         settings: Settings | None = None,
+        *,
+        state_changed_callback: Callable[[], None] | None = None,
     ) -> None:
         app_settings = settings or get_settings()
         self._generation_repository = generation_repository
@@ -46,6 +53,7 @@ class GenerationHistoryService:
         self._data_dir = app_settings.data_dir.resolve()
         self._timezone = ZoneInfo(app_settings.timezone)
         self._page_size = app_settings.history_page_size
+        self._state_changed_callback = state_changed_callback
 
     @property
     def page_size(self) -> int:
@@ -186,6 +194,7 @@ class GenerationHistoryService:
     def set_favorite(self, generation_id: UUID, favorite: bool) -> GenerationDetailView:
         try:
             self._generation_repository.set_favorite(generation_id, favorite)
+            self._notify_state_changed()
             return self.get_detail(generation_id)
         except (GenerationRepositoryError, ValueError) as exc:
             raise GenerationHistoryError("お気に入りを保存できませんでした。") from exc
@@ -193,6 +202,7 @@ class GenerationHistoryService:
     def update_note(self, generation_id: UUID, note: str | None) -> GenerationDetailView:
         try:
             self._generation_repository.update_note(generation_id, note)
+            self._notify_state_changed()
             return self.get_detail(generation_id)
         except (GenerationRepositoryError, ValueError) as exc:
             raise GenerationHistoryError("メモを保存できませんでした。") from exc
@@ -205,6 +215,14 @@ class GenerationHistoryService:
         if generation is None:
             raise GenerationHistoryError("履歴が見つかりません。")
         return generation
+
+    def _notify_state_changed(self) -> None:
+        if self._state_changed_callback is None:
+            return
+        try:
+            self._state_changed_callback()
+        except Exception:  # noqa: BLE001 - backup notification is best effort after commit
+            logger.warning("generation history state change notification failed", exc_info=True)
 
     def _item(self, generation: Generation) -> GenerationHistoryItem:
         try:

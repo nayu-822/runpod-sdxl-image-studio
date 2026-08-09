@@ -165,7 +165,10 @@ class StateSyncService:
                 if schedule_follow_up and not self._is_clean(snapshot_version):
                     self._schedule_follow_up_backup()
                 return self.get_status(), True
-            backup_name = _backup_name(snapshot.metadata.created_at)
+            backup_name = _backup_name(
+                snapshot.metadata.created_at,
+                snapshot.metadata.sha256,
+            )
             remote_filename = f"backups/{backup_name}.sqlite3"
             metadata_filename = f"{remote_filename}.metadata.json"
             pointer_path: Path | None = None
@@ -318,8 +321,11 @@ class StateSyncService:
             )
 
 
-def _backup_name(created_at: datetime) -> str:
-    return created_at.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+def _backup_name(created_at: datetime, sha256: str) -> str:
+    """Build a content-addressed immutable backup basename."""
+
+    timestamp = created_at.astimezone(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    return f"{timestamp}-{sha256}"
 
 
 def _write_json(directory: Path, name: str, value: dict[str, object]) -> Path:

@@ -409,6 +409,7 @@ def build_app(
         generation_repository,
         artifact_repository,
         app_settings,
+        state_changed_callback=state_sync_service.mark_dirty,
     )
     recovery_service = GenerationRecoveryService(
         client,
@@ -424,6 +425,7 @@ def build_app(
     stateless_reconciliation_service = StatelessReconciliationService(
         dispatch_queue_repository,
         drive_sync_repository,
+        state_changed_callback=state_sync_service.mark_dirty,
     )
 
     async def reconcile_queue_item(item: GenerationQueueItem) -> ReconciliationOutcome:
@@ -1768,12 +1770,12 @@ def build_app(
             fn=make_history_favorite_handler(history_service),
             inputs=[history.selected, history.favorite],
             outputs=[history.favorite, history.message],
-        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
+        )
         history.save_note_button.click(
             fn=make_history_note_handler(history_service),
             inputs=[history.selected, history.note],
             outputs=[history.message],
-        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
+        )
         restore_outputs = [
             history.message,
             generation.positive_prompt,

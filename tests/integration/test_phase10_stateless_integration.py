@@ -27,7 +27,7 @@ from runpod_sdxl_image_studio.db.migration_runner import upgrade_database
 from runpod_sdxl_image_studio.domain.generation import GenerationKind
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
-from runpod_sdxl_image_studio.domain.state_sync import StateRestoreStatus
+from runpod_sdxl_image_studio.domain.state_sync import StateRestoreStatus, StateSyncStatus
 from runpod_sdxl_image_studio.services.state_restore_service import StateRestoreService
 from runpod_sdxl_image_studio.services.state_snapshot_service import StateSnapshotService
 from runpod_sdxl_image_studio.services.state_sync_service import StateSyncService
@@ -126,14 +126,23 @@ def test_startup_restore_migration_reconciliation_then_worker_start(tmp_path: Pa
         StateRestoreService(settings, storage=storage).restore_if_missing_async()  # type: ignore[arg-type]
     )
     assert restored.status is StateRestoreStatus.RESTORED
+    assert restored.metadata is not None
 
     upgrade_database(settings, ROOT)
     restored_engine = create_image_studio_engine(settings)
     restored_factory = create_session_factory(restored_engine)
+    restored_state_sync = StateSyncService(
+        settings,
+        storage=storage,  # type: ignore[arg-type]
+        snapshot_service=StateSnapshotService(settings, now_factory=lambda: NOW),
+        now_factory=lambda: NOW,
+        initial_remote_sha256=restored.metadata.sha256,
+    )
     reconciliation = StatelessReconciliationService(
         GenerationDispatchQueueRepository(restored_factory),
         DriveSyncRepository(restored_factory),
         now_factory=lambda: NOW,
+        state_changed_callback=restored_state_sync.mark_dirty,
     )
     queue_runtime = _WorkerRuntime()
     drive_runtime = _WorkerRuntime()
@@ -141,6 +150,7 @@ def test_startup_restore_migration_reconciliation_then_worker_start(tmp_path: Pa
         demo=object(),  # type: ignore[arg-type]
         queue_runtime=queue_runtime,  # type: ignore[arg-type]
         drive_sync_runtime=drive_runtime,  # type: ignore[arg-type]
+        state_sync_service=restored_state_sync,
         stateless_reconciliation_service=reconciliation,
         run_stateless_reconciliation=True,
     )
@@ -148,6 +158,9 @@ def test_startup_restore_migration_reconciliation_then_worker_start(tmp_path: Pa
     pre_start_result = reconciliation.reconcile()
     assert pre_start_result.is_success is True
     assert pre_start_result.generation_reconciled_count == 1
+    reconciled_backup = asyncio.run(restored_state_sync.backup())
+    assert reconciled_backup.status is StateSyncStatus.SYNCED
+    assert reconciled_backup.remote_sha256 != restored.metadata.sha256
     runtime.start()
 
     assert queue_runtime.start_calls == 1
@@ -157,6 +170,24 @@ def test_startup_restore_migration_reconciliation_then_worker_start(tmp_path: Pa
     assert result.generation_reconciled_count == 0
     runtime.stop()
     restored_engine.dispose()
+
+    database_path.unlink()
+    restored_again = asyncio.run(
+        StateRestoreService(settings, storage=storage).restore_if_missing_async()  # type: ignore[arg-type]
+    )
+    assert restored_again.status is StateRestoreStatus.RESTORED
+    restored_again_engine = create_image_studio_engine(settings)
+    restored_again_factory = create_session_factory(restored_again_engine)
+    second_reconciliation = StatelessReconciliationService(
+        GenerationDispatchQueueRepository(restored_again_factory),
+        DriveSyncRepository(restored_again_factory),
+        now_factory=lambda: NOW,
+    )
+    second_result = second_reconciliation.reconcile()
+    assert second_result.is_success is True
+    assert second_result.generation_reconciled_count == 0
+    assert second_result.drive_reconciled_count == 0
+    restored_again_engine.dispose()
 
 
 def test_restore_failure_leaves_remote_latest_unchanged(tmp_path: Path) -> None:

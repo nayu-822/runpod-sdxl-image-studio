@@ -95,11 +95,12 @@ class _FakeStateStorage:
         self.upload_calls: list[str] = []
         self.download_calls: list[str] = []
         self.fail_upload = False
+        self.fail_upload_paths: set[str] = set()
         self.download_error: Exception | None = None
 
     async def upload(self, local_path: Path, relative_path: str) -> None:
         self.upload_calls.append(relative_path)
-        if self.fail_upload:
+        if self.fail_upload or relative_path in self.fail_upload_paths:
             raise OSError("simulated state upload failure")
         self.objects[relative_path] = local_path.read_bytes()
 
@@ -223,6 +224,11 @@ def _snapshot_hash(settings: Settings) -> str:
         snapshot.path.unlink(missing_ok=True)
 
 
+def _expected_backup_filename(sha256: str) -> str:
+    timestamp = NOW.astimezone(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    return f"backups/{timestamp}-{sha256}.sqlite3"
+
+
 def test_sqlite_snapshot_uses_backup_api_and_cleans_temp_files(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     engine, _ = _create_state_database(settings)
@@ -268,13 +274,14 @@ def test_state_backup_uploads_snapshot_metadata_and_latest_pointer_once(tmp_path
 
     first = asyncio.run(service.backup())
     assert first.status is StateSyncStatus.SYNCED
+    expected_filename = _expected_backup_filename(first.remote_sha256 or "")
     assert storage.upload_calls == [
-        "backups/20260809T030000Z.sqlite3",
-        "backups/20260809T030000Z.sqlite3.metadata.json",
+        expected_filename,
+        f"{expected_filename}.metadata.json",
         "latest.json",
     ]
     pointer = json.loads(storage.objects["latest.json"])
-    assert pointer["filename"] == "backups/20260809T030000Z.sqlite3"
+    assert pointer["filename"] == expected_filename
     assert pointer["sha256"] == first.remote_sha256
     assert pointer["size_bytes"] == first.remote_size_bytes
 
@@ -300,9 +307,141 @@ def test_state_backup_failure_does_not_leave_local_snapshot(tmp_path: Path) -> N
 
     result = asyncio.run(service.backup())
     assert result.status is StateSyncStatus.FAILED
-    assert storage.upload_calls == ["backups/20260809T030000Z.sqlite3"]
+    assert len(storage.upload_calls) == 1
+    assert storage.upload_calls[0].startswith("backups/20260809T030000000000Z-")
+    assert storage.upload_calls[0].endswith(".sqlite3")
     assert not list((tmp_path / ".state-sync").glob("*"))
     engine.dispose()
+
+
+def test_second_backup_metadata_failure_preserves_previous_restore_point(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    engine, _ = _create_state_database(settings)
+    storage = _FakeStateStorage()
+    service = StateSyncService(
+        settings,
+        storage=storage,  # type: ignore[arg-type]
+        snapshot_service=StateSnapshotService(settings, now_factory=lambda: NOW),
+        now_factory=lambda: NOW,
+    )
+
+    first = asyncio.run(service.backup())
+    assert first.remote_sha256 is not None
+    first_filename = _expected_backup_filename(first.remote_sha256)
+    _change_state_probe(settings, "second-backup")
+    second_hash = _snapshot_hash(settings)
+    second_filename = _expected_backup_filename(second_hash)
+    storage.fail_upload_paths.add(f"{second_filename}.metadata.json")
+
+    result = asyncio.run(service.backup())
+
+    assert result.status is StateSyncStatus.FAILED
+    assert first_filename in storage.objects
+    assert second_filename in storage.objects
+    latest = json.loads(storage.objects["latest.json"])
+    assert latest["filename"] == first_filename
+    assert latest["sha256"] == first.remote_sha256
+    service.close()
+    engine.dispose()
+
+    database_path = sqlite_database_path(settings)
+    assert database_path is not None
+    database_path.unlink()
+    restored = asyncio.run(
+        StateRestoreService(settings, storage=storage).restore_if_missing_async()  # type: ignore[arg-type]
+    )
+
+    assert restored.status is StateRestoreStatus.RESTORED
+    assert restored.metadata is not None
+    assert restored.metadata.sha256 == first.remote_sha256
+
+
+def test_second_backup_latest_pointer_failure_preserves_previous_restore_point(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    engine, _ = _create_state_database(settings)
+    storage = _FakeStateStorage()
+    service = StateSyncService(
+        settings,
+        storage=storage,  # type: ignore[arg-type]
+        snapshot_service=StateSnapshotService(settings, now_factory=lambda: NOW),
+        now_factory=lambda: NOW,
+    )
+
+    first = asyncio.run(service.backup())
+    assert first.remote_sha256 is not None
+    first_filename = _expected_backup_filename(first.remote_sha256)
+    _change_state_probe(settings, "latest-failure")
+    second_hash = _snapshot_hash(settings)
+    second_filename = _expected_backup_filename(second_hash)
+    storage.fail_upload_paths.add("latest.json")
+
+    result = asyncio.run(service.backup())
+
+    assert result.status is StateSyncStatus.FAILED
+    assert first_filename in storage.objects
+    assert second_filename in storage.objects
+    assert f"{second_filename}.metadata.json" in storage.objects
+    latest = json.loads(storage.objects["latest.json"])
+    assert latest["filename"] == first_filename
+    assert latest["sha256"] == first.remote_sha256
+    service.close()
+    engine.dispose()
+
+    database_path = sqlite_database_path(settings)
+    assert database_path is not None
+    database_path.unlink()
+    restored = asyncio.run(
+        StateRestoreService(settings, storage=storage).restore_if_missing_async()  # type: ignore[arg-type]
+    )
+
+    assert restored.status is StateRestoreStatus.RESTORED
+    assert restored.metadata is not None
+    assert restored.metadata.sha256 == first.remote_sha256
+
+
+def test_successful_same_second_backup_uses_new_immutable_path_and_restores_latest(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    engine, _ = _create_state_database(settings)
+    storage = _FakeStateStorage()
+    service = StateSyncService(
+        settings,
+        storage=storage,  # type: ignore[arg-type]
+        snapshot_service=StateSnapshotService(settings, now_factory=lambda: NOW),
+        now_factory=lambda: NOW,
+    )
+
+    first = asyncio.run(service.backup())
+    assert first.remote_sha256 is not None
+    first_filename = _expected_backup_filename(first.remote_sha256)
+    _change_state_probe(settings, "successful-second-backup")
+    second = asyncio.run(service.backup())
+
+    assert second.status is StateSyncStatus.SYNCED
+    assert second.remote_sha256 is not None
+    second_filename = _expected_backup_filename(second.remote_sha256)
+    assert second_filename != first_filename
+    assert first_filename in storage.objects
+    assert second_filename in storage.objects
+    latest = json.loads(storage.objects["latest.json"])
+    assert latest["filename"] == second_filename
+    assert latest["sha256"] == second.remote_sha256
+    service.close()
+    engine.dispose()
+
+    database_path = sqlite_database_path(settings)
+    assert database_path is not None
+    database_path.unlink()
+    restored = asyncio.run(
+        StateRestoreService(settings, storage=storage).restore_if_missing_async()  # type: ignore[arg-type]
+    )
+
+    assert restored.status is StateRestoreStatus.RESTORED
+    assert restored.metadata is not None
+    assert restored.metadata.sha256 == second.remote_sha256
 
 
 def test_state_backup_waits_for_dirty_change_during_upload(tmp_path: Path) -> None:
@@ -477,6 +616,57 @@ def test_lora_metadata_survives_state_restore_without_thumbnail_files(tmp_path: 
     restored_engine.dispose()
 
 
+def test_generation_result_favorite_notifies_backup_and_survives_restore(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path, state_sync_debounce_seconds=60)
+    engine, factory = _database(settings)
+    generation_id, _ = _create_generation_pair(
+        factory,
+        status=GenerationStatus.COMPLETED.value,
+    )
+    storage = _FakeStateStorage()
+    state_sync = StateSyncService(
+        settings,
+        storage=storage,  # type: ignore[arg-type]
+        snapshot_service=StateSnapshotService(settings, now_factory=lambda: NOW),
+        now_factory=lambda: NOW,
+    )
+    history = GenerationHistoryService(
+        GenerationRepository(factory),
+        GenerationArtifactRepository(factory),
+        settings,
+        state_changed_callback=state_sync.mark_dirty,
+    )
+
+    favorite_detail = history.set_favorite(generation_id, True)
+    note_detail = history.update_note(generation_id, "saved from result screen")
+    backup = asyncio.run(state_sync.backup())
+
+    assert favorite_detail.favorite is True
+    assert note_detail.user_note == "saved from result screen"
+    assert backup.status is StateSyncStatus.SYNCED
+    state_sync.close()
+    engine.dispose()
+
+    database_path = sqlite_database_path(settings)
+    assert database_path is not None
+    database_path.unlink()
+    restored = asyncio.run(
+        StateRestoreService(settings, storage=storage).restore_if_missing_async()  # type: ignore[arg-type]
+    )
+    assert restored.status is StateRestoreStatus.RESTORED
+
+    restored_engine = create_image_studio_engine(settings)
+    restored_generation = GenerationRepository(create_session_factory(restored_engine)).get_by_id(
+        generation_id
+    )
+    assert restored_generation is not None
+    assert restored_generation.favorite is True
+    assert restored_generation.user_note == "saved from result screen"
+    restored_engine.dispose()
+
+
 def test_remote_write_protection_blocks_manual_and_debounced_backup(tmp_path: Path) -> None:
     settings = _settings(tmp_path, state_sync_debounce_seconds=0)
     engine, _ = _create_state_database(settings)
@@ -618,7 +808,8 @@ def test_restore_rejects_backup_hash_mismatch(tmp_path: Path) -> None:
     database_path = sqlite_database_path(settings)
     assert database_path is not None
     database_path.unlink()
-    storage.objects["backups/20260809T030000Z.sqlite3"] = b"tampered"
+    pointer = json.loads(storage.objects["latest.json"])
+    storage.objects[pointer["filename"]] = b"tampered"
 
     result = asyncio.run(
         StateRestoreService(settings, storage=storage).restore_if_missing_async()  # type: ignore[arg-type]
