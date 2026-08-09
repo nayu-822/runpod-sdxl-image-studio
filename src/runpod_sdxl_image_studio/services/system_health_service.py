@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -55,7 +55,7 @@ class DriveHealthProvider(Protocol):
 
     def status_counts(self) -> Any: ...
 
-    def list_jobs(self, limit: int = 50) -> Sequence[object]: ...
+    def get_latest_synced_job(self) -> object | None: ...
 
     def get_latest_unresolved_failure(self) -> object | None: ...
 
@@ -346,16 +346,9 @@ class SystemHealthService:
         last_failure_at: datetime | None = None
         job_history_available = DriveHealthAvailability.AVAILABLE
         try:
-            jobs = service.list_jobs(100)
-            for job in jobs:
-                value = getattr(getattr(job, "status", None), "value", None)
-                completed_at = getattr(job, "completed_at", None)
-                if (
-                    value == "synced"
-                    and isinstance(completed_at, datetime)
-                    and (last_sync_at is None or _utc(completed_at) > last_sync_at)
-                ):
-                    last_sync_at = _utc(completed_at)
+            latest_synced_job = service.get_latest_synced_job()
+            if latest_synced_job is not None:
+                last_sync_at = _synced_job_time(latest_synced_job, observed_at)
         except Exception:  # noqa: BLE001
             logger.warning("System health could not read last Drive sync")
             job_history_available = DriveHealthAvailability.UNAVAILABLE
@@ -538,6 +531,11 @@ def _overall_status(
 
 def _event_time(value: object, fallback: datetime) -> datetime:
     candidate = getattr(value, "updated_at", None) or getattr(value, "completed_at", None)
+    return _utc(candidate if isinstance(candidate, datetime) else fallback)
+
+
+def _synced_job_time(value: object, fallback: datetime) -> datetime:
+    candidate = getattr(value, "completed_at", None) or getattr(value, "updated_at", None)
     return _utc(candidate if isinstance(candidate, datetime) else fallback)
 
 

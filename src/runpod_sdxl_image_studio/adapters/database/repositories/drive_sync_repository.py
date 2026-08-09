@@ -169,6 +169,8 @@ class DriveSyncRepositoryProtocol(Protocol):
 
     def list_jobs(self, limit: int = 50) -> tuple[DriveSyncJob, ...]: ...
 
+    def get_latest_synced_job(self) -> DriveSyncJob | None: ...
+
     def get_latest_unresolved_failure(self) -> DriveSyncJob | None: ...
 
     def status_counts(self) -> dict[DriveSyncStatus, int]: ...
@@ -863,6 +865,28 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
                 return tuple(_job_domain(row) for row in rows)
         except (SQLAlchemyError, ValueError) as exc:
             raise DriveSyncRepositoryError("drive sync jobs could not be listed") from exc
+
+    def get_latest_synced_job(self) -> DriveSyncJob | None:
+        """Return the newest successful sync attempt without a history window."""
+
+        try:
+            with session_scope(self._session_factory) as session:
+                row = session.scalar(
+                    select(DriveSyncJobModel)
+                    .where(DriveSyncJobModel.status == DriveSyncStatus.SYNCED.value)
+                    .order_by(
+                        func.coalesce(
+                            DriveSyncJobModel.completed_at,
+                            DriveSyncJobModel.updated_at,
+                        ).desc(),
+                        DriveSyncJobModel.updated_at.desc(),
+                        DriveSyncJobModel.id.desc(),
+                    )
+                    .limit(1)
+                )
+                return _job_domain(row) if row is not None else None
+        except (SQLAlchemyError, ValueError) as exc:
+            raise DriveSyncRepositoryError("latest synced drive job could not be read") from exc
 
     def get_latest_unresolved_failure(self) -> DriveSyncJob | None:
         """Return the newest failed job whose sync record is still failed.

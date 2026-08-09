@@ -21,6 +21,7 @@ VIEWPORTS = (
     (1280, 800),
 )
 TAB_CONTROLS = {
+    "システム": ("System Health", "Refresh system status", "Recent errors"),
     "生成": ("Positive prompt", "生成をキューへ追加", "実使用Seed（コピー）"),
     "履歴": ("履歴を検索", "実使用seed（選択してコピー）"),
     "キュー": ("キューを更新", "選択ジョブをキャンセル"),
@@ -121,7 +122,7 @@ def test_phase9_system_tab_is_usable_at_all_required_viewports() -> None:
     from playwright.sync_api import sync_playwright
 
     url = os.environ["IMAGE_STUDIO_BROWSER_URL"]
-    system_tab_label = tuple(TAB_CONTROLS)[-1]
+    system_tab_label = "システム"
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)

@@ -128,6 +128,14 @@ class _FakeDisk:
 class _FakeDrive:
     is_configured = True
 
+    def __init__(self) -> None:
+        self.latest_synced_job = SimpleNamespace(
+            status=DriveSyncStatus.SYNCED,
+            completed_at=NOW,
+            updated_at=NOW,
+            generation_id=uuid4(),
+        )
+
     async def check_connection(self) -> object:
         return SimpleNamespace(status=SimpleNamespace(value="connected"))
 
@@ -139,13 +147,10 @@ class _FakeDrive:
         }
 
     def list_jobs(self, _limit: int = 50) -> tuple[object, ...]:
-        return (
-            SimpleNamespace(
-                status=DriveSyncStatus.SYNCED,
-                completed_at=NOW,
-                generation_id=uuid4(),
-            ),
-        )
+        raise AssertionError("System Health must use get_latest_synced_job")
+
+    def get_latest_synced_job(self) -> object:
+        return self.latest_synced_job
 
     def get_latest_unresolved_failure(self) -> object | None:
         return None
@@ -225,6 +230,9 @@ class _FailingDrive:
     def list_jobs(self, _limit: int = 50) -> tuple[object, ...]:
         raise RuntimeError("C:\\private\\secret.log")
 
+    def get_latest_synced_job(self) -> object:
+        raise RuntimeError("C:\\private\\secret.log")
+
     def capacity(self) -> object:
         raise RuntimeError("/mnt/data/private.log")
 
@@ -250,6 +258,9 @@ class _FailedDrive:
             ),
         )
 
+    def get_latest_synced_job(self) -> object | None:
+        return None
+
     def get_latest_unresolved_failure(self) -> object:
         return SimpleNamespace(updated_at=self.failure_at, completed_at=self.failure_at)
 
@@ -274,9 +285,12 @@ class _PartialDrive:
         return {DriveSyncStatus.PENDING: 2, DriveSyncStatus.FAILED: 1}
 
     def list_jobs(self, _limit: int = 50) -> tuple[object, ...]:
+        raise AssertionError("System Health must not read a limited job history")
+
+    def get_latest_synced_job(self) -> object:
         if self.failed_read == "history":
             raise RuntimeError("history unavailable")
-        return (SimpleNamespace(status=DriveSyncStatus.SYNCED, completed_at=NOW),)
+        return SimpleNamespace(status=DriveSyncStatus.SYNCED, completed_at=NOW, updated_at=NOW)
 
     def get_latest_unresolved_failure(self) -> object | None:
         if self.failed_read == "history":
@@ -674,6 +688,199 @@ async def test_drive_failed_event_uses_persisted_failure_time(tmp_path: Path) ->
     assert second_event.created_at == drive.failure_at
     assert first.drive.last_failure_at == drive.failure_at
     assert second.drive.last_failure_at == drive.failure_at
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("completed_at", "updated_at", "expected"),
+    [
+        (NOW - timedelta(days=2), NOW, NOW - timedelta(days=2)),
+        (None, NOW - timedelta(days=3), NOW - timedelta(days=3)),
+    ],
+)
+async def test_drive_last_sync_uses_latest_synced_job_time(
+    tmp_path: Path,
+    completed_at: datetime | None,
+    updated_at: datetime,
+    expected: datetime,
+) -> None:
+    drive = _FakeDrive()
+    drive.latest_synced_job = SimpleNamespace(
+        status=DriveSyncStatus.SYNCED,
+        completed_at=completed_at,
+        updated_at=updated_at,
+    )
+    service = SystemHealthService(
+        _FakeComfyUI(),
+        _FakeQueue(),
+        drive,
+        _settings(tmp_path),
+        disk_usage_adapter=_FakeDisk(DiskUsage(1000, 700, 300)),
+        now_factory=lambda: NOW,
+    )
+
+    view = await service.get_health()
+
+    assert view.drive.last_sync_at == expected
+
+
+def _drive_test_rows(
+    *, index: int, status: str, updated_at: datetime, completed_at: datetime | None
+) -> tuple[object, ...]:
+    generation_id = uuid4()
+    artifact_id = uuid4()
+    record_id = uuid4()
+    job_id = uuid4()
+    is_failure = status == DriveSyncStatus.FAILED.value
+    return (
+        GenerationModel(
+            id=str(generation_id),
+            kind="standard",
+            status=GenerationStatus.COMPLETED.value,
+            settings_snapshot_json="{}",
+            snapshot_schema_version=1,
+            workflow_template_id="phase9-test",
+            workflow_template_version="1",
+            created_at=updated_at,
+            updated_at=updated_at,
+        ),
+        GenerationArtifactModel(
+            id=str(artifact_id),
+            generation_id=str(generation_id),
+            artifact_type="image",
+            local_path=f"images/{index}.png",
+            sha256=f"{index:064x}",
+            size_bytes=1,
+            mime_type="image/png",
+            created_at=updated_at,
+        ),
+        DriveSyncRecordModel(
+            id=str(record_id),
+            generation_id=str(generation_id),
+            status=status,
+            remote_name="gdrive",
+            remote_base_path="RunPod/Images",
+            remote_image_path=f"RunPod/Images/{index}.png",
+            remote_metadata_path=f"RunPod/Images/{index}.json",
+            image_artifact_id=str(artifact_id),
+            image_sha256=f"{index:064x}",
+            image_size_bytes=1,
+            synced_at=updated_at if status == DriveSyncStatus.SYNCED.value else None,
+            error_code="drive_copy_failed" if is_failure else None,
+            error_summary="failure" if is_failure else None,
+            created_at=updated_at,
+            updated_at=updated_at,
+        ),
+        DriveSyncJobModel(
+            id=str(job_id),
+            sync_record_id=str(record_id),
+            generation_id=str(generation_id),
+            queue_sequence=index + 1,
+            status=status,
+            completed_at=completed_at,
+            error_code="drive_copy_failed" if is_failure else None,
+            error_summary="failure" if is_failure else None,
+            retryable=True,
+            image_artifact_id=str(artifact_id),
+            image_sha256=f"{index:064x}",
+            image_size_bytes=1,
+            created_at=updated_at,
+            updated_at=updated_at,
+        ),
+    )
+
+
+def test_drive_latest_synced_job_is_not_limited_by_recent_job_history(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(f"sqlite:///{(tmp_path / 'drive-latest-sync.sqlite3').as_posix()}")
+    Base.metadata.create_all(engine)
+    factory = create_session_factory(engine)
+    sync_at = NOW - timedelta(days=1)
+    rows: list[object] = []
+    for index in range(102):
+        status = (
+            DriveSyncStatus.SYNCED.value
+            if index == 0
+            else (DriveSyncStatus.FAILED.value if index % 2 else DriveSyncStatus.PENDING.value)
+        )
+        updated_at = sync_at if index == 0 else NOW + timedelta(minutes=index)
+        completed_at = sync_at if index == 0 else (updated_at if status == "failed" else None)
+        rows.extend(
+            _drive_test_rows(
+                index=index,
+                status=status,
+                updated_at=updated_at,
+                completed_at=completed_at,
+            )
+        )
+    with factory() as session:
+        session.add_all(rows)
+        session.commit()
+
+    latest = DriveSyncRepository(factory).get_latest_synced_job()
+
+    assert latest is not None
+    assert latest.completed_at == sync_at
+    assert latest.updated_at == sync_at
+    engine.dispose()
+
+
+def test_drive_latest_synced_job_falls_back_to_updated_at(tmp_path: Path) -> None:
+    engine = create_engine(
+        f"sqlite:///{(tmp_path / 'drive-latest-sync-fallback.sqlite3').as_posix()}"
+    )
+    Base.metadata.create_all(engine)
+    factory = create_session_factory(engine)
+    updated_at = NOW - timedelta(hours=4)
+    with factory() as session:
+        session.add_all(
+            _drive_test_rows(
+                index=0,
+                status=DriveSyncStatus.SYNCED.value,
+                updated_at=updated_at,
+                completed_at=None,
+            )
+        )
+        session.commit()
+
+    latest = DriveSyncRepository(factory).get_latest_synced_job()
+
+    assert latest is not None
+    assert latest.completed_at is None
+    assert latest.updated_at == updated_at
+    engine.dispose()
+
+
+def test_drive_latest_synced_job_is_kept_after_current_record_failure(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite:///{(tmp_path / 'drive-previous-sync.sqlite3').as_posix()}")
+    Base.metadata.create_all(engine)
+    factory = create_session_factory(engine)
+    sync_at = NOW - timedelta(days=2)
+    generation, artifact, record, job = _drive_test_rows(
+        index=0,
+        status=DriveSyncStatus.SYNCED.value,
+        updated_at=sync_at,
+        completed_at=sync_at,
+    )
+    record.status = DriveSyncStatus.FAILED.value  # type: ignore[attr-defined]
+    record.error_code = "drive_copy_failed"  # type: ignore[attr-defined]
+    with factory() as session:
+        session.add_all((generation, artifact, record, job))
+        session.commit()
+
+    latest = DriveSyncRepository(factory).get_latest_synced_job()
+
+    assert latest is not None
+    assert latest.completed_at == sync_at
+    with factory() as session:
+        current_record = session.get(DriveSyncRecordModel, record.id)  # type: ignore[attr-defined]
+        current_job = session.get(DriveSyncJobModel, job.id)  # type: ignore[attr-defined]
+        assert current_record is not None
+        assert current_record.status == DriveSyncStatus.FAILED.value
+        assert current_job is not None
+        assert current_job.status == DriveSyncStatus.SYNCED.value
+    engine.dispose()
 
 
 def test_drive_latest_unresolved_failure_is_not_limited_by_recent_job_history(
