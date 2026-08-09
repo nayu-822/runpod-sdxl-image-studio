@@ -5,7 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol
 
-from runpod_sdxl_image_studio.adapters.drive.google_drive_adapter import GoogleDriveAdapter
+from runpod_sdxl_image_studio.adapters.drive.google_drive_adapter import (
+    GoogleDriveAdapter,
+    GoogleDriveAdapterError,
+)
 from runpod_sdxl_image_studio.config import Settings
 from runpod_sdxl_image_studio.domain.drive_sync import (
     DriveDestination,
@@ -15,6 +18,14 @@ from runpod_sdxl_image_studio.domain.drive_sync import (
 
 class StateBackupStorageError(RuntimeError):
     """Safe state backup transfer failure."""
+
+
+class StateBackupNotFound(StateBackupStorageError):
+    """The requested remote state object was confirmed to be absent."""
+
+
+class StateBackupUnavailable(StateBackupStorageError):
+    """The remote state object could not be read because the service was unavailable."""
 
 
 class StateBackupTransferAdapter(Protocol):
@@ -68,11 +79,20 @@ class StateBackupStorage:
         if not self.is_configured:
             raise StateBackupStorageError("state backup remote is not configured")
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        await self._adapter.copy_from_remote(
-            self._destination(),
-            self._remote_state_path(relative_path),
-            local_path,
-        )
+        try:
+            await self._adapter.copy_from_remote(
+                self._destination(),
+                self._remote_state_path(relative_path),
+                local_path,
+            )
+        except GoogleDriveAdapterError as exc:
+            if exc.code == "remote_not_found":
+                raise StateBackupNotFound("remote state object was not found") from exc
+            raise StateBackupUnavailable("remote state transfer was unavailable") from exc
+        except StateBackupStorageError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - adapter failures stay fail-closed
+            raise StateBackupUnavailable("remote state transfer was unavailable") from exc
 
     def _destination(self) -> DriveDestination:
         return DriveDestination(self._settings.rclone_remote, self._settings.rclone_base_path)
@@ -82,4 +102,10 @@ class StateBackupStorage:
         return validate_remote_relative_path(f"{self._settings.state_sync_subdir}/{normalized}")
 
 
-__all__ = ["StateBackupStorage", "StateBackupStorageError", "StateBackupTransferAdapter"]
+__all__ = [
+    "StateBackupNotFound",
+    "StateBackupStorage",
+    "StateBackupStorageError",
+    "StateBackupTransferAdapter",
+    "StateBackupUnavailable",
+]

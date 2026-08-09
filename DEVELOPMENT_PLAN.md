@@ -416,6 +416,39 @@ Alembic `0015_phase9_system_error_events`を追加しました。API key、token
 Phase 9の自動確認は`tests/unit/test_phase9_system_health.py`で行い、FakeのComfyUI、Queue、Drive、
 ディスクadapter、SQLiteを使用します。実GPU、実ComfyUI、実RunPod、実Google Driveは要求しません。
 
+## フェーズ10: Stateless状態バックアップ・復元
+
+### 目的
+
+毎回新規PodをDeployし、利用後にTerminateする運用、またはVolume Disk 0GBのstateless運用でも、
+SQLiteの状態を安全に引き継げるようにする。
+
+### 対応
+
+- SQLite backup APIによる状態snapshot
+- Google Driveへのtimestamped state backupと`latest.json`ポインター
+- backup hash、サイズ、SQLite integrity checkによる検証
+- ローカルDBがない場合だけのatomic restore
+- `NO_BACKUP`とremote取得不能の分離、およびrestore失敗時のfail-closed
+- 復元後のGeneration / Job / Drive同期状態のstateless reconciliation
+- dirty versionを用いたdebounced continuous backupとmanual clean backup
+- worker停止後のbest-effort shutdown flush
+- Generation、Preset、LoRA metadataの永続変更通知
+- ローカルArtifact欠損時の履歴・upscale・Drive resync耐性
+
+### 対象外
+
+- model自動download
+- 画像remote on-demand restore
+- RunPod API
+- 専用Docker image
+- 自動Terminate
+
+state backupのremote retentionと古いtimestamped backupの自動削除は未実装です。`rclone sync`や汎用remote削除APIは使用しません。
+
+SQLite backup/restore、reconciliation、dirty version、LoRA通知、migration後のstartup順序はFake、SQLite、Alembicを使った
+自動テストで確認します。実RunPod、実Google Drive、Volume Disk 0GBでの手動確認は別途必要です。
+
 ## 将来候補
 
 - img2img

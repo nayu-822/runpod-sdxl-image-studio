@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
@@ -30,9 +30,12 @@ class LoraCatalogService:
         self,
         repository: LoraMetadataRepository,
         thumbnail_storage: LoraThumbnailStorage,
+        *,
+        state_changed_callback: Callable[[], None] | None = None,
     ) -> None:
         self._repository = repository
         self._thumbnails = thumbnail_storage
+        self._state_changed_callback = state_changed_callback
 
     def sync_with_capabilities(
         self,
@@ -43,9 +46,11 @@ class LoraCatalogService:
         if not capability_success:
             return self._repository.list_all(LoraSearchQuery(include_missing=True))
         try:
-            return self._repository.upsert_discovered_loras(file_names)
+            result = self._repository.upsert_discovered_loras(file_names)
         except Exception as exc:  # noqa: BLE001 - service boundary
             raise LoraCatalogError("LoRA一覧を同期できませんでした。") from exc
+        self._notify_state_changed()
+        return result
 
     def search(self, query: LoraSearchQuery | None = None) -> tuple[LoraMetadata, ...]:
         try:
@@ -78,6 +83,7 @@ class LoraCatalogService:
             raise LoraCatalogError("LoRA metadataを更新できませんでした。") from exc
         if metadata is None:
             raise LoraCatalogError("対象のLoRA metadataが見つかりません。")
+        self._notify_state_changed()
         return metadata
 
     def set_favorite(self, metadata_id: UUID, is_favorite: bool) -> LoraMetadata:
@@ -87,6 +93,7 @@ class LoraCatalogService:
             raise LoraCatalogError("お気に入りを更新できませんでした。") from exc
         if metadata is None:
             raise LoraCatalogError("対象のLoRA metadataが見つかりません。")
+        self._notify_state_changed()
         return metadata
 
     def save_thumbnail(self, metadata_id: UUID, payload: bytes) -> LoraMetadata:
@@ -105,6 +112,7 @@ class LoraCatalogService:
             updated = self._repository.set_thumbnail_path(metadata_id, relative_path)
             if updated is None:
                 raise LoraCatalogError("対象のLoRA metadataが見つかりません。")
+            self._notify_state_changed()
             return updated
         except Exception as exc:  # noqa: BLE001 - compensate DB/filesystem boundary
             try:
@@ -136,6 +144,7 @@ class LoraCatalogService:
             updated = self._repository.set_thumbnail_path(metadata_id, None)
             if updated is None:
                 raise LoraCatalogError("対象のLoRA metadataが見つかりません。")
+            self._notify_state_changed()
             return updated
         except Exception as exc:  # noqa: BLE001 - compensate DB/filesystem boundary
             if old_payload is not None:
@@ -154,6 +163,7 @@ class LoraCatalogService:
             return
         try:
             self._repository.update_usage(names, completed_at or datetime.now(UTC))
+            self._notify_state_changed()
         except Exception:  # noqa: BLE001 - usage is explicitly best effort
             logger.warning("LoRA usage statistics update failed", exc_info=True)
 
@@ -178,3 +188,11 @@ class LoraCatalogService:
             ("利用回数", LoraSort.USAGE.value),
             ("名前", LoraSort.NAME.value),
         )
+
+    def _notify_state_changed(self) -> None:
+        if self._state_changed_callback is None:
+            return
+        try:
+            self._state_changed_callback()
+        except Exception:  # noqa: BLE001 - notification is best effort after commit
+            logger.warning("LoRA state change notification failed", exc_info=True)

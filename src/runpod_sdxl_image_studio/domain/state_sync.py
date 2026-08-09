@@ -24,6 +24,7 @@ class StateRestoreStatus(StrEnum):
     SKIPPED_LOCAL = "skipped_local"
     NO_BACKUP = "no_backup"
     RESTORED = "restored"
+    UNAVAILABLE = "unavailable"
     FAILED = "failed"
 
 

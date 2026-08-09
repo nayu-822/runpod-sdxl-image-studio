@@ -366,6 +366,26 @@ async def test_system_health_aggregates_comfy_queue_storage_drive_and_models(
 
 
 @pytest.mark.asyncio
+async def test_system_health_read_does_not_mark_state_dirty_without_persisted_error(
+    tmp_path: Path,
+) -> None:
+    state_changes: list[str] = []
+    service = SystemHealthService(
+        _FakeComfyUI(),
+        _FakeQueue(),
+        _FakeDrive(),
+        _settings(tmp_path),
+        disk_usage_adapter=_FakeDisk(DiskUsage(1000, 700, 300)),
+        now_factory=lambda: NOW,
+        state_changed_callback=lambda: state_changes.append("changed"),
+    )
+
+    await service.get_health()
+
+    assert state_changes == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("failed_read", "availability_field"),
     [
@@ -596,6 +616,7 @@ async def test_queue_read_failure_is_unavailable_and_recorded_safely(tmp_path: P
     engine = create_engine(f"sqlite:///{(tmp_path / 'health-errors.sqlite3').as_posix()}")
     Base.metadata.create_all(engine)
     error_repository = SystemErrorEventRepository(create_session_factory(engine))
+    state_changes: list[str] = []
     service = SystemHealthService(
         _FakeComfyUI(),
         _FailingQueue(),
@@ -604,6 +625,7 @@ async def test_queue_read_failure_is_unavailable_and_recorded_safely(tmp_path: P
         disk_usage_adapter=_FakeDisk(DiskUsage(1000, 700, 300)),
         error_history_repository=error_repository,
         now_factory=lambda: NOW,
+        state_changed_callback=lambda: state_changes.append("changed"),
     )
 
     view = await service.get_health()
@@ -614,6 +636,7 @@ async def test_queue_read_failure_is_unavailable_and_recorded_safely(tmp_path: P
     events = error_repository.list_recent()
     assert [event.error_code for event in events] == ["system_queue_status_failed"]
     assert "queue-secret" not in (events[0].summary + (events[0].details or ""))
+    assert state_changes == ["changed"]
     engine.dispose()
 
 

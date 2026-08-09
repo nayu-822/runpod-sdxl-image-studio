@@ -212,7 +212,6 @@ class Settings(BaseSettings):
     state_sync_download_timeout_seconds: float = Field(
         600.0, validation_alias="IMAGE_STUDIO_STATE_SYNC_DOWNLOAD_TIMEOUT_SECONDS"
     )
-    state_sync_max_backups: int = Field(20, validation_alias="IMAGE_STUDIO_STATE_SYNC_MAX_BACKUPS")
 
     @field_validator("rclone_remote")
     @classmethod
@@ -284,7 +283,6 @@ class Settings(BaseSettings):
         "drive_discovery_batch_size",
         "min_free_disk_bytes",
         "warning_free_disk_bytes",
-        "state_sync_max_backups",
     )
     @classmethod
     def validate_positive_integer(cls, value: int) -> int:

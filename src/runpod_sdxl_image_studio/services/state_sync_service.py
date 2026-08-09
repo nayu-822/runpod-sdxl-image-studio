@@ -35,6 +35,8 @@ class StateSyncService:
         storage: StateBackupStorage | None = None,
         snapshot_service: StateSnapshotService | None = None,
         now_factory: Callable[[], datetime] = lambda: datetime.now(UTC),
+        initial_remote_sha256: str | None = None,
+        remote_write_protected: bool = False,
     ) -> None:
         self._settings = settings
         self._storage = storage or StateBackupStorage(settings)
@@ -43,74 +45,69 @@ class StateSyncService:
         )
         self._now_factory = now_factory
         self._timer: threading.Timer | None = None
+        self._timer_token = 0
         self._timer_lock = threading.Lock()
         self._backup_lock = threading.Lock()
-        self._last_hash: str | None = None
-        self._view = StateSyncView(
-            StateSyncStatus.IDLE
+        self._last_hash = initial_remote_sha256
+        self._dirty_version = 0
+        self._backed_up_version = 0
+        self._closed = False
+        self._remote_write_protected = remote_write_protected
+        initial_status = (
+            StateSyncStatus.FAILED
+            if remote_write_protected
+            else StateSyncStatus.IDLE
             if settings.state_sync_enabled and self._storage.is_configured
             else StateSyncStatus.DISABLED
+        )
+        initial_message = (
+            "状態バックアップはリモート復旧失敗のため無効です。" if remote_write_protected else ""
+        )
+        self._view = StateSyncView(
+            initial_status,
+            last_message=initial_message,
+            remote_sha256=initial_remote_sha256,
         )
 
     @property
     def enabled(self) -> bool:
+        return self._is_configured and not self._remote_write_protected and not self._closed
+
+    @property
+    def _is_configured(self) -> bool:
         return self._settings.state_sync_enabled and self._storage.is_configured
 
     def get_status(self) -> StateSyncView:
         with self._timer_lock:
             return self._view
 
-    async def backup(self) -> StateSyncView:
-        if not self.enabled:
-            self._set_view(StateSyncStatus.DISABLED, "状態バックアップは無効です。")
-            return self.get_status()
-        if not self._backup_lock.acquire(blocking=False):
-            return self.get_status()
-        snapshot: StateSnapshot | None = None
-        self._set_view(StateSyncStatus.RUNNING, "状態バックアップを実行中です。")
-        try:
-            snapshot = self._snapshot_service.create_snapshot()
-            if snapshot.metadata.sha256 == self._last_hash:
-                self._set_view(
-                    StateSyncStatus.SYNCED,
-                    "状態バックアップは変更がないためアップロードを省略しました。",
-                    success_at=snapshot.metadata.created_at,
-                    remote_sha256=snapshot.metadata.sha256,
-                    remote_size_bytes=snapshot.metadata.size_bytes,
-                )
-                return self.get_status()
-            backup_name = _backup_name(snapshot.metadata.created_at)
-            remote_filename = f"backups/{backup_name}.sqlite3"
-            metadata_filename = f"{remote_filename}.metadata.json"
-            pointer_path = self._write_pointer(snapshot, remote_filename)
-            metadata_path = self._write_metadata(snapshot, remote_filename, metadata_filename)
-            try:
-                await self._storage.upload(snapshot.path, remote_filename)
-                await self._storage.upload(metadata_path, metadata_filename)
-                await self._storage.upload(pointer_path, "latest.json")
-            finally:
-                pointer_path.unlink(missing_ok=True)
-                metadata_path.unlink(missing_ok=True)
-            self._last_hash = snapshot.metadata.sha256
-            self._set_view(
-                StateSyncStatus.SYNCED,
-                "状態バックアップが完了しました。",
-                success_at=snapshot.metadata.created_at,
-                remote_sha256=snapshot.metadata.sha256,
-                remote_size_bytes=snapshot.metadata.size_bytes,
-            )
-        except Exception as exc:  # noqa: BLE001 - remote backup is non-fatal to the app
-            logger.warning("state backup failed error=%s", type(exc).__name__)
+    async def backup(self, *, wait_for_clean: bool = True) -> StateSyncView:
+        if self._remote_write_protected:
             self._set_view(
                 StateSyncStatus.FAILED,
-                "状態バックアップに失敗しました。",
-                failure_at=_utc(self._now_factory()),
+                "状態バックアップはリモート復旧失敗のため無効です。",
             )
-        finally:
-            if snapshot is not None:
-                snapshot.path.unlink(missing_ok=True)
-            self._backup_lock.release()
-        return self.get_status()
+            return self.get_status()
+        if not self._is_configured or self._closed:
+            self._set_view(StateSyncStatus.DISABLED, "状態バックアップは無効です。")
+            return self.get_status()
+        while True:
+            if not self._backup_lock.acquire(blocking=False):
+                if not wait_for_clean:
+                    self._schedule_follow_up_backup()
+                    return self.get_status()
+                await asyncio.sleep(0.01)
+                continue
+            try:
+                snapshot_version = self._current_dirty_version()
+                view, succeeded = await self._backup_once(
+                    snapshot_version,
+                    schedule_follow_up=not wait_for_clean,
+                )
+            finally:
+                self._backup_lock.release()
+            if not wait_for_clean or not succeeded or self._is_clean(snapshot_version):
+                return view
 
     def backup_sync(self) -> StateSyncView:
         return asyncio.run(self.backup())
@@ -121,26 +118,149 @@ class StateSyncService:
         if not self.enabled:
             return
         with self._timer_lock:
-            if self._timer is not None:
-                self._timer.cancel()
-            self._timer = threading.Timer(
-                self._settings.state_sync_debounce_seconds,
-                self._run_debounced_backup,
-            )
-            self._timer.daemon = True
-            self._timer.start()
+            self._dirty_version += 1
+            self._schedule_timer_locked(reset=True)
 
     def close(self) -> None:
+        should_flush = False
         with self._timer_lock:
+            if self._closed:
+                return
             if self._timer is not None:
                 self._timer.cancel()
                 self._timer = None
+            self._timer_token += 1
+            should_flush = self._dirty_version > self._backed_up_version
+        if should_flush and self.enabled:
+            try:
+                self.backup_sync()
+            except Exception:  # noqa: BLE001 - stop must continue after best-effort flush
+                logger.warning("state backup flush during shutdown failed", exc_info=True)
+        with self._timer_lock:
+            self._closed = True
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            self._timer_token += 1
 
-    def _run_debounced_backup(self) -> None:
+    async def _backup_once(
+        self,
+        snapshot_version: int,
+        *,
+        schedule_follow_up: bool,
+    ) -> tuple[StateSyncView, bool]:
+        snapshot: StateSnapshot | None = None
+        self._set_view(StateSyncStatus.RUNNING, "状態バックアップを実行中です。")
         try:
-            asyncio.run(self.backup())
+            snapshot = self._snapshot_service.create_snapshot()
+            if snapshot.metadata.sha256 == self._current_last_hash():
+                self._record_success(snapshot.metadata.sha256, snapshot_version)
+                self._set_view(
+                    StateSyncStatus.SYNCED,
+                    "状態バックアップは変更がないためアップロードを省略しました。",
+                    success_at=snapshot.metadata.created_at,
+                    remote_sha256=snapshot.metadata.sha256,
+                    remote_size_bytes=snapshot.metadata.size_bytes,
+                )
+                if schedule_follow_up and not self._is_clean(snapshot_version):
+                    self._schedule_follow_up_backup()
+                return self.get_status(), True
+            backup_name = _backup_name(snapshot.metadata.created_at)
+            remote_filename = f"backups/{backup_name}.sqlite3"
+            metadata_filename = f"{remote_filename}.metadata.json"
+            pointer_path: Path | None = None
+            metadata_path: Path | None = None
+            try:
+                pointer_path = self._write_pointer(snapshot, remote_filename)
+                metadata_path = self._write_metadata(snapshot, remote_filename, metadata_filename)
+                await self._storage.upload(snapshot.path, remote_filename)
+                assert metadata_path is not None
+                assert pointer_path is not None
+                await self._storage.upload(metadata_path, metadata_filename)
+                await self._storage.upload(pointer_path, "latest.json")
+            finally:
+                if pointer_path is not None:
+                    pointer_path.unlink(missing_ok=True)
+                if metadata_path is not None:
+                    metadata_path.unlink(missing_ok=True)
+            self._record_success(snapshot.metadata.sha256, snapshot_version)
+            self._set_view(
+                StateSyncStatus.SYNCED,
+                "状態バックアップが完了しました。",
+                success_at=snapshot.metadata.created_at,
+                remote_sha256=snapshot.metadata.sha256,
+                remote_size_bytes=snapshot.metadata.size_bytes,
+            )
+            if schedule_follow_up and not self._is_clean(snapshot_version):
+                self._schedule_follow_up_backup()
+            return self.get_status(), True
+        except Exception as exc:  # noqa: BLE001 - remote backup is non-fatal to the app
+            logger.warning("state backup failed error=%s", type(exc).__name__)
+            self._set_view(
+                StateSyncStatus.FAILED,
+                "状態バックアップに失敗しました。",
+                failure_at=_utc(self._now_factory()),
+            )
+            if schedule_follow_up:
+                self._schedule_follow_up_backup()
+            return self.get_status(), False
+        finally:
+            if snapshot is not None:
+                snapshot.path.unlink(missing_ok=True)
+
+    def _run_debounced_backup(self, timer_token: int) -> None:
+        with self._timer_lock:
+            if timer_token != self._timer_token:
+                return
+            self._timer = None
+            if self._closed:
+                return
+        try:
+            asyncio.run(self.backup(wait_for_clean=False))
         except Exception:  # noqa: BLE001 - background backup must never crash the process
             logger.warning("debounced state backup failed", exc_info=True)
+
+    def _schedule_timer_locked(self, *, reset: bool) -> None:
+        if self._closed or not self._is_configured or self._remote_write_protected:
+            return
+        if reset and self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+        if not reset and self._timer is not None:
+            return
+        self._timer_token += 1
+        token = self._timer_token
+        self._timer = threading.Timer(
+            self._settings.state_sync_debounce_seconds,
+            self._run_debounced_backup,
+            args=(token,),
+        )
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _schedule_follow_up_backup(self) -> None:
+        with self._timer_lock:
+            self._schedule_timer_locked(reset=False)
+
+    def _current_dirty_version(self) -> int:
+        with self._timer_lock:
+            return self._dirty_version
+
+    def _current_last_hash(self) -> str | None:
+        with self._timer_lock:
+            return self._last_hash
+
+    def _record_success(self, remote_sha256: str, snapshot_version: int) -> None:
+        with self._timer_lock:
+            self._last_hash = remote_sha256
+            self._backed_up_version = max(self._backed_up_version, snapshot_version)
+
+    def _is_clean(self, snapshot_version: int) -> bool:
+        with self._timer_lock:
+            return (
+                self._backed_up_version >= self._dirty_version
+                and self._backed_up_version >= snapshot_version
+            )
 
     def _write_metadata(
         self, snapshot: StateSnapshot, remote_filename: str, local_name: str
@@ -187,8 +307,14 @@ class StateSyncService:
                 last_success_at=success_at or current.last_success_at,
                 last_failure_at=failure_at or current.last_failure_at,
                 last_message=message,
-                remote_sha256=remote_sha256 or current.remote_sha256,
-                remote_size_bytes=remote_size_bytes or current.remote_size_bytes,
+                remote_sha256=(
+                    remote_sha256 if remote_sha256 is not None else current.remote_sha256
+                ),
+                remote_size_bytes=(
+                    remote_size_bytes
+                    if remote_size_bytes is not None
+                    else current.remote_size_bytes
+                ),
             )
 
 

@@ -247,7 +247,9 @@ class ApplicationRuntime:
         """Start the process-level queue worker."""
 
         if self.run_stateless_reconciliation and self.stateless_reconciliation_service is not None:
-            self.stateless_reconciliation_service.reconcile()
+            result = self.stateless_reconciliation_service.reconcile()
+            if not result.is_success:
+                raise RuntimeError("stateless reconciliation failed; workers were not started")
         self.queue_runtime.start()
         if self.drive_sync_runtime is not None:
             self.drive_sync_runtime.start()
@@ -265,6 +267,8 @@ class ApplicationRuntime:
 def build_app(
     settings: Settings | None = None,
     service: ComfyUIService | None = None,
+    *,
+    initial_remote_sha256: str | None = None,
 ) -> gr.Blocks:
     """Build the UI without starting a server or contacting ComfyUI."""
 
@@ -284,6 +288,12 @@ def build_app(
     system_error_repository = SystemErrorEventRepository(session_factory)
     start_repository = GenerationStartRepository(session_factory)
     progress_repository = GenerationProgressRepository(session_factory)
+    drive_adapter = GoogleDriveAdapter(app_settings)
+    state_sync_service = StateSyncService(
+        app_settings,
+        storage=StateBackupStorage(app_settings, drive_adapter),
+        initial_remote_sha256=initial_remote_sha256,
+    )
     catalog_service = LoraCatalogService(
         LoraMetadataRepository(create_session_factory(database_engine)),
         LoraThumbnailStorage(
@@ -291,6 +301,7 @@ def build_app(
             app_settings.max_lora_thumbnail_bytes,
             app_settings.lora_thumbnail_max_edge,
         ),
+        state_changed_callback=state_sync_service.mark_dirty,
     )
     loaded_workflow = load_txt2img_template(
         app_settings.workflow_dir.parent if app_settings.workflow_dir.exists() else None
@@ -350,11 +361,6 @@ def build_app(
         metadata_import_repository=metadata_import_repository,
         imported_image_storage=imported_image_storage,
     )
-    drive_adapter = GoogleDriveAdapter(app_settings)
-    state_sync_service = StateSyncService(
-        app_settings,
-        storage=StateBackupStorage(app_settings, drive_adapter),
-    )
     drive_sync_service = DriveSyncService(
         drive_sync_repository,
         generation_repository,
@@ -392,6 +398,7 @@ def build_app(
         app_settings,
         disk_usage_adapter=disk_usage_adapter,
         error_history_repository=system_error_repository,
+        state_changed_callback=state_sync_service.mark_dirty,
     )
     execution_service = GenerationExecutionService(
         generation_service,
@@ -513,18 +520,16 @@ def build_app(
             system_health_service,
             app_settings.timezone,
         )
-        health_load_event = demo.load(
+        demo.load(
             fn=health_handler,
             outputs=[system.health_markdown, system.error_history_markdown],
             concurrency_limit=1,
         )
-        health_load_event.then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
-        health_refresh_event = system.health_refresh_button.click(
+        system.health_refresh_button.click(
             fn=health_handler,
             outputs=[system.health_markdown, system.error_history_markdown],
             concurrency_limit=1,
         )
-        health_refresh_event.then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
         state_backup_event = system.state_backup_button.click(
             fn=lambda: gr.Button(interactive=False),
             outputs=[system.state_backup_button],
@@ -1978,10 +1983,11 @@ def build_application_runtime(
     settings: Settings | None = None,
     *,
     run_stateless_reconciliation: bool = False,
+    initial_remote_sha256: str | None = None,
 ) -> ApplicationRuntime:
     """Build the demo and obtain its unstarted process-level worker runtime."""
 
-    demo = build_app(settings)
+    demo = build_app(settings, initial_remote_sha256=initial_remote_sha256)
     runtime = getattr(demo, "generation_queue_runtime", None)
     if not isinstance(runtime, GenerationQueueRuntime):
         raise RuntimeError("generation queue runtime was not configured")

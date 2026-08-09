@@ -440,6 +440,31 @@ def test_resync_rejects_pending_old_manifest_and_atomic_race_without_new_destina
     assert manifest_jobs[0].status is DriveSyncStatus.PENDING
 
 
+def test_resync_with_missing_local_image_does_not_enqueue_or_copy(tmp_path: Path) -> None:
+    adapter = FakeDriveAdapter()
+    service, repository, generation_id, image_path, _, _ = _fixture(
+        tmp_path,
+        adapter=adapter,
+    )
+    assert service.enqueue_generation(generation_id) is not None
+    claimed = repository.claim_next("worker-1", 120)
+    assert claimed is not None
+    assert asyncio.run(service.process_job(claimed, "worker-1")) is not None
+    manifest_job = repository.claim_next_manifest("worker-1", 120)
+    assert manifest_job is not None
+    assert asyncio.run(service.process_manifest_job(manifest_job, "worker-1")) is not None
+    existing_job_count = len(repository.list_jobs())
+    adapter.calls.clear()
+    image_path.unlink()
+
+    with pytest.raises(DriveSyncServiceError) as error:
+        service.retry_generation(generation_id, resync=True)
+
+    assert error.value.code == DriveSyncErrorCode.SOURCE_MISSING.value
+    assert len(repository.list_jobs()) == existing_job_count
+    assert adapter.calls == []
+
+
 def test_process_pid_and_live_progress_are_persisted_with_lease_owner(
     tmp_path: Path,
 ) -> None:

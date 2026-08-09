@@ -350,6 +350,19 @@ def _classify_rclone_failure(stderr: str) -> str:
     normalized = stderr.lower()
     if any(token in normalized for token in ("auth", "unauthorized", "forbidden", "401", "403")):
         return "drive_authentication_failed"
+    if any(
+        token in normalized
+        for token in (
+            "not found",
+            "no such file",
+            "doesn't exist",
+            "does not exist",
+            "directory not found",
+            "file not found",
+            "object not found",
+        )
+    ):
+        return "remote_not_found"
     return DriveSyncErrorCode.TRANSFER_FAILED.value
 
 
@@ -406,7 +419,7 @@ def _progress_from_line(
 
 _SAFE_ERROR_CODES = frozenset(
     {error.value for error in DriveSyncErrorCode}
-    | {"drive_authentication_failed", "operation_timeout", "operation_failed"}
+    | {"drive_authentication_failed", "remote_not_found", "operation_timeout", "operation_failed"}
 )
 _SAFE_OPERATIONS = frozenset({"connection", "copyto", "copyfrom"})
 _SAFE_ARTIFACTS = frozenset({"image", "metadata", "manifest"})

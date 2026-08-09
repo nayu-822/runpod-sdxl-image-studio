@@ -34,6 +34,26 @@ prompt ID の保存に失敗した場合は `ready` に戻しません。結果�
 
 Queue 並べ替え、複数 worker/GPU、自動 retry、汎用workflow editor、LoRA学習は今回の対象外です。
 
+## Phase 10: Stateless状態バックアップ・復元
+
+新規Pod Deploy後にSQLite状態を復元する場合は、rcloneのremoteとstate syncを設定します。
+復元対象はSQLiteの状態だけで、ローカル画像やLoRA thumbnailの実体は自動取得しません。
+
+```dotenv
+IMAGE_STUDIO_STATE_SYNC_ENABLED=true
+IMAGE_STUDIO_STATE_SYNC_RESTORE_ON_STARTUP=true
+IMAGE_STUDIO_STATE_SYNC_SUBDIR=state
+IMAGE_STUDIO_STATE_SYNC_DEBOUNCE_SECONDS=30
+IMAGE_STUDIO_STATE_SYNC_UPLOAD_TIMEOUT_SECONDS=600
+IMAGE_STUDIO_STATE_SYNC_DOWNLOAD_TIMEOUT_SECONDS=600
+RCLONE_REMOTE=drive
+RCLONE_BASE_PATH=RunPodSDXLImageStudio
+```
+
+起動時にremote stateの取得可否を確認できない場合はfail-closedし、空のSQLiteで過去のremote stateを上書きしません。
+remoteにstate backupが存在しないことを確認できた初回だけ、空DBで起動できます。timestamped backupのremote retentionは未実装で、
+古いstate backupの自動削除は行いません。`rclone sync`は使用しません。
+
 ## フェーズ3A: 生成履歴・スナップショット・再生成
 
 フェーズ3Aでは、SQLite による `Generation`、`GenerationJob`、

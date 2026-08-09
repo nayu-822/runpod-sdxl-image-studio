@@ -16,13 +16,18 @@ def main() -> None:
 
     settings = get_settings()
     restore_result = StateRestoreService(settings).restore_if_missing()
+    if restore_result.status in {StateRestoreStatus.UNAVAILABLE, StateRestoreStatus.FAILED}:
+        raise RuntimeError("remote write protection: state restore could not be verified")
     upgrade_database(settings)
     runtime = build_application_runtime(
         settings,
         run_stateless_reconciliation=restore_result.status is StateRestoreStatus.RESTORED,
+        initial_remote_sha256=(
+            restore_result.metadata.sha256 if restore_result.metadata is not None else None
+        ),
     )
-    runtime.start()
     try:
+        runtime.start()
         runtime.demo.launch(
             server_name=settings.host,
             server_port=settings.port,

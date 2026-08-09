@@ -18,7 +18,7 @@ import httpx
 import pytest
 import respx
 from PIL import Image
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, select
 from sqlalchemy.pool import StaticPool
 
 from runpod_sdxl_image_studio.adapters.catalog.upscaler_catalog import UpscalerCatalog
@@ -28,7 +28,7 @@ from runpod_sdxl_image_studio.adapters.comfyui.upscale_workflow_adapter import (
     UpscaleWorkflowAdapter,
 )
 from runpod_sdxl_image_studio.adapters.database.engine import create_session_factory
-from runpod_sdxl_image_studio.adapters.database.models import Base
+from runpod_sdxl_image_studio.adapters.database.models import Base, GenerationModel
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_dispatch_queue_repository import (  # noqa: E501
     GenerationDispatchQueueRepository,
 )
@@ -249,6 +249,79 @@ def test_upscale_enqueue_rejects_source_mutation_before_generation_creation(tmp_
 
         verify_source_artifact(artifact, settings)
     assert error.value.code == "upscale_source_changed"
+    source.unlink()
+    with pytest.raises(UpscaleEnqueueError) as missing_error:
+        verify_source_artifact(artifact, settings)
+    assert missing_error.value.code == "upscale_source_file_missing"
+
+
+def test_upscale_enqueue_missing_source_creates_no_generation_or_queue_entry(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    factory = create_session_factory(engine)
+    settings = Settings(
+        _env_file=None,
+        data_dir=tmp_path,
+        upscaler_dir=tmp_path / "upscalers",
+        max_width=2048,
+        max_height=2048,
+    )
+    parent_id, parent_job_id = uuid4(), uuid4()
+    now = datetime.now(UTC)
+    parent_snapshot = GenerationSettingsSnapshot.from_settings(_settings())
+    GenerationStartRepository(factory).create_pending(
+        parent_snapshot,
+        generation_id=parent_id,
+        job_id=parent_job_id,
+        kind=GenerationKind.STANDARD,
+        parent_generation_id=None,
+        created_at=now,
+    )
+    missing_artifact = GenerationArtifact(
+        id=uuid4(),
+        generation_id=parent_id,
+        artifact_type=ArtifactType.IMAGE,
+        local_path="generations/missing-source.png",
+        sha256="a" * 64,
+        size_bytes=10,
+        width=512,
+        height=512,
+        mime_type="image/png",
+        created_at=now,
+    )
+    GenerationCompletionRepository(factory).complete_generation(
+        parent_id,
+        parent_job_id,
+        missing_artifact,
+        now,
+    )
+    dispatch = GenerationDispatchQueueRepository(factory)
+    service = UpscaleEnqueueService(
+        GenerationRepository(factory),
+        GenerationArtifactRepository(factory),
+        dispatch,
+        settings,
+        catalog=UpscalerCatalog(("4x.pth",)),
+    )
+
+    with pytest.raises(UpscaleEnqueueError) as error:
+        service.enqueue(
+            parent_id,
+            UpscaleSettings(
+                method=UpscaleMethod.IMAGE,
+                sizing_mode=UpscaleSizingMode.FACTOR,
+                scale_factor=2,
+                upscaler_name="4x.pth",
+            ),
+        )
+
+    assert error.value.code == "upscale_source_file_missing"
+    with factory() as session:
+        assert len(session.scalars(select(GenerationModel)).all()) == 1
+    assert dispatch.list_queue() == ()
+    engine.dispose()
 
 
 def test_upscale_retry_preserves_parent_snapshots_and_does_not_resubmit_prompt(

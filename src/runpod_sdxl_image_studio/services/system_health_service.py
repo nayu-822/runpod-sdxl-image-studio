@@ -109,6 +109,7 @@ class SystemHealthService:
         disk_usage_adapter: DiskUsageAdapterProtocol | None = None,
         error_history_repository: ErrorHistoryProvider | None = None,
         now_factory: Callable[[], datetime] | None = None,
+        state_changed_callback: Callable[[], None] | None = None,
     ) -> None:
         self._comfyui_service = comfyui_service
         self._queue_service = queue_service
@@ -117,6 +118,7 @@ class SystemHealthService:
         self._disk_usage_adapter = disk_usage_adapter or LocalDiskUsageAdapter()
         self._error_history_repository = error_history_repository
         self._now_factory = now_factory or (lambda: datetime.now(UTC))
+        self._state_changed_callback = state_changed_callback
 
     async def get_health(self) -> SystemHealthView:
         """Collect one bounded snapshot; no continuous polling is performed here."""
@@ -403,6 +405,11 @@ class SystemHealthService:
                     retryable=True,
                     created_at=observed_at,
                 )
+                if self._state_changed_callback is not None:
+                    try:
+                        self._state_changed_callback()
+                    except Exception:  # noqa: BLE001 - backup notification must not break health
+                        logger.warning("System health state change notification failed")
         except Exception:  # noqa: BLE001 - telemetry must not block health rendering
             logger.warning("System health error history could not be saved")
 

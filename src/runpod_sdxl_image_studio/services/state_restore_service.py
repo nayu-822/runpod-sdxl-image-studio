@@ -12,7 +12,11 @@ from pathlib import Path, PurePosixPath
 from tempfile import NamedTemporaryFile
 
 from runpod_sdxl_image_studio.adapters.database.engine import sqlite_database_path
-from runpod_sdxl_image_studio.adapters.rclone.state_backup_storage import StateBackupStorage
+from runpod_sdxl_image_studio.adapters.rclone.state_backup_storage import (
+    StateBackupNotFound,
+    StateBackupStorage,
+    StateBackupUnavailable,
+)
 from runpod_sdxl_image_studio.config import Settings
 from runpod_sdxl_image_studio.domain.state_sync import (
     StateRestoreResult,
@@ -69,11 +73,22 @@ class StateRestoreService:
         temporary_db: Path | None = None
         try:
             await self._storage.download("latest.json", pointer_path)
-        except Exception as exc:  # noqa: BLE001 - missing/unavailable remote is non-fatal
-            logger.info("state restore pointer unavailable error=%s", type(exc).__name__)
+        except StateBackupNotFound:
             pointer_path.unlink(missing_ok=True)
             return StateRestoreResult(
                 StateRestoreStatus.NO_BACKUP, message="no remote state backup"
+            )
+        except (StateBackupUnavailable, OSError) as exc:
+            logger.info("state restore pointer unavailable error=%s", type(exc).__name__)
+            pointer_path.unlink(missing_ok=True)
+            return StateRestoreResult(
+                StateRestoreStatus.UNAVAILABLE, message="remote state backup is unavailable"
+            )
+        except Exception as exc:  # noqa: BLE001 - unknown remote failures fail closed
+            logger.warning("state restore pointer transfer failed error=%s", type(exc).__name__)
+            pointer_path.unlink(missing_ok=True)
+            return StateRestoreResult(
+                StateRestoreStatus.UNAVAILABLE, message="remote state backup is unavailable"
             )
 
         try:
@@ -83,7 +98,12 @@ class StateRestoreService:
             ) as file:
                 temporary_db = Path(file.name)
             os.chmod(temporary_db, 0o600)
-            await self._storage.download(metadata.filename, temporary_db)
+            try:
+                await self._storage.download(metadata.filename, temporary_db)
+            except StateBackupNotFound as exc:
+                raise StateRestoreError("state backup body is missing") from exc
+            except StateBackupUnavailable:
+                raise
             if temporary_db.stat().st_size != metadata.size_bytes:
                 raise StateRestoreError("state backup size does not match latest pointer")
             if _sha256(temporary_db) != metadata.sha256:
@@ -106,9 +126,16 @@ class StateRestoreService:
         except (OSError, ValueError, StateRestoreError, StateSnapshotError) as exc:
             logger.warning("state restore validation failed error=%s", type(exc).__name__)
             return StateRestoreResult(StateRestoreStatus.FAILED, message="state restore failed")
+        except StateBackupUnavailable as exc:
+            logger.warning("state restore backup transfer unavailable error=%s", type(exc).__name__)
+            return StateRestoreResult(
+                StateRestoreStatus.UNAVAILABLE, message="remote state backup is unavailable"
+            )
         except Exception as exc:  # noqa: BLE001 - remote transfer failures fail closed
             logger.warning("state restore transfer failed error=%s", type(exc).__name__)
-            return StateRestoreResult(StateRestoreStatus.FAILED, message="state restore failed")
+            return StateRestoreResult(
+                StateRestoreStatus.UNAVAILABLE, message="remote state backup is unavailable"
+            )
         finally:
             pointer_path.unlink(missing_ok=True)
             if temporary_db is not None:
