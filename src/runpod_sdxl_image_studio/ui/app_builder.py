@@ -56,6 +56,7 @@ from runpod_sdxl_image_studio.adapters.database.repositories.upscale_settings_re
     UpscaleSettingsRepository,
 )
 from runpod_sdxl_image_studio.adapters.drive.google_drive_adapter import GoogleDriveAdapter
+from runpod_sdxl_image_studio.adapters.rclone.state_backup_storage import StateBackupStorage
 from runpod_sdxl_image_studio.adapters.storage.disk_usage import LocalDiskUsageAdapter
 from runpod_sdxl_image_studio.adapters.storage.generation_metadata_storage import (
     GenerationMetadataStorage,
@@ -104,6 +105,10 @@ from runpod_sdxl_image_studio.services.lora_catalog_service import (
 from runpod_sdxl_image_studio.services.metadata_import_service import MetadataImportService
 from runpod_sdxl_image_studio.services.preset_service import PresetService
 from runpod_sdxl_image_studio.services.recent_settings_service import RecentSettingsService
+from runpod_sdxl_image_studio.services.state_sync_service import StateSyncService
+from runpod_sdxl_image_studio.services.stateless_reconciliation_service import (
+    StatelessReconciliationService,
+)
 from runpod_sdxl_image_studio.services.system_health_service import SystemHealthService
 from runpod_sdxl_image_studio.services.upscale_enqueue_service import UpscaleEnqueueService
 from runpod_sdxl_image_studio.services.upscale_service import UpscaleService
@@ -206,6 +211,7 @@ from runpod_sdxl_image_studio.ui.tabs.system_tab import (
     make_check_connection_handler,
     make_enqueue_handler,
     make_refresh_handler,
+    make_state_backup_handler,
     make_system_health_handler,
     size_preset_values,
 )
@@ -219,7 +225,7 @@ from runpod_sdxl_image_studio.ui.tabs.upscale_tab import (
     make_upscale_result_handler,
     make_upscale_visibility_handler,
 )
-from runpod_sdxl_image_studio.ui.view_models import initial_status_markdown
+from runpod_sdxl_image_studio.ui.view_models import initial_status_markdown, state_sync_markdown
 from runpod_sdxl_image_studio.workflows.loader import load_txt2img_template, load_workflow_template
 
 APP_TITLE = "RunPod SDXL Image Studio"
@@ -233,10 +239,15 @@ class ApplicationRuntime:
     demo: gr.Blocks
     queue_runtime: GenerationQueueRuntime
     drive_sync_runtime: DriveSyncRuntime | None = None
+    state_sync_service: StateSyncService | None = None
+    stateless_reconciliation_service: StatelessReconciliationService | None = None
+    run_stateless_reconciliation: bool = False
 
     def start(self) -> None:
         """Start the process-level queue worker."""
 
+        if self.run_stateless_reconciliation and self.stateless_reconciliation_service is not None:
+            self.stateless_reconciliation_service.reconcile()
         self.queue_runtime.start()
         if self.drive_sync_runtime is not None:
             self.drive_sync_runtime.start()
@@ -247,6 +258,8 @@ class ApplicationRuntime:
         if self.drive_sync_runtime is not None:
             self.drive_sync_runtime.stop()
         self.queue_runtime.stop()
+        if self.state_sync_service is not None:
+            self.state_sync_service.close()
 
 
 def build_app(
@@ -337,12 +350,17 @@ def build_app(
         metadata_import_repository=metadata_import_repository,
         imported_image_storage=imported_image_storage,
     )
+    drive_adapter = GoogleDriveAdapter(app_settings)
+    state_sync_service = StateSyncService(
+        app_settings,
+        storage=StateBackupStorage(app_settings, drive_adapter),
+    )
     drive_sync_service = DriveSyncService(
         drive_sync_repository,
         generation_repository,
         artifact_repository,
         app_settings,
-        GoogleDriveAdapter(app_settings),
+        drive_adapter,
         metadata_repair_handler=generation_service.repair_optional_artifacts,
     )
     generation_service.set_drive_sync_enqueue_handler(drive_sync_service.enqueue_generation)
@@ -396,6 +414,10 @@ def build_app(
         failure_repository=failure_repository,
         cancellation_repository=GenerationCancellationRepository(session_factory),
     )
+    stateless_reconciliation_service = StatelessReconciliationService(
+        dispatch_queue_repository,
+        drive_sync_repository,
+    )
 
     async def reconcile_queue_item(item: GenerationQueueItem) -> ReconciliationOutcome:
         queue_item = item
@@ -420,12 +442,14 @@ def build_app(
         reconcile_handler=reconcile_queue_item,
         cancellation_adapter=cancellation_adapter,
         completed_optional_artifact_handler=repair_one_optional_artifact,
+        state_changed_callback=state_sync_service.mark_dirty,
     )
     queue_runtime = GenerationQueueRuntime(queue_worker)
     drive_sync_worker = DriveSyncWorker(
         drive_sync_repository,
         drive_sync_service,
         app_settings,
+        state_changed_callback=state_sync_service.mark_dirty,
     )
     drive_sync_runtime = DriveSyncRuntime(drive_sync_worker)
     queue_service.set_wake_callback(queue_runtime.wake)
@@ -453,6 +477,9 @@ def build_app(
             system = build_system_tab(
                 app_settings.comfyui_base_url,
                 initial_status_markdown(),
+                initial_state_sync_markdown=state_sync_markdown(
+                    state_sync_service.get_status(), app_settings.timezone
+                ),
             )
         with gr.Tab("キュー"):
             (
@@ -486,15 +513,31 @@ def build_app(
             system_health_service,
             app_settings.timezone,
         )
-        demo.load(
+        health_load_event = demo.load(
             fn=health_handler,
             outputs=[system.health_markdown, system.error_history_markdown],
             concurrency_limit=1,
         )
-        system.health_refresh_button.click(
+        health_load_event.then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
+        health_refresh_event = system.health_refresh_button.click(
             fn=health_handler,
             outputs=[system.health_markdown, system.error_history_markdown],
             concurrency_limit=1,
+        )
+        health_refresh_event.then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
+        state_backup_event = system.state_backup_button.click(
+            fn=lambda: gr.Button(interactive=False),
+            outputs=[system.state_backup_button],
+            queue=False,
+        )
+        state_backup_event.then(
+            fn=make_state_backup_handler(state_sync_service, app_settings.timezone),
+            outputs=[system.state_sync_markdown, system.state_sync_message],
+            concurrency_limit=1,
+        ).then(
+            fn=lambda: gr.Button(interactive=True),
+            outputs=[system.state_backup_button],
+            queue=False,
         )
 
         mobile_status_inputs = [
@@ -644,13 +687,13 @@ def build_app(
             inputs=[metadata_import.image, metadata_import.sidecar],
             outputs=metadata_import_outputs,
             concurrency_limit=1,
-        )
+        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
         metadata_import.apply_mapping.click(
             fn=make_metadata_mapping_handler(metadata_import_service),
             inputs=[metadata_import.import_id, metadata_import.mapping_json],
             outputs=metadata_import_outputs,
             concurrency_limit=1,
-        )
+        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
         metadata_import.select_source_button.click(
             fn=make_metadata_source_selection_handler(metadata_import_service),
             inputs=[
@@ -660,7 +703,7 @@ def build_app(
             ],
             outputs=metadata_import_outputs,
             concurrency_limit=1,
-        )
+        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
 
         upscale.enqueue_button.click(
             fn=begin_upscale_enqueue,
@@ -684,7 +727,7 @@ def build_app(
             ],
             outputs=[upscale.enqueue_button, upscale.status],
             concurrency_limit=1,
-        )
+        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
         upscale.latest_button.click(
             fn=make_latest_parent_selection_handler(upscale_enqueue_service),
             outputs=[upscale.parent_generation_id, upscale.source_preview, upscale.status],
@@ -831,7 +874,7 @@ def build_app(
             inputs=mobile_status_inputs,
             outputs=mobile_status_poll_outputs,
             concurrency_limit=1,
-        )
+        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
         queue_refresh.click(
             fn=make_queue_refresh_handler(queue_service),
             inputs=[queue_status, queue_batch_filter],
@@ -866,7 +909,7 @@ def build_app(
             fn=make_queue_refresh_handler(queue_service),
             inputs=[queue_status, queue_batch_filter],
             outputs=[queue_jobs, queue_message],
-        )
+        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
         ambiguous_link_event = queue_ambiguous_link.click(
             fn=lambda: (gr.Button(interactive=False), gr.Button(interactive=False)),
             outputs=[queue_ambiguous_link, queue_ambiguous_fail],
@@ -895,7 +938,7 @@ def build_app(
                 queue_ambiguous_link,
                 queue_ambiguous_fail,
             ],
-        )
+        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
         ambiguous_fail_event = queue_ambiguous_fail.click(
             fn=lambda: (gr.Button(interactive=False), gr.Button(interactive=False)),
             outputs=[queue_ambiguous_link, queue_ambiguous_fail],
@@ -924,7 +967,7 @@ def build_app(
                 queue_ambiguous_link,
                 queue_ambiguous_fail,
             ],
-        )
+        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
         queue_retry_event = queue_retry.click(
             fn=lambda: gr.Button(interactive=False),
             outputs=[queue_retry],
@@ -939,7 +982,7 @@ def build_app(
             fn=make_queue_refresh_handler(queue_service),
             inputs=[queue_status, queue_batch_filter],
             outputs=[queue_jobs, queue_message],
-        )
+        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
         queue_retry_batch_event = queue_retry_batch.click(
             fn=lambda: gr.Button(interactive=False),
             outputs=[queue_retry_batch],
@@ -954,7 +997,7 @@ def build_app(
             fn=make_queue_refresh_handler(queue_service),
             inputs=[queue_status, queue_batch_filter],
             outputs=[queue_jobs, queue_message],
-        )
+        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
         presets.refresh.click(
             fn=make_preset_search_handler(preset_service),
             inputs=[presets.search, presets.kind, presets.favorite_only],
@@ -1024,17 +1067,17 @@ def build_app(
             fn=make_preset_save_handler(preset_service, app_settings.max_loras),
             inputs=preset_save_inputs,
             outputs=preset_form_outputs,
-        )
+        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
         presets.update_button.click(
             fn=make_preset_update_handler(preset_service, app_settings.max_loras),
             inputs=[presets.selected, *preset_save_inputs[1:]],
             outputs=preset_form_outputs,
-        )
+        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
         presets.duplicate_button.click(
             fn=make_preset_duplicate_handler(preset_service),
             inputs=[presets.selected, presets.search, presets.kind, presets.favorite_only],
             outputs=preset_form_outputs,
-        )
+        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
         presets.delete_button.click(
             fn=make_preset_delete_handler(preset_service),
             inputs=[
@@ -1045,12 +1088,12 @@ def build_app(
                 presets.favorite_only,
             ],
             outputs=preset_form_outputs,
-        )
+        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
         presets.favorite.change(
             fn=make_preset_favorite_handler(preset_service),
             inputs=[presets.selected, presets.favorite],
             outputs=[presets.favorite, presets.message],
-        )
+        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
         presets.clear_button.click(
             fn=make_preset_clear_handler(),
             outputs=[
@@ -1298,7 +1341,7 @@ def build_app(
                 *component_outputs(generation.lora_editor),
                 generation.lora_editor.add_button,
             ],
-        )
+        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
         for index, row in enumerate(generation.lora_editor.rows):
             row.name.change(
                 fn=lambda state, name, model, clip, row_index=index: handle_lora_name_change(
@@ -1394,7 +1437,7 @@ def build_app(
                 *component_outputs(generation.lora_editor),
                 generation.lora_editor.add_button,
             ],
-        )
+        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
 
         search_inputs = [
             lora_management.search,
@@ -1720,12 +1763,12 @@ def build_app(
             fn=make_history_favorite_handler(history_service),
             inputs=[history.selected, history.favorite],
             outputs=[history.favorite, history.message],
-        )
+        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
         history.save_note_button.click(
             fn=make_history_note_handler(history_service),
             inputs=[history.selected, history.note],
             outputs=[history.message],
-        )
+        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
         restore_outputs = [
             history.message,
             generation.positive_prompt,
@@ -1758,7 +1801,7 @@ def build_app(
                 generation.lora_editor.choices,
             ],
             outputs=restore_outputs,
-        )
+        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
         metadata_import.apply_upscale.click(
             fn=make_metadata_upscale_apply_handler(metadata_import_service),
             inputs=[metadata_import.import_id],
@@ -1768,7 +1811,7 @@ def build_app(
                 upscale.source_preview,
                 upscale.status,
             ],
-        )
+        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
         history.restore_button.click(
             fn=make_restore_handler(history_service, app_settings.max_loras),
             inputs=[
@@ -1778,7 +1821,7 @@ def build_app(
                 generation.lora_editor.choices,
             ],
             outputs=restore_outputs,
-        )
+        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
         generation_inputs = [
             generation.checkpoint,
             generation.positive_prompt,
@@ -1833,7 +1876,7 @@ def build_app(
             fn=mobile_status_poll_handler,
             inputs=mobile_status_inputs,
             outputs=mobile_status_poll_outputs,
-        )
+        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
         generate_event = generation.generate_button.click(
             fn=disable_generate_button,
             outputs=[generation.generate_button],
@@ -1858,6 +1901,7 @@ def build_app(
             outputs=mobile_status_poll_outputs,
             concurrency_limit=1,
         )
+        generation_enqueue_event.then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
         generation.result_edit_button.click(
             fn=make_restore_handler(history_service, app_settings.max_loras),
             inputs=[
@@ -1918,12 +1962,23 @@ def build_app(
             outputs=mobile_status_poll_outputs,
             concurrency_limit=1,
         )
+        result_regenerate_enqueue_event.then(
+            fn=state_sync_service.mark_dirty,
+            outputs=[],
+            queue=False,
+        )
     demo.generation_queue_runtime = queue_runtime
     demo.drive_sync_runtime = drive_sync_runtime
+    demo.state_sync_service = state_sync_service
+    demo.stateless_reconciliation_service = stateless_reconciliation_service
     return demo
 
 
-def build_application_runtime(settings: Settings | None = None) -> ApplicationRuntime:
+def build_application_runtime(
+    settings: Settings | None = None,
+    *,
+    run_stateless_reconciliation: bool = False,
+) -> ApplicationRuntime:
     """Build the demo and obtain its unstarted process-level worker runtime."""
 
     demo = build_app(settings)
@@ -1933,10 +1988,19 @@ def build_application_runtime(settings: Settings | None = None) -> ApplicationRu
     drive_runtime = getattr(demo, "drive_sync_runtime", None)
     if not isinstance(drive_runtime, DriveSyncRuntime):
         raise RuntimeError("drive sync runtime was not configured")
+    state_sync_service = getattr(demo, "state_sync_service", None)
+    if not isinstance(state_sync_service, StateSyncService):
+        raise RuntimeError("state sync service was not configured")
+    stateless_reconciliation_service = getattr(demo, "stateless_reconciliation_service", None)
+    if not isinstance(stateless_reconciliation_service, StatelessReconciliationService):
+        raise RuntimeError("stateless reconciliation service was not configured")
     return ApplicationRuntime(
         demo=demo,
         queue_runtime=runtime,
         drive_sync_runtime=drive_runtime,
+        state_sync_service=state_sync_service,
+        stateless_reconciliation_service=stateless_reconciliation_service,
+        run_stateless_reconciliation=run_stateless_reconciliation,
     )
 
 

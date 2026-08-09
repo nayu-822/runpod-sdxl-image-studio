@@ -21,7 +21,13 @@ VIEWPORTS = (
     (1280, 800),
 )
 TAB_CONTROLS = {
-    "システム": ("System Health", "Refresh system status", "Recent errors"),
+    "システム": (
+        "System Health",
+        "Refresh system status",
+        "Recent errors",
+        "State backup status",
+        "今すぐ状態をバックアップ",
+    ),
     "生成": ("Positive prompt", "生成をキューへ追加", "実使用Seed（コピー）"),
     "履歴": ("履歴を検索", "実使用seed（選択してコピー）"),
     "キュー": ("キューを更新", "選択ジョブをキャンセル"),

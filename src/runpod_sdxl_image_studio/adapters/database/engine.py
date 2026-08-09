@@ -19,6 +19,15 @@ def resolved_database_url(settings: Settings) -> str:
     return f"sqlite:///{(settings.data_dir / 'database' / 'image_studio.sqlite3').as_posix()}"
 
 
+def sqlite_database_path(settings: Settings) -> Path | None:
+    """Return the file path for a configured SQLite database, if it is file-backed."""
+
+    parsed = make_url(resolved_database_url(settings))
+    if not parsed.drivername.startswith("sqlite") or parsed.database in {None, ":memory:"}:
+        return None
+    return Path(parsed.database)
+
+
 def create_image_studio_engine(settings: Settings) -> Engine:
     url = resolved_database_url(settings)
     connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}

@@ -7,6 +7,7 @@ import contextlib
 import logging
 import threading
 import time
+from collections.abc import Callable
 from uuid import UUID, uuid4
 
 from runpod_sdxl_image_studio.adapters.database.repositories.drive_sync_repository import (
@@ -37,11 +38,13 @@ class DriveSyncWorker:
         settings: Settings,
         *,
         worker_id: str | None = None,
+        state_changed_callback: Callable[[], None] | None = None,
     ) -> None:
         self._repository = repository
         self._service = service
         self._settings = settings
         self.worker_id = worker_id or f"drive-worker-{uuid4()}"
+        self._state_changed_callback = state_changed_callback
         self._stop_requested = threading.Event()
         self._wake_requested = threading.Event()
         self._thread: threading.Thread | None = None
@@ -147,6 +150,7 @@ class DriveSyncWorker:
             heartbeat.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat
+            self._notify_state_changed()
         return True
 
     async def _run_manifest_once(self) -> bool:
@@ -179,7 +183,16 @@ class DriveSyncWorker:
             heartbeat.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat
+            self._notify_state_changed()
         return True
+
+    def _notify_state_changed(self) -> None:
+        if self._state_changed_callback is None:
+            return
+        try:
+            self._state_changed_callback()
+        except Exception:  # noqa: BLE001 - backup notification must not stop the worker
+            logger.warning("Drive state backup notification failed", exc_info=True)
 
     async def _heartbeat(self, job_id: UUID) -> None:
         while True:

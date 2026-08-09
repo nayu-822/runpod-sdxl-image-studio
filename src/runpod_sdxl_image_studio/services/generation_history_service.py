@@ -28,6 +28,11 @@ class GenerationHistoryError(RuntimeError):
     """Safe history service error."""
 
 
+_MISSING_LOCAL_IMAGE_MESSAGE = (
+    "このPodにはローカル画像がありません。stateless運用のため詳細画像は利用できません。"
+)
+
+
 class GenerationHistoryService:
     def __init__(
         self,
@@ -90,12 +95,13 @@ class GenerationHistoryService:
         thumbnail = next(
             (item for item in artifacts if item.artifact_type.value == "thumbnail"), None
         )
+        image_path = self._safe_relative_existing(image.local_path) if image else None
+        thumbnail_path = self._safe_relative_existing(thumbnail.local_path) if thumbnail else None
+        restore_warnings = (_MISSING_LOCAL_IMAGE_MESSAGE,) if image and image_path is None else ()
         return GenerationDetailView(
             generation_id=str(generation.id),
-            image_path=self._safe_relative_existing(image.local_path) if image else None,
-            thumbnail_path=self._safe_relative_existing(thumbnail.local_path)
-            if thumbnail
-            else None,
+            image_path=image_path,
+            thumbnail_path=thumbnail_path,
             kind_text=generation.kind.value,
             status_text=generation.status.value,
             parent_generation_id=(
@@ -113,7 +119,7 @@ class GenerationHistoryService:
             favorite=generation.favorite,
             user_note=generation.user_note,
             error_summary=generation.error_summary,
-            restore_warnings=(),
+            restore_warnings=restore_warnings,
         )
 
     def restore_settings(

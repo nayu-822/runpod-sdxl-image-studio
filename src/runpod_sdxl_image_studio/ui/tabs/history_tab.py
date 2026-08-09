@@ -728,6 +728,7 @@ def render_generation_detail(generation: GenerationDetailView) -> str:
     ]
     if generation.error_summary:
         values.append(f"error: {html.escape(generation.error_summary)}")
+    values.extend(html.escape(warning) for warning in generation.restore_warnings)
     return "\n\n".join(values)
 
 

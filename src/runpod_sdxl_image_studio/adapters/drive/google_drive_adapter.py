@@ -64,6 +64,20 @@ class GoogleDriveAdapter:
             "1s",
         )
 
+    def build_copy_from_remote_command(
+        self,
+        destination: DriveDestination,
+        relative_remote_path: str,
+        local_path: Path,
+    ) -> tuple[str, ...]:
+        safe_relative = validate_remote_relative_path(relative_remote_path)
+        return (
+            *self._global_args(),
+            "copyto",
+            self._remote_path(destination, safe_relative),
+            str(local_path),
+        )
+
     async def check_connection(self) -> DriveConnectionResult:
         if not self._settings.rclone_remote:
             return DriveConnectionResult(
@@ -110,10 +124,15 @@ class GoogleDriveAdapter:
         process_started_callback: ProcessStartedCallback | None = None,
         process_finished_callback: ProcessFinishedCallback | None = None,
         log_path: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> None:
         await self._run(
             self.build_copy_command(local_path, destination, relative_remote_path),
-            timeout_seconds=self._settings.rclone_transfer_timeout_seconds,
+            timeout_seconds=(
+                self._settings.rclone_transfer_timeout_seconds
+                if timeout_seconds is None
+                else timeout_seconds
+            ),
             timeout_code=DriveSyncErrorCode.TRANSFER_FAILED.value,
             progress_callback=progress_callback,
             total_bytes=total_bytes,
@@ -122,6 +141,20 @@ class GoogleDriveAdapter:
             process_finished_callback=process_finished_callback,
             log_path=log_path,
             operation="copyto",
+        )
+
+    async def copy_from_remote(
+        self,
+        destination: DriveDestination,
+        relative_remote_path: str,
+        local_path: Path,
+    ) -> None:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        await self._run(
+            self.build_copy_from_remote_command(destination, relative_remote_path, local_path),
+            timeout_seconds=self._settings.state_sync_download_timeout_seconds,
+            timeout_code=DriveSyncErrorCode.TRANSFER_FAILED.value,
+            operation="copyfrom",
         )
 
     async def _run(
@@ -375,7 +408,7 @@ _SAFE_ERROR_CODES = frozenset(
     {error.value for error in DriveSyncErrorCode}
     | {"drive_authentication_failed", "operation_timeout", "operation_failed"}
 )
-_SAFE_OPERATIONS = frozenset({"connection", "copyto"})
+_SAFE_OPERATIONS = frozenset({"connection", "copyto", "copyfrom"})
 _SAFE_ARTIFACTS = frozenset({"image", "metadata", "manifest"})
 
 

@@ -31,6 +31,7 @@ from runpod_sdxl_image_studio.services.lora_catalog_service import (
     LoraCatalogError,
     LoraCatalogService,
 )
+from runpod_sdxl_image_studio.services.state_sync_service import StateSyncService
 from runpod_sdxl_image_studio.services.system_health_service import SystemHealthService
 from runpod_sdxl_image_studio.ui.components.generation_status_card import (
     build_generation_status_card,
@@ -47,6 +48,7 @@ from runpod_sdxl_image_studio.ui.view_models import (
     lora_markdown,
     preflight_markdown,
     preserve_selection,
+    state_sync_markdown,
     status_markdown,
     system_error_history_markdown,
     system_health_markdown,
@@ -66,6 +68,9 @@ class SystemTabComponents:
     health_markdown: gr.Markdown
     health_refresh_button: gr.Button
     error_history_markdown: gr.Markdown
+    state_sync_markdown: gr.Markdown
+    state_backup_button: gr.Button
+    state_sync_message: gr.Markdown
 
 
 @dataclass(frozen=True)
@@ -156,6 +161,7 @@ def build_system_tab(
     initial_markdown: str,
     initial_health_markdown: str = "### System Health\nNot checked",
     initial_error_history_markdown: str = "### Recent errors\nNo recent operational errors.",
+    initial_state_sync_markdown: str = "### State backup status\nNot checked",
 ) -> SystemTabComponents:
     """Build the system tab without making a network request."""
 
@@ -184,6 +190,13 @@ def build_system_tab(
                 "Detailed investigation uses server-side Generation ID, Job ID, or error_code."
             )
             error_history_markdown = gr.Markdown(initial_error_history_markdown)
+    with gr.Accordion("State backup", open=True, elem_classes=["system-state-sync-section"]):
+        state_sync_markdown = gr.Markdown(initial_state_sync_markdown)
+        state_backup_button = gr.Button(
+            "今すぐ状態をバックアップ",
+            elem_classes=["mobile-tap-button"],
+        )
+        state_sync_message = gr.Markdown("")
     return SystemTabComponents(
         status,
         connection_button,
@@ -192,6 +205,9 @@ def build_system_tab(
         health_markdown,
         health_refresh_button,
         error_history_markdown,
+        state_sync_markdown,
+        state_backup_button,
+        state_sync_message,
     )
 
 
@@ -391,6 +407,19 @@ def make_system_health_handler(
             system_health_markdown(view, timezone_name),
             system_error_history_markdown(view.recent_errors, timezone_name),
         )
+
+    return handler
+
+
+def make_state_backup_handler(
+    service: StateSyncService,
+    timezone_name: str,
+) -> Callable[[], Awaitable[tuple[str, str]]]:
+    """Create the explicit state backup action for the System tab."""
+
+    async def handler() -> tuple[str, str]:
+        view = await service.backup()
+        return state_sync_markdown(view, timezone_name), view.last_message
 
     return handler
 

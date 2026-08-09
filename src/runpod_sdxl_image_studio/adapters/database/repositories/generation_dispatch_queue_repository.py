@@ -190,6 +190,8 @@ class GenerationDispatchQueueRepositoryProtocol(Protocol):
 
     def reconcile_expired_claims(self, *, now: datetime | None = None) -> int: ...
 
+    def reconcile_stateless_restore(self, *, now: datetime | None = None) -> int: ...
+
     def mark_reconciliation_failed(
         self,
         generation_id: UUID,
@@ -1207,6 +1209,87 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
                 return len(entries)
         except SQLAlchemyError as exc:
             raise GenerationDispatchQueueRepositoryError("queue reconciliation failed") from exc
+
+    def reconcile_stateless_restore(self, *, now: datetime | None = None) -> int:
+        """Fail unfinished restored work so a new Pod never resends an old prompt."""
+
+        timestamp = _utc(now or datetime.now(UTC))
+        active_statuses = (
+            GenerationStatus.PENDING.value,
+            GenerationStatus.QUEUED.value,
+            GenerationStatus.RUNNING.value,
+        )
+        terminal_statuses = {
+            GenerationStatus.COMPLETED.value,
+            GenerationStatus.FAILED.value,
+            GenerationStatus.CANCELLED.value,
+        }
+        summary = "Stateless復元後の未完了Jobを再開せず失敗として終了しました。"
+        try:
+            with session_scope(self._session_factory) as session:
+                rows = session.execute(
+                    select(GenerationModel, GenerationJobModel, GenerationQueueEntryModel)
+                    .join(
+                        GenerationJobModel,
+                        GenerationJobModel.generation_id == GenerationModel.id,
+                    )
+                    .outerjoin(
+                        GenerationQueueEntryModel,
+                        GenerationQueueEntryModel.generation_id == GenerationModel.id,
+                    )
+                    .where(
+                        or_(
+                            GenerationModel.status.in_(active_statuses),
+                            GenerationJobModel.status.in_(active_statuses),
+                            GenerationQueueEntryModel.cancel_requested_at.is_not(None),
+                        )
+                    )
+                ).all()
+                reconciled = 0
+                for generation, job, entry in rows:
+                    changed = False
+                    if generation.status not in terminal_statuses:
+                        generation.status = GenerationStatus.FAILED.value
+                        generation.error_code = "stateless_restore_interrupted"
+                        generation.error_summary = summary
+                        generation.completed_at = timestamp
+                        generation.updated_at = timestamp
+                        changed = True
+                    if job.status not in terminal_statuses:
+                        job.status = GenerationStatus.FAILED.value
+                        job.error_code = "stateless_restore_interrupted"
+                        job.error_summary = summary
+                        job.completed_at = timestamp
+                        job.updated_at = timestamp
+                        changed = True
+                    if (
+                        job.worker_id is not None
+                        or job.claimed_at is not None
+                        or job.lease_expires_at is not None
+                    ):
+                        job.worker_id = None
+                        job.claimed_at = None
+                        job.lease_expires_at = None
+                        job.updated_at = timestamp
+                        changed = True
+                    if entry is not None and (
+                        entry.worker_id is not None
+                        or entry.claimed_at is not None
+                        or entry.lease_expires_at is not None
+                    ):
+                        entry.worker_id = None
+                        entry.claimed_at = None
+                        entry.lease_expires_at = None
+                        entry.updated_at = timestamp
+                        changed = True
+                    if changed:
+                        reconciled += 1
+                session.flush()
+                return reconciled
+        except SQLAlchemyError as exc:
+            raise GenerationDispatchQueueRepositoryError(
+                "stateless generation reconciliation failed"
+            ) from exc
 
     def mark_reconciliation_failed(
         self,

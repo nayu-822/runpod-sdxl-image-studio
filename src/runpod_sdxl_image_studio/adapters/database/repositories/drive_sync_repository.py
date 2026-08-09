@@ -167,6 +167,8 @@ class DriveSyncRepositoryProtocol(Protocol):
 
     def reconcile_stale(self, now: datetime | None = None) -> int: ...
 
+    def reconcile_stateless_restore(self, now: datetime | None = None) -> int: ...
+
     def list_jobs(self, limit: int = 50) -> tuple[DriveSyncJob, ...]: ...
 
     def get_latest_synced_job(self) -> DriveSyncJob | None: ...
@@ -853,6 +855,59 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
                 return count
         except SQLAlchemyError as exc:
             raise DriveSyncRepositoryError("stale drive sync jobs could not be reconciled") from exc
+
+    def reconcile_stateless_restore(self, now: datetime | None = None) -> int:
+        """Fail restored Drive work because its local source may not exist on a new Pod."""
+
+        timestamp = utc(now or datetime.now(UTC))
+        unfinished = (DriveSyncStatus.PENDING.value, DriveSyncStatus.SYNCING.value)
+        error_code = "stateless_restore_missing_local_artifact"
+        error_summary = "Stateless復元後はローカルartifactを再開せず失敗として終了しました。"
+        count = 0
+        try:
+            with session_scope(self._session_factory) as session:
+                rows = session.scalars(
+                    select(DriveSyncJobModel).where(DriveSyncJobModel.status.in_(unfinished))
+                ).all()
+                for row in rows:
+                    record = session.get(DriveSyncRecordModel, row.sync_record_id)
+                    row.status = DriveSyncStatus.FAILED.value
+                    row.worker_id = None
+                    row.pid = None
+                    row.claimed_at = None
+                    row.lease_expires_at = None
+                    row.completed_at = timestamp
+                    row.error_code = error_code
+                    row.error_summary = error_summary
+                    row.retryable = False
+                    row.updated_at = timestamp
+                    if record is not None and record.status != DriveSyncStatus.SYNCED.value:
+                        record.status = DriveSyncStatus.FAILED.value
+                        record.error_code = error_code
+                        record.error_summary = error_summary
+                        record.updated_at = timestamp
+                    count += 1
+                manifest_rows = session.scalars(
+                    select(DriveManifestJobModel).where(
+                        DriveManifestJobModel.status.in_(unfinished)
+                    )
+                ).all()
+                for row in manifest_rows:
+                    row.status = DriveSyncStatus.FAILED.value
+                    row.worker_id = None
+                    row.pid = None
+                    row.claimed_at = None
+                    row.lease_expires_at = None
+                    row.completed_at = timestamp
+                    row.error_code = error_code
+                    row.error_summary = error_summary
+                    row.retryable = False
+                    row.updated_at = timestamp
+                    count += 1
+                session.flush()
+                return count
+        except SQLAlchemyError as exc:
+            raise DriveSyncRepositoryError("stateless Drive reconciliation failed") from exc
 
     def list_jobs(self, limit: int = 50) -> tuple[DriveSyncJob, ...]:
         try:

@@ -203,6 +203,10 @@ class DriveSyncService:
 
         artifacts = self._artifacts_with_repair(generation_id)
         image, metadata = _select_required_artifacts(artifacts)
+        if resync:
+            _verify_image_source(image, self._settings)
+            if metadata is not None:
+                _verify_metadata_source(metadata, self._settings, generation.id)
         paths = build_remote_paths(
             generation.id,
             generation.kind.value,

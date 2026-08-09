@@ -10,6 +10,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from runpod_sdxl_image_studio.domain.drive_sync import (
     validate_remote_base_path,
     validate_remote_name,
+    validate_remote_relative_path,
 )
 from runpod_sdxl_image_studio.domain.metadata_import import MAX_METADATA_RAW_BYTES
 
@@ -197,6 +198,21 @@ class Settings(BaseSettings):
     rclone_transfer_timeout_seconds: float | None = Field(
         None, validation_alias="IMAGE_STUDIO_RCLONE_TRANSFER_TIMEOUT_SECONDS"
     )
+    state_sync_enabled: bool = Field(False, validation_alias="IMAGE_STUDIO_STATE_SYNC_ENABLED")
+    state_sync_restore_on_startup: bool = Field(
+        True, validation_alias="IMAGE_STUDIO_STATE_SYNC_RESTORE_ON_STARTUP"
+    )
+    state_sync_subdir: str = Field("state", validation_alias="IMAGE_STUDIO_STATE_SYNC_SUBDIR")
+    state_sync_debounce_seconds: float = Field(
+        30.0, validation_alias="IMAGE_STUDIO_STATE_SYNC_DEBOUNCE_SECONDS"
+    )
+    state_sync_upload_timeout_seconds: float = Field(
+        600.0, validation_alias="IMAGE_STUDIO_STATE_SYNC_UPLOAD_TIMEOUT_SECONDS"
+    )
+    state_sync_download_timeout_seconds: float = Field(
+        600.0, validation_alias="IMAGE_STUDIO_STATE_SYNC_DOWNLOAD_TIMEOUT_SECONDS"
+    )
+    state_sync_max_backups: int = Field(20, validation_alias="IMAGE_STUDIO_STATE_SYNC_MAX_BACKUPS")
 
     @field_validator("rclone_remote")
     @classmethod
@@ -207,6 +223,11 @@ class Settings(BaseSettings):
     @classmethod
     def validate_rclone_base(cls, value: str) -> str:
         return validate_remote_base_path(value)
+
+    @field_validator("state_sync_subdir")
+    @classmethod
+    def validate_state_sync_subdir(cls, value: str) -> str:
+        return validate_remote_relative_path(value)
 
     @field_validator("port")
     @classmethod
@@ -263,6 +284,7 @@ class Settings(BaseSettings):
         "drive_discovery_batch_size",
         "min_free_disk_bytes",
         "warning_free_disk_bytes",
+        "state_sync_max_backups",
     )
     @classmethod
     def validate_positive_integer(cls, value: int) -> int:
@@ -312,6 +334,8 @@ class Settings(BaseSettings):
         "drive_sync_lease_seconds",
         "drive_sync_heartbeat_seconds",
         "rclone_connection_timeout_seconds",
+        "state_sync_upload_timeout_seconds",
+        "state_sync_download_timeout_seconds",
     )
     @classmethod
     def validate_queue_timing(cls, value: float) -> float:
@@ -331,6 +355,13 @@ class Settings(BaseSettings):
     def validate_queue_optional_timing(cls, value: float) -> float:
         if value < 0:
             raise ValueError("queue optional timing values must not be negative")
+        return value
+
+    @field_validator("state_sync_debounce_seconds")
+    @classmethod
+    def validate_state_sync_debounce(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("state_sync_debounce_seconds must not be negative")
         return value
 
     @model_validator(mode="after")

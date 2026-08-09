@@ -93,6 +93,7 @@ class GenerationQueueWorker:
         progress_reporter: ProgressReporter | None = None,
         completed_optional_artifact_handler: CompletedOptionalArtifactMaintenanceHandler
         | None = None,
+        state_changed_callback: Callable[[], None] | None = None,
     ) -> None:
         self._repository = repository
         self._execution_service = execution_service
@@ -102,6 +103,7 @@ class GenerationQueueWorker:
         self._cancellation_adapter = cancellation_adapter
         self._progress_reporter = progress_reporter
         self._completed_optional_artifact_handler = completed_optional_artifact_handler
+        self._state_changed_callback = state_changed_callback
         self._stop_requested = threading.Event()
         self._wake_requested = threading.Event()
         self._thread: threading.Thread | None = None
@@ -237,6 +239,11 @@ class GenerationQueueWorker:
                     self._repository.release_claim(item.entry.sequence, self.worker_id)
                 except GenerationDispatchQueueRepositoryError:
                     logger.warning("generation worker lease release failed", exc_info=True)
+            if self._state_changed_callback is not None:
+                try:
+                    self._state_changed_callback()
+                except Exception:  # noqa: BLE001 - backup notification must not stop the worker
+                    logger.warning("generation state backup notification failed", exc_info=True)
 
     async def _cancel_item(self, item: GenerationQueueItem) -> None:
         current = self._repository.get_queue_item(item.generation.id)

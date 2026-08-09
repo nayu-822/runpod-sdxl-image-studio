@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from runpod_sdxl_image_studio.adapters.comfyui.models import ComfyUICapabilities
 from runpod_sdxl_image_studio.domain.preflight import PreflightResult
+from runpod_sdxl_image_studio.domain.state_sync import StateSyncView
 from runpod_sdxl_image_studio.domain.system_status import (
     ComfyUIStatus,
     DriveHealthAvailability,
@@ -221,6 +222,24 @@ def system_health_markdown(view: SystemHealthView, timezone_name: str) -> str:
         ),
     ]
     return "\n".join(lines)
+
+
+def state_sync_markdown(view: StateSyncView, timezone_name: str) -> str:
+    """Render state backup status without exposing local paths or secrets."""
+
+    remote = "-"
+    if view.remote_sha256 is not None:
+        remote = f"{view.remote_sha256[:12]} / {_format_bytes(view.remote_size_bytes)}"
+    return "\n".join(
+        (
+            "### State backup status",
+            f"**Status:** `{html.escape(view.status.value)}`",
+            f"**Last success:** `{_format_datetime(view.last_success_at, timezone_name)}`",
+            f"**Last failure:** `{_format_datetime(view.last_failure_at, timezone_name)}`",
+            f"**Remote hash / size:** `{html.escape(remote)}`",
+            html.escape(view.last_message or "-"),
+        )
+    )
 
 
 def _drive_connection_label(view: SystemHealthView) -> str:
