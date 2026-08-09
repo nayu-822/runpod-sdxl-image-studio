@@ -21,6 +21,11 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from runpod_sdxl_image_studio.domain.lora_metadata import LoraMetadata
+from runpod_sdxl_image_studio.domain.model_transfer import (
+    ModelTransferJob,
+    ModelTransferStatus,
+    RemoteModelKind,
+)
 
 
 class Base(DeclarativeBase):
@@ -527,6 +532,84 @@ class SystemErrorEventModel(Base):
     details: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class ModelTransferJobModel(Base):
+    """Persistent on-demand transfer of one remote ComfyUI model."""
+
+    __tablename__ = "model_transfer_jobs"
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('checkpoint', 'lora', 'vae', 'upscaler')",
+            name="ck_model_transfer_job_kind",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'downloading', 'completed', 'failed', "
+            "'cancel_requested', 'cancelled')",
+            name="ck_model_transfer_job_status",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    remote_relative_path: Mapped[str] = mapped_column(String(1000), nullable=False)
+    local_relative_path: Mapped[str] = mapped_column(String(1000), nullable=False)
+    remote_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    remote_hash_algorithm: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    remote_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    remote_modified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    remote_identity: Mapped[str] = mapped_column(String(500), nullable=False)
+    local_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    progress_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    total_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    progress_percentage: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    worker_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retryable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    def to_domain(self) -> ModelTransferJob:
+        return ModelTransferJob(
+            id=UUID(self.id),
+            kind=RemoteModelKind(self.kind),
+            remote_relative_path=self.remote_relative_path,
+            local_relative_path=self.local_relative_path,
+            remote_size_bytes=self.remote_size_bytes,
+            remote_hash_algorithm=self.remote_hash_algorithm,
+            remote_hash=self.remote_hash,
+            remote_modified_at=_utc(self.remote_modified_at),
+            remote_identity=self.remote_identity,
+            local_sha256=self.local_sha256,
+            status=ModelTransferStatus(self.status),
+            progress_bytes=self.progress_bytes,
+            total_bytes=self.total_bytes,
+            progress_percentage=self.progress_percentage,
+            worker_id=self.worker_id,
+            pid=self.pid,
+            claimed_at=_utc(self.claimed_at),
+            lease_expires_at=_utc(self.lease_expires_at),
+            started_at=_utc(self.started_at),
+            completed_at=_utc(self.completed_at),
+            cancelled_at=_utc(self.cancelled_at),
+            error_code=self.error_code,
+            error_summary=self.error_summary,
+            retryable=self.retryable,
+            created_at=_utc(self.created_at) or datetime.now(UTC),
+            updated_at=_utc(self.updated_at) or datetime.now(UTC),
+        )
+
+
 Index("ix_system_error_events_created_at", SystemErrorEventModel.created_at)
 Index("ix_system_error_events_category", SystemErrorEventModel.category)
 Index("ix_system_error_events_generation", SystemErrorEventModel.generation_id)
@@ -593,6 +676,25 @@ Index(
     DriveManifestJobModel.remote_base_path,
     unique=True,
     sqlite_where=DriveManifestJobModel.status.in_(["pending", "syncing"]),
+)
+Index(
+    "ix_model_transfer_jobs_status_created",
+    ModelTransferJobModel.status,
+    ModelTransferJobModel.created_at,
+)
+Index("ix_model_transfer_jobs_lease", ModelTransferJobModel.lease_expires_at)
+Index(
+    "ix_model_transfer_jobs_remote",
+    ModelTransferJobModel.kind,
+    ModelTransferJobModel.remote_relative_path,
+)
+Index(
+    "uq_model_transfer_active_remote",
+    ModelTransferJobModel.kind,
+    ModelTransferJobModel.remote_relative_path,
+    ModelTransferJobModel.remote_identity,
+    unique=True,
+    sqlite_where=ModelTransferJobModel.status.in_(["pending", "downloading", "cancel_requested"]),
 )
 Index(
     "uq_generations_retry_of_generation",

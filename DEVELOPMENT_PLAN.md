@@ -449,6 +449,40 @@ state backupのremote retentionと古いtimestamped backupの自動削除は未�
 SQLite backup/restore、reconciliation、dirty version、LoRA通知、migration後のstartup順序はFake、SQLite、Alembicを使った
 自動テストで確認します。実RunPod、実Google Drive、Volume Disk 0GBでの手動確認は別途必要です。
 
+## フェーズ11: Google Driveモデルカタログ・選択取得
+
+### 目的
+
+Volume Disk 0GBまたは毎回Deployするstateless運用でも、必要なcheckpoint、LoRA、VAE、upscalerだけを
+Google DriveからRunPodへ明示的に準備できるようにします。Remoteモデル一覧と、ComfyUIが現在利用できる
+ローカルcapabilityは別の情報源として扱い、Remoteに存在するだけのモデルを生成画面へ表示しません。
+
+### 対応
+
+- `RemoteModelKind`、`RemoteModelEntry`、`RemoteModelCatalog`による型付きRemote catalog
+- `rclone lsjson`の引数配列実行、拡張子・相対path・category root検証
+- `model_transfer_jobs` SQLite migrationとpending/downloading/completed/failed/cancelled状態
+- 同一Remote snapshotのactive transfer重複防止
+- 一時ファイル、サイズ/hash検証、symlink/path containment確認、atomic replace
+- ComfyUI capability refresh後のexact model visibility確認
+- LoRA取得後の既存LoRA metadata catalog同期
+- ブラウザ切断後も継続するModelTransferWorker、進捗・cancel・retry
+- stateless restore時の未完了model transferの`stateless_restore_interrupted`終端化
+- `StateSyncService.mark_dirty`への永続変更通知（progressは既存debounce経由）
+- Generation画面とは分離した「モデル準備」タブと既存mobile viewport対応
+
+### 設定
+
+`RCLONE_REMOTE`を既存Drive同期と共有し、モデル領域は既定で`SDXLModels/`配下に分離します。
+`IMAGE_STUDIO_REMOTE_MODEL_ENABLED`がfalseまたはcatalog取得不能でも、既にローカルにあるモデルによる生成は停止しません。
+Remote catalogは選択・準備だけを提供し、Remote選択をGeneration設定へ自動適用したり、別モデルへ置換したりしません。
+
+### 対象外
+
+RunPod bootstrap/Docker image、RunPod API、自動Terminate、複数Pod、モデル自動更新・削除・LRU cache、
+任意URL/Civitai download、過去画像のon-demand restore、img2img、inpainting、ControlNet、LoRA学習、
+汎用workflow editorは対象外です。実RunPod、実ComfyUI、実Google Driveの手動確認は別途必要です。
+
 ## 将来候補
 
 - img2img

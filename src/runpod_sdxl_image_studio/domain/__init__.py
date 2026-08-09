@@ -13,6 +13,14 @@ from runpod_sdxl_image_studio.domain.lora_metadata import (
     LoraMetadataUpdate,
 )
 from runpod_sdxl_image_studio.domain.lora_search import LoraSearchQuery, LoraSort
+from runpod_sdxl_image_studio.domain.model_transfer import (
+    ModelTransferJob,
+    ModelTransferProgress,
+    ModelTransferStatus,
+    RemoteModelCatalog,
+    RemoteModelEntry,
+    RemoteModelKind,
+)
 
 __all__ = [
     "GenerationProgress",
@@ -24,5 +32,11 @@ __all__ = [
     "LoraMetadataUpdate",
     "LoraSearchQuery",
     "LoraSort",
+    "ModelTransferJob",
+    "ModelTransferProgress",
+    "ModelTransferStatus",
+    "RemoteModelCatalog",
+    "RemoteModelEntry",
+    "RemoteModelKind",
     "StoredImage",
 ]

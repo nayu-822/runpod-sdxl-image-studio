@@ -73,6 +73,25 @@ MOBILE_UI_CSS = """
   gap: 0.75rem !important;
 }
 
+.model-preparation-selection,
+.model-preparation-actions {
+  min-width: 0 !important;
+  width: 100% !important;
+  align-items: stretch !important;
+  gap: 0.5rem !important;
+  flex-wrap: wrap !important;
+}
+
+.model-preparation-selection {
+  display: grid !important;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr));
+}
+
+.model-preparation-actions {
+  display: grid !important;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 9rem), 1fr));
+}
+
 .comparison-layout {
   display: grid !important;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -123,6 +142,7 @@ MOBILE_UI_CSS = """
 }
 
 .prompt-actions,
+.model-preparation-actions,
 .size-dimensions,
 .seed-controls,
 .result-actions,
@@ -272,6 +292,7 @@ MOBILE_UI_CSS = """
   }
 
   .history-filter,
+  .model-preparation-actions,
   .history-actions,
   .system-actions,
   .queue-actions,
@@ -298,6 +319,7 @@ MOBILE_UI_CSS = """
   }
 
   .history-filter > *,
+  .model-preparation-actions > *,
   .history-actions > *,
   .system-actions > *,
   .queue-actions > *,

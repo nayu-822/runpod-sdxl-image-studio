@@ -19,6 +19,10 @@ class StatelessDriveRepository(Protocol):
     def reconcile_stateless_restore(self, now: datetime | None = None) -> int: ...
 
 
+class StatelessModelTransferRepository(Protocol):
+    def reconcile_stateless_restore(self, now: datetime | None = None) -> int: ...
+
+
 @dataclass(frozen=True)
 class StatelessReconciliationResult:
     """Safe startup result without exposing persistence exception details."""
@@ -26,6 +30,7 @@ class StatelessReconciliationResult:
     generation_reconciled_count: int
     drive_reconciled_count: int
     is_success: bool
+    model_transfer_reconciled_count: int = 0
 
 
 class StatelessReconciliationService:
@@ -38,16 +43,19 @@ class StatelessReconciliationService:
         *,
         now_factory: Callable[[], datetime] = lambda: datetime.now(UTC),
         state_changed_callback: Callable[[], None] | None = None,
+        model_transfer_repository: StatelessModelTransferRepository | None = None,
     ) -> None:
         self._generation_repository = generation_repository
         self._drive_repository = drive_repository
         self._now_factory = now_factory
         self._state_changed_callback = state_changed_callback
+        self._model_transfer_repository = model_transfer_repository
 
     def reconcile(self) -> StatelessReconciliationResult:
         timestamp = self._now_factory()
         generation_count = 0
         drive_count = 0
+        model_transfer_count = 0
         is_success = True
         try:
             generation_count = self._generation_repository.reconcile_stateless_restore(
@@ -61,12 +69,21 @@ class StatelessReconciliationService:
         except Exception:  # noqa: BLE001 - one subsystem must not block startup
             logger.warning("stateless Drive reconciliation failed", exc_info=True)
             is_success = False
-        if is_success and (generation_count > 0 or drive_count > 0):
+        if self._model_transfer_repository is not None:
+            try:
+                model_transfer_count = self._model_transfer_repository.reconcile_stateless_restore(
+                    timestamp
+                )
+            except Exception:  # noqa: BLE001 - one subsystem must not block startup
+                logger.warning("stateless model transfer reconciliation failed", exc_info=True)
+                is_success = False
+        if is_success and (generation_count > 0 or drive_count > 0 or model_transfer_count > 0):
             self._notify_state_changed()
         return StatelessReconciliationResult(
             generation_reconciled_count=generation_count,
             drive_reconciled_count=drive_count,
             is_success=is_success,
+            model_transfer_reconciled_count=model_transfer_count,
         )
 
     def _notify_state_changed(self) -> None:

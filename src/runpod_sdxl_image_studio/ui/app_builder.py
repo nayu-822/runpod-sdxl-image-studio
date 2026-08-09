@@ -46,6 +46,9 @@ from runpod_sdxl_image_studio.adapters.database.repositories.lora_metadata_repos
 from runpod_sdxl_image_studio.adapters.database.repositories.metadata_import_repository import (
     MetadataImportRepository,
 )
+from runpod_sdxl_image_studio.adapters.database.repositories.model_transfer_repository import (
+    ModelTransferRepository,
+)
 from runpod_sdxl_image_studio.adapters.database.repositories.preset_repository import (
     PresetRepository,
 )
@@ -56,6 +59,9 @@ from runpod_sdxl_image_studio.adapters.database.repositories.upscale_settings_re
     UpscaleSettingsRepository,
 )
 from runpod_sdxl_image_studio.adapters.drive.google_drive_adapter import GoogleDriveAdapter
+from runpod_sdxl_image_studio.adapters.rclone.remote_model_catalog import (
+    RemoteModelCatalogAdapter,
+)
 from runpod_sdxl_image_studio.adapters.rclone.state_backup_storage import StateBackupStorage
 from runpod_sdxl_image_studio.adapters.storage.disk_usage import LocalDiskUsageAdapter
 from runpod_sdxl_image_studio.adapters.storage.generation_metadata_storage import (
@@ -77,6 +83,10 @@ from runpod_sdxl_image_studio.jobs.drive_sync_worker import DriveSyncRuntime, Dr
 from runpod_sdxl_image_studio.jobs.generation_queue_worker import (
     GenerationQueueRuntime,
     GenerationQueueWorker,
+)
+from runpod_sdxl_image_studio.jobs.model_transfer_worker import (
+    ModelTransferRuntime,
+    ModelTransferWorker,
 )
 from runpod_sdxl_image_studio.services.comfyui_service import ComfyUIService
 from runpod_sdxl_image_studio.services.drive_sync_service import DriveSyncService
@@ -103,6 +113,7 @@ from runpod_sdxl_image_studio.services.lora_catalog_service import (
     LoraCatalogService,
 )
 from runpod_sdxl_image_studio.services.metadata_import_service import MetadataImportService
+from runpod_sdxl_image_studio.services.model_preparation_service import ModelPreparationService
 from runpod_sdxl_image_studio.services.preset_service import PresetService
 from runpod_sdxl_image_studio.services.recent_settings_service import RecentSettingsService
 from runpod_sdxl_image_studio.services.state_sync_service import StateSyncService
@@ -174,6 +185,14 @@ from runpod_sdxl_image_studio.ui.tabs.metadata_import_tab import (
     make_metadata_source_selection_handler,
     make_metadata_upscale_apply_handler,
 )
+from runpod_sdxl_image_studio.ui.tabs.model_preparation_tab import (
+    build_model_preparation_tab,
+    make_model_cancel_handler,
+    make_model_catalog_refresh_handler,
+    make_model_jobs_refresh_handler,
+    make_model_prepare_handler,
+    make_model_retry_handler,
+)
 from runpod_sdxl_image_studio.ui.tabs.preset_tab import (
     build_preset_tab,
     make_preset_apply_handler,
@@ -239,6 +258,7 @@ class ApplicationRuntime:
     demo: gr.Blocks
     queue_runtime: GenerationQueueRuntime
     drive_sync_runtime: DriveSyncRuntime | None = None
+    model_transfer_runtime: ModelTransferRuntime | None = None
     state_sync_service: StateSyncService | None = None
     stateless_reconciliation_service: StatelessReconciliationService | None = None
     run_stateless_reconciliation: bool = False
@@ -253,12 +273,16 @@ class ApplicationRuntime:
         self.queue_runtime.start()
         if self.drive_sync_runtime is not None:
             self.drive_sync_runtime.start()
+        if self.model_transfer_runtime is not None:
+            self.model_transfer_runtime.start()
 
     def stop(self) -> None:
         """Stop the process-level queue worker."""
 
         if self.drive_sync_runtime is not None:
             self.drive_sync_runtime.stop()
+        if self.model_transfer_runtime is not None:
+            self.model_transfer_runtime.stop()
         self.queue_runtime.stop()
         if self.state_sync_service is not None:
             self.state_sync_service.close()
@@ -285,6 +309,7 @@ def build_app(
     queue_repository = GenerationQueueRepository(session_factory)
     dispatch_queue_repository = GenerationDispatchQueueRepository(session_factory)
     drive_sync_repository = DriveSyncRepository(session_factory)
+    model_transfer_repository = ModelTransferRepository(session_factory)
     system_error_repository = SystemErrorEventRepository(session_factory)
     start_repository = GenerationStartRepository(session_factory)
     progress_repository = GenerationProgressRepository(session_factory)
@@ -301,6 +326,15 @@ def build_app(
             app_settings.max_lora_thumbnail_bytes,
             app_settings.lora_thumbnail_max_edge,
         ),
+        state_changed_callback=state_sync_service.mark_dirty,
+    )
+    remote_model_adapter = RemoteModelCatalogAdapter(app_settings)
+    model_preparation_service = ModelPreparationService(
+        model_transfer_repository,
+        remote_model_adapter,
+        app_settings,
+        comfyui_service.refresh_capabilities,
+        lora_catalog_service=catalog_service,
         state_changed_callback=state_sync_service.mark_dirty,
     )
     loaded_workflow = load_txt2img_template(
@@ -425,6 +459,7 @@ def build_app(
     stateless_reconciliation_service = StatelessReconciliationService(
         dispatch_queue_repository,
         drive_sync_repository,
+        model_transfer_repository=model_transfer_repository,
         state_changed_callback=state_sync_service.mark_dirty,
     )
 
@@ -461,6 +496,13 @@ def build_app(
         state_changed_callback=state_sync_service.mark_dirty,
     )
     drive_sync_runtime = DriveSyncRuntime(drive_sync_worker)
+    model_transfer_worker = ModelTransferWorker(
+        model_transfer_repository,
+        model_preparation_service,
+        app_settings,
+        state_changed_callback=state_sync_service.mark_dirty,
+    )
+    model_transfer_runtime = ModelTransferRuntime(model_transfer_worker)
     queue_service.set_wake_callback(queue_runtime.wake)
     preset_repository = PresetRepository(session_factory)
     preset_service = PresetService(preset_repository, app_settings)
@@ -517,6 +559,8 @@ def build_app(
             metadata_import = build_metadata_import_tab(app_settings.max_loras)
         with gr.Tab("同期・設定"):
             drive_sync = build_drive_sync_tab()
+        with gr.Tab("モデル準備"):
+            model_preparation = build_model_preparation_tab(app_settings.max_loras)
 
         health_handler = make_system_health_handler(
             system_health_service,
@@ -665,6 +709,61 @@ def build_app(
         ).then(
             fn=make_drive_failed_manifest_handler(drive_sync_service),
             outputs=[drive_sync.failed_manifest_button, drive_sync.message],
+        )
+
+        model_preparation.refresh_button.click(
+            fn=make_model_catalog_refresh_handler(model_preparation_service),
+            outputs=[
+                model_preparation.checkpoint,
+                model_preparation.vae,
+                model_preparation.loras,
+                model_preparation.upscaler,
+                model_preparation.message,
+            ],
+            concurrency_limit=1,
+        )
+        model_preparation.prepare_button.click(
+            fn=lambda: gr.Button(interactive=False),
+            outputs=[model_preparation.prepare_button],
+            queue=False,
+        ).then(
+            fn=make_model_prepare_handler(model_preparation_service),
+            inputs=[
+                model_preparation.checkpoint,
+                model_preparation.vae,
+                model_preparation.loras,
+                model_preparation.upscaler,
+            ],
+            outputs=[model_preparation.status, model_preparation.message],
+            concurrency_limit=1,
+        ).then(
+            fn=lambda: gr.Button(interactive=True),
+            outputs=[model_preparation.prepare_button],
+            queue=False,
+        ).then(fn=state_sync_service.mark_dirty, outputs=[], queue=False)
+        model_preparation.jobs_refresh_button.click(
+            fn=make_model_jobs_refresh_handler(model_preparation_service),
+            outputs=[model_preparation.jobs, model_preparation.status],
+            concurrency_limit=1,
+        )
+        model_preparation.cancel_button.click(
+            fn=make_model_cancel_handler(model_preparation_service),
+            inputs=[model_preparation.jobs],
+            outputs=[model_preparation.status, model_preparation.message],
+            concurrency_limit=1,
+        ).then(fn=model_transfer_runtime.wake, outputs=[], queue=False)
+        model_preparation.retry_button.click(
+            fn=make_model_retry_handler(model_preparation_service),
+            inputs=[model_preparation.jobs],
+            outputs=[model_preparation.status, model_preparation.message],
+            concurrency_limit=1,
+        ).then(fn=model_transfer_runtime.wake, outputs=[], queue=False).then(
+            fn=state_sync_service.mark_dirty, outputs=[], queue=False
+        )
+        demo.load(
+            fn=make_model_jobs_refresh_handler(model_preparation_service),
+            outputs=[model_preparation.jobs, model_preparation.status],
+            concurrency_limit=1,
         )
 
         metadata_import_outputs = [
@@ -1976,6 +2075,7 @@ def build_app(
         )
     demo.generation_queue_runtime = queue_runtime
     demo.drive_sync_runtime = drive_sync_runtime
+    demo.model_transfer_runtime = model_transfer_runtime
     demo.state_sync_service = state_sync_service
     demo.stateless_reconciliation_service = stateless_reconciliation_service
     return demo
@@ -1996,6 +2096,9 @@ def build_application_runtime(
     drive_runtime = getattr(demo, "drive_sync_runtime", None)
     if not isinstance(drive_runtime, DriveSyncRuntime):
         raise RuntimeError("drive sync runtime was not configured")
+    model_runtime = getattr(demo, "model_transfer_runtime", None)
+    if not isinstance(model_runtime, ModelTransferRuntime):
+        raise RuntimeError("model transfer runtime was not configured")
     state_sync_service = getattr(demo, "state_sync_service", None)
     if not isinstance(state_sync_service, StateSyncService):
         raise RuntimeError("state sync service was not configured")
@@ -2006,6 +2109,7 @@ def build_application_runtime(
         demo=demo,
         queue_runtime=runtime,
         drive_sync_runtime=drive_runtime,
+        model_transfer_runtime=model_runtime,
         state_sync_service=state_sync_service,
         stateless_reconciliation_service=stateless_reconciliation_service,
         run_stateless_reconciliation=run_stateless_reconciliation,

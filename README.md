@@ -54,6 +54,36 @@ RCLONE_BASE_PATH=RunPodSDXLImageStudio
 remoteにstate backupが存在しないことを確認できた初回だけ、空DBで起動できます。timestamped backupのremote retentionは未実装で、
 古いstate backupの自動削除は行いません。`rclone sync`は使用しません。
 
+## Phase 11: Google Driveモデルカタログ・選択取得
+
+新しい「モデル準備」タブでは、生成画像を保存する`RunPodSDXLImageStudio/`とは分離した
+`SDXLModels/`配下のcheckpoint、LoRA、VAE、upscalerをRemote一覧から選び、必要なものだけをPodへ準備できます。
+
+```dotenv
+IMAGE_STUDIO_REMOTE_MODEL_ENABLED=true
+IMAGE_STUDIO_REMOTE_MODEL_BASE_PATH=SDXLModels
+IMAGE_STUDIO_REMOTE_CHECKPOINT_SUBDIR=checkpoints
+IMAGE_STUDIO_REMOTE_LORA_SUBDIR=loras
+IMAGE_STUDIO_REMOTE_VAE_SUBDIR=vae
+IMAGE_STUDIO_REMOTE_UPSCALER_SUBDIR=upscale_models
+IMAGE_STUDIO_REMOTE_MODEL_LIST_TIMEOUT_SECONDS=120
+IMAGE_STUDIO_REMOTE_MODEL_DOWNLOAD_TIMEOUT_SECONDS=3600
+IMAGE_STUDIO_REMOTE_MODEL_MAX_CATALOG_ITEMS=5000
+RCLONE_REMOTE=drive
+```
+
+準備処理はSQLiteの`model_transfer_jobs`へ保存され、ブラウザを閉じてもバックグラウンドWorkerが継続します。
+Remoteのカテゴリ内相対pathをComfyUIのローカルmodel pathへ保持し、`.safetensors`、`.ckpt`、`.pt`、`.pth`、`.bin`以外は候補にしません。
+最終ファイルへ直接書き込まず、一時ファイルのサイズ/hash検証、許可root内のsymlink確認、atomic replace、ComfyUI capabilityのexact visibility確認後に完了します。
+
+RemoteにあるだけのモデルはGenerationのdropdownへ表示されません。ダウンロード後にComfyUI capabilityが更新され、
+そのモデルが確認できた場合だけ既存Generation画面で選択可能になります。Drive接続が失敗しても既存ローカルモデルによる生成は継続し、
+選択中のRemoteモデルが見えない場合は`model_not_visible_to_comfyui`として安全に失敗します。
+
+新Podへstate backupを復元した場合、旧Podでpending/downloading/cancel_requestedだったモデル転送は自動再開せず、
+`stateless_restore_interrupted`へ終端化します。必要なモデルはRemote catalogを再取得して明示的にretryしてください。
+`rclone sync`、任意URL、UI入力remote、任意保存先、rclone設定本文や認証情報のログ出力は行いません。
+
 ## フェーズ3A: 生成履歴・スナップショット・再生成
 
 フェーズ3Aでは、SQLite による `Generation`、`GenerationJob`、

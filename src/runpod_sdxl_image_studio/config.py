@@ -198,6 +198,27 @@ class Settings(BaseSettings):
     rclone_transfer_timeout_seconds: float | None = Field(
         None, validation_alias="IMAGE_STUDIO_RCLONE_TRANSFER_TIMEOUT_SECONDS"
     )
+    remote_model_enabled: bool = Field(False, validation_alias="IMAGE_STUDIO_REMOTE_MODEL_ENABLED")
+    remote_model_base_path: str = Field(
+        "SDXLModels", validation_alias="IMAGE_STUDIO_REMOTE_MODEL_BASE_PATH"
+    )
+    remote_checkpoint_subdir: str = Field(
+        "checkpoints", validation_alias="IMAGE_STUDIO_REMOTE_CHECKPOINT_SUBDIR"
+    )
+    remote_lora_subdir: str = Field("loras", validation_alias="IMAGE_STUDIO_REMOTE_LORA_SUBDIR")
+    remote_vae_subdir: str = Field("vae", validation_alias="IMAGE_STUDIO_REMOTE_VAE_SUBDIR")
+    remote_upscaler_subdir: str = Field(
+        "upscale_models", validation_alias="IMAGE_STUDIO_REMOTE_UPSCALER_SUBDIR"
+    )
+    remote_model_list_timeout_seconds: float = Field(
+        120.0, validation_alias="IMAGE_STUDIO_REMOTE_MODEL_LIST_TIMEOUT_SECONDS"
+    )
+    remote_model_download_timeout_seconds: float = Field(
+        3600.0, validation_alias="IMAGE_STUDIO_REMOTE_MODEL_DOWNLOAD_TIMEOUT_SECONDS"
+    )
+    remote_model_max_catalog_items: int = Field(
+        5000, validation_alias="IMAGE_STUDIO_REMOTE_MODEL_MAX_CATALOG_ITEMS"
+    )
     state_sync_enabled: bool = Field(False, validation_alias="IMAGE_STUDIO_STATE_SYNC_ENABLED")
     state_sync_restore_on_startup: bool = Field(
         True, validation_alias="IMAGE_STUDIO_STATE_SYNC_RESTORE_ON_STARTUP"
@@ -226,6 +247,17 @@ class Settings(BaseSettings):
     @field_validator("state_sync_subdir")
     @classmethod
     def validate_state_sync_subdir(cls, value: str) -> str:
+        return validate_remote_relative_path(value)
+
+    @field_validator(
+        "remote_model_base_path",
+        "remote_checkpoint_subdir",
+        "remote_lora_subdir",
+        "remote_vae_subdir",
+        "remote_upscaler_subdir",
+    )
+    @classmethod
+    def validate_remote_model_path(cls, value: str) -> str:
         return validate_remote_relative_path(value)
 
     @field_validator("port")
@@ -281,6 +313,7 @@ class Settings(BaseSettings):
         "queue_max_pending_jobs",
         "batch_max_items",
         "drive_discovery_batch_size",
+        "remote_model_max_catalog_items",
         "min_free_disk_bytes",
         "warning_free_disk_bytes",
     )
@@ -332,6 +365,8 @@ class Settings(BaseSettings):
         "drive_sync_lease_seconds",
         "drive_sync_heartbeat_seconds",
         "rclone_connection_timeout_seconds",
+        "remote_model_list_timeout_seconds",
+        "remote_model_download_timeout_seconds",
         "state_sync_upload_timeout_seconds",
         "state_sync_download_timeout_seconds",
     )
