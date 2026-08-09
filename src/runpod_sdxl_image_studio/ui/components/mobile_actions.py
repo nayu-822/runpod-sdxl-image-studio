@@ -151,7 +151,7 @@ def _idle_or_preserved_poll_outputs(
 
 def _idle_status_card() -> str:
     return generation_status_card_markdown(
-        GenerationStatusCardView(None, "idle", None, None, None, "逕滓・蠕・ｩ滉ｸｭ")
+        GenerationStatusCardView(None, "idle", None, None, None, "生成待機中")
     )
 
 

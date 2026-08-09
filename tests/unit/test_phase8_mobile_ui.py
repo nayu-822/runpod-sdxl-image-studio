@@ -309,6 +309,7 @@ def test_mobile_status_poll_without_active_generation_stays_idle_without_latest_
     assert queue.detail_calls == 0
     assert str(generation_id) not in result[0]
     assert "idle" in result[0]
+    assert "生成待機中" in result[0]
     assert result[1] is None
     assert result[2] == ""
     assert result[3] == ""
