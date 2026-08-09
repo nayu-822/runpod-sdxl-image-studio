@@ -31,7 +31,11 @@ from runpod_sdxl_image_studio.ui.components.mobile_actions import (
 from runpod_sdxl_image_studio.ui.mobile_styles import MOBILE_UI_CSS
 from runpod_sdxl_image_studio.ui.tabs.history_tab import render_history_thumbnails
 from runpod_sdxl_image_studio.ui.tabs.preset_tab import make_recent_lora_add_handler
-from runpod_sdxl_image_studio.ui.tabs.system_tab import build_generation_tab, make_enqueue_handler
+from runpod_sdxl_image_studio.ui.tabs.system_tab import (
+    build_generation_tab,
+    make_batch_enqueue_handler,
+    make_enqueue_handler,
+)
 
 
 def _queue_item(
@@ -63,6 +67,8 @@ class _FakeQueueService:
         self.items = items
         self.error = error
         self.list_limit: int | None = None
+        self.latest_candidate_calls = 0
+        self.detail_calls = 0
 
     def list_jobs(self, *, limit: int = 200) -> tuple[object, ...]:
         self.list_limit = limit
@@ -71,6 +77,7 @@ class _FakeQueueService:
         return self.items
 
     def get_latest_status_candidate(self) -> object | None:
+        self.latest_candidate_calls += 1
         if self.error is not None:
             raise self.error
         return max(
@@ -80,6 +87,7 @@ class _FakeQueueService:
         )
 
     def get_job_detail(self, generation_id: UUID) -> object | None:
+        self.detail_calls += 1
         return next(
             (
                 item
@@ -128,6 +136,20 @@ class _FakeEnqueueService:
         return SimpleNamespace(
             item=self.enqueue_item,
             queue_position=self.enqueue_item.entry.sequence,
+        )
+
+
+class _FakeBatchService:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.batch_id = uuid4()
+
+    def enqueue_batch(self, *args: object, **kwargs: object) -> object:
+        del args, kwargs
+        self.calls += 1
+        return SimpleNamespace(
+            batch=SimpleNamespace(id=self.batch_id),
+            items=(object(), object()),
         )
 
 
@@ -270,6 +292,119 @@ def test_mobile_status_poll_does_not_overwrite_active_generation_id() -> None:
     assert len(result) == 6
     assert "running" in result[0]
     assert history.detail_calls == 0
+
+
+def test_mobile_status_poll_without_active_generation_stays_idle_without_latest_lookup() -> None:
+    generation_id = uuid4()
+    queue = _FakeQueueService(
+        (_queue_item(generation_id, sequence=8, status=GenerationStatus.RUNNING),)
+    )
+    history = _FakeHistoryService()
+    handler = make_mobile_status_poll_handler(queue, history)
+
+    result = handler(None, None, None, None, None, False)
+
+    assert len(result) == 6
+    assert queue.latest_candidate_calls == 0
+    assert queue.detail_calls == 0
+    assert str(generation_id) not in result[0]
+    assert "idle" in result[0]
+    assert result[1] is None
+    assert result[2] == ""
+    assert result[3] == ""
+    assert result[4] is False
+    assert result[5] == ""
+    assert history.detail_calls == 0
+
+    preserved = handler(None, "old card", "old.png", "old details", "123", True)
+
+    assert queue.latest_candidate_calls == 0
+    assert preserved[0] == "old card"
+    assert all(isinstance(preserved[index], dict) for index in (1, 2, 3, 4))
+    assert preserved[5] == ""
+
+
+def test_mobile_status_reload_uses_latest_candidate_only_for_full_refresh() -> None:
+    generation_id = uuid4()
+    queue = _FakeQueueService(
+        (_queue_item(generation_id, sequence=8, status=GenerationStatus.RUNNING),)
+    )
+    handler = make_mobile_status_refresh_handler(queue, _FakeHistoryService())
+
+    result = handler(None, None, None, None, None, False)
+
+    assert queue.latest_candidate_calls == 1
+    assert queue.detail_calls == 0
+    assert result[0] == str(generation_id)
+    assert "running" in result[1]
+
+
+def test_mobile_status_poll_keeps_active_generation_when_newer_generation_exists() -> None:
+    active_id = uuid4()
+    newer_id = uuid4()
+    queue = _FakeQueueService(
+        (
+            _queue_item(active_id, sequence=8, status=GenerationStatus.RUNNING),
+            _queue_item(newer_id, sequence=9, status=GenerationStatus.RUNNING),
+        )
+    )
+    handler = make_mobile_status_poll_handler(queue, _FakeHistoryService())
+
+    result = handler(str(active_id), None, None, None, None, False)
+
+    assert queue.latest_candidate_calls == 0
+    assert queue.detail_calls == 1
+    assert str(active_id)[:12] in result[0]
+    assert str(newer_id)[:12] not in result[0]
+
+
+def test_batch_enqueue_and_timer_poll_keep_active_generation_state() -> None:
+    batch_service = _FakeBatchService()
+    batch_handler = make_batch_enqueue_handler(batch_service, max_loras=2)
+    batch_result = asyncio.run(
+        batch_handler(
+            "checkpoint.safetensors",
+            "positive",
+            "negative",
+            1024,
+            1024,
+            "Fixed",
+            123,
+            28,
+            5.5,
+            "euler",
+            "normal",
+            None,
+            [],
+            2,
+            "sequential",
+            123,
+            1,
+            "Batch",
+        )
+    )
+
+    assert batch_service.calls == 1
+    assert len(batch_result) == 3
+    assert f"Batch `{batch_service.batch_id}`" in batch_result[2]
+
+    active_id = uuid4()
+    newer_id = uuid4()
+    queue = _FakeQueueService(
+        (
+            _queue_item(active_id, sequence=8, status=GenerationStatus.RUNNING),
+            _queue_item(newer_id, sequence=9, status=GenerationStatus.RUNNING),
+        )
+    )
+    poll_handler = make_mobile_status_poll_handler(queue, _FakeHistoryService())
+
+    fresh_result = poll_handler(None, None, None, None, None, False)
+    active_result = poll_handler(str(active_id), None, None, None, None, False)
+
+    assert queue.latest_candidate_calls == 0
+    assert fresh_result[0] != str(newer_id)
+    assert str(active_id)[:12] in active_result[0]
+    assert str(newer_id)[:12] not in active_result[0]
 
 
 def test_latest_status_candidate_uses_sequence_26_for_reload_after_more_than_20_jobs() -> None:

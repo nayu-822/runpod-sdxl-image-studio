@@ -110,6 +110,14 @@ def make_mobile_status_poll_handler(
         current_seed: str | None = None,
         current_favorite: bool = False,
     ) -> tuple[object, object, object, object, object, object]:
+        if not active_generation_id or not active_generation_id.strip():
+            return _idle_or_preserved_poll_outputs(
+                current_card,
+                current_image,
+                current_details,
+                current_seed,
+                current_favorite,
+            )
         return refresh_handler(
             active_generation_id,
             current_card,
@@ -120,6 +128,31 @@ def make_mobile_status_poll_handler(
         )[1:]
 
     return handler
+
+
+def _idle_or_preserved_poll_outputs(
+    current_card: str | None,
+    current_image: object,
+    current_details: str | None,
+    current_seed: str | None,
+    current_favorite: bool,
+) -> tuple[object, object, object, object, object, object]:
+    """Keep a timer poll from selecting an unrelated Generation."""
+
+    return (
+        current_card or _idle_status_card(),
+        gr.skip() if current_image is not None else None,
+        gr.skip() if current_details else "",
+        gr.skip() if current_seed else "",
+        gr.skip() if current_favorite else False,
+        "",
+    )
+
+
+def _idle_status_card() -> str:
+    return generation_status_card_markdown(
+        GenerationStatusCardView(None, "idle", None, None, None, "逕滓・蠕・ｩ滉ｸｭ")
+    )
 
 
 def _status_view(item: GenerationQueueItem) -> GenerationStatusCardView:

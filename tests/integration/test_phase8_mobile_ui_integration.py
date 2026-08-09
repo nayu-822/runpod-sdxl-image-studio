@@ -83,3 +83,47 @@ def test_phase8_generation_surface_is_mobile_ready_and_status_poll_is_wired() ->
         )
         action_input_sets.append(set(action_dependency["inputs"]))
     assert action_input_sets[0] & action_input_sets[1]
+
+
+def test_phase8_batch_enqueue_does_not_mutate_active_generation_state() -> None:
+    demo = build_app(Settings(_env_file=None, environment="phase8-ui-test"))
+    components = demo.config["components"]
+    dependencies = demo.config["dependencies"]
+
+    def button_id(label: str) -> int:
+        return next(
+            component["id"]
+            for component in components
+            if component["type"] == "button" and component["props"].get("value") == label
+        )
+
+    def click_dependency(label: str) -> dict[str, object]:
+        component_id = button_id(label)
+        return next(
+            dependency
+            for dependency in dependencies
+            if dependency["targets"] == [(component_id, "click")]
+        )
+
+    edit_dependency = click_dependency("設定を編集")
+    upscale_dependency = click_dependency("アップスケール")
+    active_state_ids = set(edit_dependency["inputs"]) & set(upscale_dependency["inputs"])
+    assert len(active_state_ids) == 1
+    active_state_id = next(iter(active_state_ids))
+
+    disable_dependency = click_dependency("バッチをキューへ追加")
+    batch_dependency = next(
+        dependency
+        for dependency in dependencies
+        if dependency.get("trigger_after") == disable_dependency["id"]
+    )
+    poll_dependency = next(
+        dependency
+        for dependency in dependencies
+        if dependency.get("trigger_after") == batch_dependency["id"]
+    )
+
+    assert len(batch_dependency["outputs"]) == 3
+    assert active_state_id not in batch_dependency["outputs"]
+    assert len(poll_dependency["outputs"]) == 6
+    assert active_state_id not in poll_dependency["outputs"]
