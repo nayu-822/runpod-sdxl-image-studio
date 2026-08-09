@@ -113,3 +113,29 @@ def test_phase8_mobile_viewports_have_no_horizontal_overflow_or_missing_controls
                     assert overflow_menu_used, "320x568 did not exercise the overflow tab menu"
         finally:
             browser.close()
+
+
+def test_phase9_system_tab_is_usable_at_all_required_viewports() -> None:
+    """Keep the System Health surface visible even when tabs collapse."""
+
+    from playwright.sync_api import sync_playwright
+
+    url = os.environ["IMAGE_STUDIO_BROWSER_URL"]
+    system_tab_label = tuple(TAB_CONTROLS)[-1]
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page()
+        try:
+            for width, height in VIEWPORTS:
+                page.set_viewport_size({"width": width, "height": height})
+                page.goto(url, wait_until="domcontentloaded")
+                page.wait_for_selector("button", state="visible")
+                _click_tab(page, system_tab_label)
+                for control in ("System Health", "Refresh system status", "Recent errors"):
+                    assert _has_visible_text(page, control), (
+                        f"{control!r} is not visible in System tab at {width}x{height}"
+                    )
+                _assert_no_horizontal_overflow(page)
+        finally:
+            browser.close()

@@ -21,10 +21,7 @@ MAX_ERROR_DETAILS_LENGTH = 2_000
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _SECRET_PATTERNS = (
-    re.compile(
-        r"(?i)\b(?:authorization(?:\s+header)?|cookie|set-cookie)\b\s*:\s*"
-        r"(?:bearer\s+)?[^\s,;]+(?:\s+[^\s,;]+)?"
-    ),
+    re.compile(r"(?im)\b(?:authorization(?:\s+header)?|cookie|set-cookie)\b\s*:[^\r\n]*"),
     re.compile(r"(?i)\bbearer\b\s+[^\s,;]+"),
     re.compile(
         r"(?i)\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|password|"
@@ -62,6 +59,15 @@ class SystemErrorEventRepositoryProtocol(Protocol):
     ) -> SystemErrorEvent: ...
 
     def list_recent(self, limit: int = 100) -> tuple[SystemErrorEvent, ...]: ...
+
+    def search(
+        self,
+        *,
+        generation_id: UUID | None = None,
+        job_id: UUID | None = None,
+        error_code: str | None = None,
+        limit: int = 100,
+    ) -> tuple[SystemErrorEvent, ...]: ...
 
 
 class SystemErrorEventRepository(SystemErrorEventRepositoryProtocol):
@@ -161,6 +167,41 @@ class SystemErrorEventRepository(SystemErrorEventRepositoryProtocol):
                 return tuple(_to_domain(row) for row in rows)
         except (SQLAlchemyError, ValueError) as exc:
             raise SystemErrorEventRepositoryError("system errors could not be listed") from exc
+
+    def search(
+        self,
+        *,
+        generation_id: UUID | None = None,
+        job_id: UUID | None = None,
+        error_code: str | None = None,
+        limit: int = 100,
+    ) -> tuple[SystemErrorEvent, ...]:
+        """Search only indexed safe identifiers; never open a UI-supplied path."""
+
+        bounded_limit = min(max(1, limit), 100)
+        normalized_error_code = sanitize_error_text(error_code, max_length=64)
+        if error_code is not None and not normalized_error_code:
+            return ()
+        try:
+            with session_scope(self._session_factory) as session:
+                statement = select(SystemErrorEventModel).order_by(
+                    SystemErrorEventModel.created_at.desc(),
+                    SystemErrorEventModel.id.desc(),
+                )
+                if generation_id is not None:
+                    statement = statement.where(
+                        SystemErrorEventModel.generation_id == str(generation_id)
+                    )
+                if job_id is not None:
+                    statement = statement.where(SystemErrorEventModel.job_id == str(job_id))
+                if normalized_error_code is not None:
+                    statement = statement.where(
+                        SystemErrorEventModel.error_code == normalized_error_code
+                    )
+                rows = session.scalars(statement.limit(bounded_limit)).all()
+                return tuple(_to_domain(row) for row in rows)
+        except (SQLAlchemyError, ValueError) as exc:
+            raise SystemErrorEventRepositoryError("system errors could not be searched") from exc
 
 
 def sanitize_error_text(value: str | None, *, max_length: int) -> str | None:

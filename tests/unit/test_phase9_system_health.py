@@ -17,8 +17,14 @@ from runpod_sdxl_image_studio.adapters.comfyui.models import (
 from runpod_sdxl_image_studio.adapters.database.engine import create_session_factory
 from runpod_sdxl_image_studio.adapters.database.models import (
     Base,
+    DriveSyncJobModel,
+    DriveSyncRecordModel,
+    GenerationArtifactModel,
     GenerationJobModel,
     GenerationModel,
+)
+from runpod_sdxl_image_studio.adapters.database.repositories.drive_sync_repository import (
+    DriveSyncRepository,
 )
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_dispatch_queue_repository import (  # noqa: E501
     GenerationDispatchQueueRepository,
@@ -31,7 +37,7 @@ from runpod_sdxl_image_studio.adapters.storage.disk_usage import DiskUsage
 from runpod_sdxl_image_studio.config import Settings
 from runpod_sdxl_image_studio.domain.drive_sync import DriveSyncStatus
 from runpod_sdxl_image_studio.domain.generation import GenerationStatus
-from runpod_sdxl_image_studio.domain.generation_queue import QueueHealthCounts
+from runpod_sdxl_image_studio.domain.generation_queue import BatchSeedStrategy, QueueHealthCounts
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
 from runpod_sdxl_image_studio.domain.lora import LoraSetting
@@ -42,6 +48,7 @@ from runpod_sdxl_image_studio.domain.preflight import (
 )
 from runpod_sdxl_image_studio.domain.system_status import (
     ComfyUIStatus,
+    DriveHealthAvailability,
     DriveHealthView,
     QueueHealthAvailability,
     SystemHealthStatus,
@@ -140,6 +147,9 @@ class _FakeDrive:
             ),
         )
 
+    def get_latest_unresolved_failure(self) -> object | None:
+        return None
+
     def capacity(self) -> object:
         return SimpleNamespace(unsynced_bytes=1234)
 
@@ -162,6 +172,23 @@ class _FakeQueue:
                     updated_at=NOW,
                     error_code="generation_failed",
                     error_summary="generation failed",
+                ),
+                job=SimpleNamespace(id=self.failed_job_id),
+            ),
+        )
+
+
+class _UnsafeFailedQueue(_FakeQueue):
+    def list_recent_failed(self, limit: int = 100) -> tuple[object, ...]:
+        assert limit == 100
+        return (
+            SimpleNamespace(
+                generation=SimpleNamespace(
+                    id=self.failed_generation_id,
+                    status=GenerationStatus.FAILED,
+                    updated_at=NOW,
+                    error_code="generation_failed",
+                    error_summary="Cookie: session=secret-from-generation",
                 ),
                 job=SimpleNamespace(id=self.failed_job_id),
             ),
@@ -223,8 +250,43 @@ class _FailedDrive:
             ),
         )
 
+    def get_latest_unresolved_failure(self) -> object:
+        return SimpleNamespace(updated_at=self.failure_at, completed_at=self.failure_at)
+
     def capacity(self) -> object:
         return SimpleNamespace(unsynced_bytes=100)
+
+
+class _PartialDrive:
+    is_configured = True
+
+    def __init__(self, failed_read: str) -> None:
+        self.failed_read = failed_read
+
+    async def check_connection(self) -> object:
+        if self.failed_read == "connection":
+            raise RuntimeError("connection unavailable")
+        return SimpleNamespace(status=SimpleNamespace(value="connected"))
+
+    def status_counts(self) -> dict[DriveSyncStatus, int]:
+        if self.failed_read == "status":
+            raise RuntimeError("status unavailable")
+        return {DriveSyncStatus.PENDING: 2, DriveSyncStatus.FAILED: 1}
+
+    def list_jobs(self, _limit: int = 50) -> tuple[object, ...]:
+        if self.failed_read == "history":
+            raise RuntimeError("history unavailable")
+        return (SimpleNamespace(status=DriveSyncStatus.SYNCED, completed_at=NOW),)
+
+    def get_latest_unresolved_failure(self) -> object | None:
+        if self.failed_read == "history":
+            raise RuntimeError("failure history unavailable")
+        return None
+
+    def capacity(self) -> object:
+        if self.failed_read == "capacity":
+            raise RuntimeError("capacity unavailable")
+        return SimpleNamespace(unsynced_bytes=1234)
 
 
 def _settings(tmp_path: Path, **updates: object) -> Settings:
@@ -290,6 +352,48 @@ async def test_system_health_aggregates_comfy_queue_storage_drive_and_models(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failed_read", "availability_field"),
+    [
+        ("connection", "connection_available"),
+        ("status", "sync_status_available"),
+        ("capacity", "capacity_available"),
+        ("history", "job_history_available"),
+    ],
+)
+async def test_drive_partial_health_read_is_warning_and_value_is_unavailable(
+    tmp_path: Path,
+    failed_read: str,
+    availability_field: str,
+) -> None:
+    service = SystemHealthService(
+        _FakeComfyUI(),
+        _FakeQueue(),
+        _PartialDrive(failed_read),
+        _settings(tmp_path),
+        disk_usage_adapter=_FakeDisk(DiskUsage(1000, 700, 300)),
+        now_factory=lambda: NOW,
+    )
+
+    view = await service.get_health()
+    markdown = system_health_markdown(view, "Asia/Tokyo")
+
+    assert view.overall_status is SystemHealthStatus.WARNING
+    assert getattr(view.drive, availability_field) is DriveHealthAvailability.UNAVAILABLE
+    assert "unavailable" in markdown
+    if failed_read == "status":
+        assert view.pending_sync_count is None
+        assert view.failed_sync_count is None
+    elif failed_read == "connection":
+        assert "connected `unavailable`" in markdown
+    elif failed_read == "capacity":
+        assert view.unsynced_bytes is None
+        assert "unsynced `unavailable`" in markdown
+    else:
+        assert "last sync `unavailable`" in markdown
+
+
+@pytest.mark.asyncio
 async def test_system_health_queue_counts_cover_all_rows_and_recent_errors_are_failed_only(
     tmp_path: Path,
 ) -> None:
@@ -345,6 +449,131 @@ async def test_system_health_queue_counts_cover_all_rows_and_recent_errors_are_f
         for event in view.recent_errors
     )
     assert all(event.generation_id != items[0].generation.id for event in view.recent_errors)
+    engine.dispose()
+
+
+def test_queue_health_separates_historical_failures_from_unresolved_retry_chains(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(f"sqlite:///{(tmp_path / 'queue-retries.sqlite3').as_posix()}")
+    Base.metadata.create_all(engine)
+    repository = GenerationDispatchQueueRepository(create_session_factory(engine))
+    snapshot = GenerationSettingsSnapshot.from_settings(_generation_settings(seed=10))
+    original = repository.enqueue_single(snapshot, enqueued_at=NOW)
+
+    with create_session_factory(engine)() as session:
+        session.execute(
+            update(GenerationModel)
+            .where(GenerationModel.id == str(original.generation.id))
+            .values(status=GenerationStatus.FAILED.value, updated_at=NOW)
+        )
+        session.execute(
+            update(GenerationJobModel)
+            .where(GenerationJobModel.id == str(original.job.id))
+            .values(status=GenerationStatus.FAILED.value, updated_at=NOW)
+        )
+        session.commit()
+
+    counts = repository.get_health_counts()
+    assert (counts.historical_failed_count, counts.unresolved_failed_count) == (1, 1)
+
+    retry = repository.enqueue_single(
+        snapshot,
+        retry_of_generation_id=original.generation.id,
+        retry_attempt=1,
+        enqueued_at=NOW + timedelta(seconds=1),
+    )
+    counts = repository.get_health_counts()
+    assert (counts.historical_failed_count, counts.unresolved_failed_count) == (1, 0)
+
+    with create_session_factory(engine)() as session:
+        session.execute(
+            update(GenerationModel)
+            .where(GenerationModel.id == str(retry.generation.id))
+            .values(status=GenerationStatus.FAILED.value, updated_at=NOW + timedelta(seconds=2))
+        )
+        session.execute(
+            update(GenerationJobModel)
+            .where(GenerationJobModel.id == str(retry.job.id))
+            .values(status=GenerationStatus.FAILED.value, updated_at=NOW + timedelta(seconds=2))
+        )
+        session.commit()
+
+    retry_again = repository.enqueue_single(
+        snapshot,
+        retry_of_generation_id=retry.generation.id,
+        retry_attempt=2,
+        enqueued_at=NOW + timedelta(seconds=3),
+    )
+    with create_session_factory(engine)() as session:
+        session.execute(
+            update(GenerationModel)
+            .where(GenerationModel.id == str(retry_again.generation.id))
+            .values(status=GenerationStatus.COMPLETED.value, updated_at=NOW + timedelta(seconds=4))
+        )
+        session.execute(
+            update(GenerationJobModel)
+            .where(GenerationJobModel.id == str(retry_again.job.id))
+            .values(status=GenerationStatus.COMPLETED.value, updated_at=NOW + timedelta(seconds=4))
+        )
+        session.commit()
+
+    counts = repository.get_health_counts()
+    assert (counts.historical_failed_count, counts.unresolved_failed_count) == (2, 0)
+    recent = repository.list_recent_failed(100)
+    assert {item.generation.id for item in recent} == {
+        original.generation.id,
+        retry.generation.id,
+    }
+
+    batch, batch_items = repository.enqueue_batch(
+        (snapshot, snapshot.model_copy(update={"seed": 11})),
+        name="Phase 9 batch",
+        seed_strategy=BatchSeedStrategy.SEQUENTIAL,
+        start_seed=10,
+        seed_step=1,
+        enqueued_at=NOW,
+    )
+    with create_session_factory(engine)() as session:
+        for item in batch_items:
+            session.execute(
+                update(GenerationModel)
+                .where(GenerationModel.id == str(item.generation.id))
+                .values(status=GenerationStatus.FAILED.value, updated_at=NOW)
+            )
+            session.execute(
+                update(GenerationJobModel)
+                .where(GenerationJobModel.id == str(item.job.id))
+                .values(status=GenerationStatus.FAILED.value, updated_at=NOW)
+            )
+        session.commit()
+    batch_retry, batch_retry_items = repository.enqueue_batch(
+        tuple(item.generation.settings_snapshot for item in batch_items),
+        name="Phase 9 batch retry",
+        seed_strategy=BatchSeedStrategy.SEQUENTIAL,
+        start_seed=10,
+        seed_step=1,
+        retry_of_batch_id=batch.id,
+        retry_of_generations=tuple(item.generation.id for item in batch_items),
+        retry_attempts=(1, 1),
+        enqueued_at=NOW + timedelta(seconds=1),
+    )
+    assert batch_retry.id != batch.id
+    with create_session_factory(engine)() as session:
+        for item in batch_retry_items:
+            session.execute(
+                update(GenerationModel)
+                .where(GenerationModel.id == str(item.generation.id))
+                .values(status=GenerationStatus.COMPLETED.value, updated_at=NOW)
+            )
+            session.execute(
+                update(GenerationJobModel)
+                .where(GenerationJobModel.id == str(item.job.id))
+                .values(status=GenerationStatus.COMPLETED.value, updated_at=NOW)
+            )
+        session.commit()
+    counts = repository.get_health_counts()
+    assert counts.unresolved_failed_count == 0
     engine.dispose()
 
 
@@ -408,6 +637,23 @@ async def test_system_health_retrieval_failures_use_fixed_codes_and_dedupe(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_synthetic_generation_error_history_is_sanitized_for_ui(tmp_path: Path) -> None:
+    service = SystemHealthService(
+        _FakeComfyUI(),
+        _UnsafeFailedQueue(),
+        None,
+        _settings(tmp_path),
+        disk_usage_adapter=_FakeDisk(DiskUsage(1000, 700, 300)),
+        now_factory=lambda: NOW,
+    )
+
+    view = await service.get_health()
+
+    generation_event = next(event for event in view.recent_errors if event.category == "generation")
+    assert "secret-from-generation" not in generation_event.summary
+
+
+@pytest.mark.asyncio
 async def test_drive_failed_event_uses_persisted_failure_time(tmp_path: Path) -> None:
     drive = _FailedDrive()
     service = SystemHealthService(
@@ -428,6 +674,94 @@ async def test_drive_failed_event_uses_persisted_failure_time(tmp_path: Path) ->
     assert second_event.created_at == drive.failure_at
     assert first.drive.last_failure_at == drive.failure_at
     assert second.drive.last_failure_at == drive.failure_at
+
+
+def test_drive_latest_unresolved_failure_is_not_limited_by_recent_job_history(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(f"sqlite:///{(tmp_path / 'drive-health.sqlite3').as_posix()}")
+    Base.metadata.create_all(engine)
+    factory = create_session_factory(engine)
+    failure_at = NOW - timedelta(days=1)
+    rows: list[object] = []
+    for index in range(102):
+        generation_id = uuid4()
+        artifact_id = uuid4()
+        record_id = uuid4()
+        job_id = uuid4()
+        is_failure = index == 0
+        updated_at = failure_at if is_failure else NOW + timedelta(minutes=index)
+        rows.extend(
+            (
+                GenerationModel(
+                    id=str(generation_id),
+                    kind="standard",
+                    status=GenerationStatus.COMPLETED.value,
+                    settings_snapshot_json="{}",
+                    snapshot_schema_version=1,
+                    workflow_template_id="phase9-test",
+                    workflow_template_version="1",
+                    created_at=updated_at,
+                    updated_at=updated_at,
+                ),
+                GenerationArtifactModel(
+                    id=str(artifact_id),
+                    generation_id=str(generation_id),
+                    artifact_type="image",
+                    local_path=f"images/{index}.png",
+                    sha256=f"{index:064x}",
+                    size_bytes=1,
+                    mime_type="image/png",
+                    created_at=updated_at,
+                ),
+                DriveSyncRecordModel(
+                    id=str(record_id),
+                    generation_id=str(generation_id),
+                    status="failed" if is_failure else "synced",
+                    remote_name="gdrive",
+                    remote_base_path="RunPod/Images",
+                    remote_image_path=f"RunPod/Images/{index}.png",
+                    remote_metadata_path=f"RunPod/Images/{index}.json",
+                    image_artifact_id=str(artifact_id),
+                    image_sha256=f"{index:064x}",
+                    image_size_bytes=1,
+                    synced_at=None if is_failure else updated_at,
+                    error_code="drive_copy_failed" if is_failure else None,
+                    error_summary="failure" if is_failure else None,
+                    created_at=updated_at,
+                    updated_at=updated_at,
+                ),
+                DriveSyncJobModel(
+                    id=str(job_id),
+                    sync_record_id=str(record_id),
+                    generation_id=str(generation_id),
+                    queue_sequence=index + 1,
+                    status="failed" if is_failure else "synced",
+                    completed_at=updated_at,
+                    error_code="drive_copy_failed" if is_failure else None,
+                    error_summary="failure" if is_failure else None,
+                    retryable=True,
+                    image_artifact_id=str(artifact_id),
+                    image_sha256=f"{index:064x}",
+                    image_size_bytes=1,
+                    created_at=updated_at,
+                    updated_at=updated_at,
+                ),
+            )
+        )
+    with factory() as session:
+        session.add_all(rows)
+        session.commit()
+
+    repository = DriveSyncRepository(factory)
+    jobs = repository.list_jobs(100)
+    latest = repository.get_latest_unresolved_failure()
+
+    assert all(job.status is not DriveSyncStatus.FAILED for job in jobs)
+    assert repository.status_counts()[DriveSyncStatus.FAILED] == 1
+    assert latest is not None
+    assert latest.updated_at == failure_at
+    engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -868,6 +1202,24 @@ def test_system_error_sanitizer_redacts_supported_secret_and_path_forms(value: s
     )
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Authorization: Bearer secret-a",
+        "Cookie: session=secret-a",
+        "Cookie: session=secret-a; refresh=secret-b",
+        "Cookie: a=one; b=two; c=three",
+        "Set-Cookie: session=secret-a; HttpOnly; Secure",
+        "Set-Cookie: a=one, b=two",
+    ],
+)
+def test_system_error_sanitizer_redacts_entire_cookie_and_header_values(value: str) -> None:
+    sanitized = sanitize_error_text(value, max_length=500)
+
+    assert sanitized == "<redacted-secret>"
+    assert all(secret not in (sanitized or "") for secret in ("secret-a", "secret-b"))
+
+
 def test_system_error_repository_deduplicates_same_category_and_code_without_update(
     tmp_path: Path,
 ) -> None:
@@ -894,4 +1246,29 @@ def test_system_error_repository_deduplicates_same_category_and_code_without_upd
     listed = repository.list_recent()
     assert len(listed) == 1
     assert listed[0].summary == "fixed summary"
+    engine.dispose()
+
+
+def test_system_error_search_uses_only_generation_job_and_error_code_filters(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(f"sqlite:///{(tmp_path / 'error-search.sqlite3').as_posix()}")
+    Base.metadata.create_all(engine)
+    repository = SystemErrorEventRepository(create_session_factory(engine))
+    generation_id = uuid4()
+    job_id = uuid4()
+    event = repository.record(
+        category="generation",
+        severity="error",
+        error_code="generation_failed",
+        summary="safe summary",
+        generation_id=generation_id,
+        job_id=job_id,
+        created_at=NOW,
+    )
+
+    assert repository.search(generation_id=generation_id) == (event,)
+    assert repository.search(job_id=job_id) == (event,)
+    assert repository.search(error_code="generation_failed") == (event,)
+    assert repository.search(error_code="C:\\private\\secret.log") == ()
     engine.dispose()

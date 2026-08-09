@@ -117,7 +117,26 @@ class QueueHealthCounts:
 
     pending_count: int
     running_count: int
-    failed_count: int
+    # ``failed_count`` remains as a compatibility field for callers written
+    # before Phase 9.  It is normalized to unresolved failures below.
+    failed_count: int = 0
+    historical_failed_count: int | None = None
+    unresolved_failed_count: int | None = None
+
+    def __post_init__(self) -> None:
+        historical = (
+            self.failed_count
+            if self.historical_failed_count is None
+            else self.historical_failed_count
+        )
+        unresolved = (
+            self.failed_count
+            if self.unresolved_failed_count is None
+            else self.unresolved_failed_count
+        )
+        object.__setattr__(self, "historical_failed_count", historical)
+        object.__setattr__(self, "unresolved_failed_count", unresolved)
+        object.__setattr__(self, "failed_count", unresolved)
 
 
 __all__ = [

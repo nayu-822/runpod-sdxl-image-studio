@@ -180,6 +180,9 @@ def build_system_tab(
             gr.Column(elem_classes=["system-error-column"]),
             gr.Accordion("Recent errors", open=False, elem_classes=["system-error-section"]),
         ):
+            gr.Markdown(
+                "Detailed investigation uses server-side Generation ID, Job ID, or error_code."
+            )
             error_history_markdown = gr.Markdown(initial_error_history_markdown)
     return SystemTabComponents(
         status,

@@ -169,6 +169,8 @@ class DriveSyncRepositoryProtocol(Protocol):
 
     def list_jobs(self, limit: int = 50) -> tuple[DriveSyncJob, ...]: ...
 
+    def get_latest_unresolved_failure(self) -> DriveSyncJob | None: ...
+
     def status_counts(self) -> dict[DriveSyncStatus, int]: ...
 
     def list_discovery_candidates(self, limit: int) -> tuple[DriveSyncDiscoveryCandidate, ...]: ...
@@ -861,6 +863,35 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
                 return tuple(_job_domain(row) for row in rows)
         except (SQLAlchemyError, ValueError) as exc:
             raise DriveSyncRepositoryError("drive sync jobs could not be listed") from exc
+
+    def get_latest_unresolved_failure(self) -> DriveSyncJob | None:
+        """Return the newest failed job whose sync record is still failed.
+
+        The status count is record-based, while the timestamp must describe a
+        failed attempt.  Joining both failed states prevents an old failed
+        attempt from being reported after its record has subsequently synced.
+        """
+
+        try:
+            with session_scope(self._session_factory) as session:
+                row = session.scalar(
+                    select(DriveSyncJobModel)
+                    .join(
+                        DriveSyncRecordModel,
+                        DriveSyncRecordModel.id == DriveSyncJobModel.sync_record_id,
+                    )
+                    .where(
+                        DriveSyncRecordModel.status == DriveSyncStatus.FAILED.value,
+                        DriveSyncJobModel.status == DriveSyncStatus.FAILED.value,
+                    )
+                    .order_by(DriveSyncJobModel.updated_at.desc(), DriveSyncJobModel.id.desc())
+                    .limit(1)
+                )
+                return _job_domain(row) if row is not None else None
+        except (SQLAlchemyError, ValueError) as exc:
+            raise DriveSyncRepositoryError(
+                "latest unresolved drive sync failure could not be read"
+            ) from exc
 
     def status_counts(self) -> dict[DriveSyncStatus, int]:
         try:

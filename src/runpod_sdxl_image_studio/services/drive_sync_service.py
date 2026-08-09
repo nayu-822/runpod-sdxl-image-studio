@@ -491,6 +491,9 @@ class DriveSyncService:
     def list_jobs(self, limit: int = 50) -> tuple[DriveSyncJob, ...]:
         return self._repository.list_jobs(limit)
 
+    def get_latest_unresolved_failure(self) -> DriveSyncJob | None:
+        return self._repository.get_latest_unresolved_failure()
+
     def capacity(self) -> DriveCapacity:
         usage = shutil.disk_usage(self._settings.data_dir)
         return self._repository.capacity(

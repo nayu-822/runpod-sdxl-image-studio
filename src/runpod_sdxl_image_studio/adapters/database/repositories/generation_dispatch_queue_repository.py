@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session, aliased, sessionmaker
 
 from runpod_sdxl_image_studio.adapters.database.engine import session_scope
 from runpod_sdxl_image_studio.adapters.database.models import (
@@ -1055,12 +1055,35 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
                     pending_count=counts[GenerationStatus.PENDING.value]
                     + counts[GenerationStatus.QUEUED.value],
                     running_count=counts[GenerationStatus.RUNNING.value],
-                    failed_count=counts[GenerationStatus.FAILED.value],
+                    historical_failed_count=counts[GenerationStatus.FAILED.value],
+                    unresolved_failed_count=self._count_unresolved_failed_generations(session),
                 )
         except (SQLAlchemyError, ValueError) as exc:
             raise GenerationDispatchQueueRepositoryError(
                 "queue health counts could not be read"
             ) from exc
+
+    @staticmethod
+    def _count_unresolved_failed_generations(session: Session) -> int:
+        """Count failed queue rows that have no retry child Generation."""
+
+        retry_child = aliased(GenerationModel)
+        retry_exists = select(retry_child.id).where(
+            retry_child.retry_of_generation_id == GenerationModel.id
+        )
+        statement = (
+            select(func.count(GenerationModel.id))
+            .select_from(GenerationModel)
+            .join(
+                GenerationQueueEntryModel,
+                GenerationQueueEntryModel.generation_id == GenerationModel.id,
+            )
+            .where(
+                GenerationModel.status == GenerationStatus.FAILED.value,
+                ~retry_exists.exists(),
+            )
+        )
+        return int(session.scalar(statement) or 0)
 
     def list_recent_failed(self, limit: int = 100) -> tuple[GenerationQueueItem, ...]:
         """Return only recent failed items, ordered by Generation update time."""

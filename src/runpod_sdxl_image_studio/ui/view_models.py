@@ -11,6 +11,7 @@ from runpod_sdxl_image_studio.adapters.comfyui.models import ComfyUICapabilities
 from runpod_sdxl_image_studio.domain.preflight import PreflightResult
 from runpod_sdxl_image_studio.domain.system_status import (
     ComfyUIStatus,
+    DriveHealthAvailability,
     QueueHealthAvailability,
     SystemErrorEvent,
     SystemHealthView,
@@ -151,6 +152,35 @@ def system_health_markdown(view: SystemHealthView, timezone_name: str) -> str:
         getattr(view.queue_available, "value", view.queue_available)
         == QueueHealthAvailability.UNAVAILABLE.value
     )
+    drive_connection = _drive_connection_label(view)
+    drive_sync_status = _drive_metric(
+        view.drive.configured,
+        view.drive.sync_status_available,
+        view.pending_sync_count,
+    )
+    drive_failed_status = _drive_metric(
+        view.drive.configured,
+        view.drive.sync_status_available,
+        view.failed_sync_count,
+    )
+    drive_last_sync = _drive_datetime(
+        view.drive.configured,
+        view.drive.job_history_available,
+        view.last_sync_at,
+        timezone_name,
+    )
+    drive_last_failure = _drive_datetime(
+        view.drive.configured,
+        view.drive.job_history_available,
+        view.drive.last_failure_at,
+        timezone_name,
+    )
+    unsynced = (
+        "unavailable"
+        if view.drive.configured
+        and view.drive.capacity_available is DriveHealthAvailability.UNAVAILABLE
+        else _format_bytes(view.unsynced_bytes)
+    )
     lines = [
         f"### System Health: `{status}`",
         f"**Checked:** {_format_datetime(view.checked_at, timezone_name)}",
@@ -167,7 +197,8 @@ def system_health_markdown(view: SystemHealthView, timezone_name: str) -> str:
             else (
                 "**Queue:** "
                 f"pending `{view.pending_count}`, running `{view.running_count}`, "
-                f"failed `{view.failed_count}`"
+                f"unresolved failed `{view.unresolved_failed_count}`, "
+                f"historical failed `{view.historical_failed_count}`"
             )
         ),
         (
@@ -175,13 +206,13 @@ def system_health_markdown(view: SystemHealthView, timezone_name: str) -> str:
             f"total `{_format_bytes(view.local_total_bytes)}`, "
             f"used `{_format_bytes(view.local_used_bytes)}`, "
             f"free `{_format_bytes(view.local_free_bytes)}`, "
-            f"unsynced `{_format_bytes(view.unsynced_bytes)}`"
+            f"unsynced `{unsynced}`"
         ),
         (
             "**Google Drive:** "
-            f"configured `{view.drive_configured}`, connected `{view.drive_connected}`, "
-            f"pending `{view.pending_sync_count}`, failed `{view.failed_sync_count}`, "
-            f"last sync `{_format_datetime(view.last_sync_at, timezone_name)}`"
+            f"configured `{view.drive_configured}`, connected `{drive_connection}`, "
+            f"pending `{drive_sync_status}`, failed `{drive_failed_status}`, "
+            f"last sync `{drive_last_sync}`, last failure `{drive_last_failure}`"
         ),
         (
             "**Models:** "
@@ -190,6 +221,31 @@ def system_health_markdown(view: SystemHealthView, timezone_name: str) -> str:
         ),
     ]
     return "\n".join(lines)
+
+
+def _drive_connection_label(view: SystemHealthView) -> str:
+    if not view.drive.configured:
+        return "not configured"
+    if view.drive.connection_available is DriveHealthAvailability.UNAVAILABLE:
+        return "unavailable"
+    return "connected" if view.drive.connected else "disconnected"
+
+
+def _drive_metric(configured: bool, availability: DriveHealthAvailability, value: object) -> str:
+    if not configured or availability is DriveHealthAvailability.UNAVAILABLE:
+        return "unavailable"
+    return str(value) if value is not None else "-"
+
+
+def _drive_datetime(
+    configured: bool,
+    availability: DriveHealthAvailability,
+    value: datetime | None,
+    timezone_name: str,
+) -> str:
+    if not configured or availability is DriveHealthAvailability.UNAVAILABLE:
+        return "unavailable"
+    return _format_datetime(value, timezone_name)
 
 
 def system_error_history_markdown(

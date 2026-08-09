@@ -8,6 +8,10 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from runpod_sdxl_image_studio.adapters.database.repositories.system_error_repository import (
+    MAX_ERROR_SUMMARY_LENGTH,
+    sanitize_error_text,
+)
 from runpod_sdxl_image_studio.adapters.storage.disk_usage import (
     DiskUsageAdapterProtocol,
     LocalDiskUsageAdapter,
@@ -18,6 +22,7 @@ from runpod_sdxl_image_studio.domain.generation_queue import QueueHealthCounts
 from runpod_sdxl_image_studio.domain.system_status import (
     ComfyUIHealthView,
     ComfyUIStatus,
+    DriveHealthAvailability,
     DriveHealthView,
     ErrorSeverity,
     GenerationQueueHealthView,
@@ -52,6 +57,8 @@ class DriveHealthProvider(Protocol):
 
     def list_jobs(self, limit: int = 50) -> Sequence[object]: ...
 
+    def get_latest_unresolved_failure(self) -> object | None: ...
+
     def capacity(self) -> object: ...
 
 
@@ -68,6 +75,15 @@ class ErrorHistoryProvider(Protocol):
         retryable: bool = False,
         created_at: datetime | None = None,
     ) -> object: ...
+
+    def search(
+        self,
+        *,
+        generation_id: UUID | None = None,
+        job_id: UUID | None = None,
+        error_code: str | None = None,
+        limit: int = 100,
+    ) -> tuple[SystemErrorEvent, ...]: ...
 
 
 _SYSTEM_ERROR_SUMMARIES = {
@@ -110,13 +126,12 @@ class SystemHealthService:
         queue_counts, queue_available, recent_failed = self._read_queue(checked_at)
         storage = self._read_storage(checked_at)
         drive, drive_unsynced = await self._read_drive(checked_at)
-        if drive_unsynced is not None:
-            storage = StorageHealthView(
-                storage.local_total_bytes,
-                storage.local_free_bytes,
-                storage.local_used_bytes,
-                drive_unsynced,
-            )
+        storage = StorageHealthView(
+            storage.local_total_bytes,
+            storage.local_free_bytes,
+            storage.local_used_bytes,
+            drive_unsynced,
+        )
         errors = self._read_error_history(recent_failed, drive)
         return SystemHealthView(
             checked_at=checked_at,
@@ -148,6 +163,36 @@ class SystemHealthService:
         """Alias used by status-oriented application code."""
 
         return await self.get_health()
+
+    def search_error_history(
+        self,
+        *,
+        generation_id: UUID | None = None,
+        job_id: UUID | None = None,
+        error_code: str | None = None,
+        limit: int = 100,
+    ) -> tuple[SystemErrorEvent, ...]:
+        """Search safe error identifiers through the server-side repository."""
+
+        repository = self._error_history_repository
+        if repository is None:
+            return ()
+        searcher = getattr(repository, "search", None)
+        if not callable(searcher):
+            return ()
+        try:
+            normalized_code = error_code.strip()[:64] if error_code else None
+            return tuple(
+                searcher(
+                    generation_id=generation_id,
+                    job_id=job_id,
+                    error_code=normalized_code,
+                    limit=min(max(1, limit), 100),
+                )
+            )
+        except Exception:  # noqa: BLE001 - search must not break System UI
+            logger.warning("System error history search failed")
+            return ()
 
     async def _read_comfyui(
         self,
@@ -234,45 +279,77 @@ class SystemHealthService:
     async def _read_drive(self, observed_at: datetime) -> tuple[DriveHealthView, int | None]:
         service = self._drive_sync_service
         if service is None:
-            return DriveHealthView(False, False, None, 0, 0), 0
+            return (
+                DriveHealthView(
+                    False,
+                    False,
+                    None,
+                    0,
+                    0,
+                    connection_available=DriveHealthAvailability.UNAVAILABLE,
+                    sync_status_available=DriveHealthAvailability.UNAVAILABLE,
+                    job_history_available=DriveHealthAvailability.UNAVAILABLE,
+                    capacity_available=DriveHealthAvailability.UNAVAILABLE,
+                ),
+                0,
+            )
         configured = bool(service.is_configured)
+        if not configured:
+            return (
+                DriveHealthView(
+                    False,
+                    False,
+                    None,
+                    0,
+                    0,
+                    connection_available=DriveHealthAvailability.UNAVAILABLE,
+                    sync_status_available=DriveHealthAvailability.UNAVAILABLE,
+                    job_history_available=DriveHealthAvailability.UNAVAILABLE,
+                    capacity_available=DriveHealthAvailability.UNAVAILABLE,
+                ),
+                0,
+            )
         connected = False
-        if configured:
-            try:
-                result = await service.check_connection()
-                connected = bool(getattr(result, "connected", False)) or (
-                    getattr(getattr(result, "status", None), "value", None) == "connected"
-                )
-            except Exception:  # noqa: BLE001 - Drive is an independent subsystem
-                logger.warning("System health could not check Google Drive")
-                self._record_system_error("system_drive_connection_failed", observed_at)
-        pending = 0
-        failed = 0
+        connection_available = DriveHealthAvailability.AVAILABLE
+        try:
+            result = await service.check_connection()
+            connected = bool(getattr(result, "connected", False)) or (
+                getattr(getattr(result, "status", None), "value", None) == "connected"
+            )
+        except Exception:  # noqa: BLE001 - Drive is an independent subsystem
+            logger.warning("System health could not check Google Drive")
+            connection_available = DriveHealthAvailability.UNAVAILABLE
+            self._record_system_error("system_drive_connection_failed", observed_at)
+
+        pending: int | None = 0
+        failed: int | None = 0
+        pending_total = 0
+        failed_total = 0
+        sync_status_available = DriveHealthAvailability.AVAILABLE
         try:
             counts = service.status_counts()
             for key, count in counts.items():
                 value = getattr(key, "value", key)
                 if value in {"pending", "syncing"}:
-                    pending += int(count)
+                    pending_total += int(count)
                 elif value == "failed":
-                    failed += int(count)
+                    failed_total += int(count)
+            pending = pending_total
+            failed = failed_total
         except Exception:  # noqa: BLE001
             logger.warning("System health could not read Drive sync counts")
+            pending = None
+            failed = None
+            sync_status_available = DriveHealthAvailability.UNAVAILABLE
             self._record_system_error("system_drive_status_failed", observed_at)
         last_sync_at: datetime | None = None
         last_failure_at: datetime | None = None
+        job_history_available = DriveHealthAvailability.AVAILABLE
         try:
             jobs = service.list_jobs(100)
             for job in jobs:
                 value = getattr(getattr(job, "status", None), "value", None)
                 completed_at = getattr(job, "completed_at", None)
-                updated_at = getattr(job, "updated_at", None)
-                if value == "failed":
-                    failure_at = updated_at or completed_at
-                    if isinstance(failure_at, datetime):
-                        failure_at = _utc(failure_at)
-                        if last_failure_at is None or failure_at > last_failure_at:
-                            last_failure_at = failure_at
                 if (
                     value == "synced"
                     and isinstance(completed_at, datetime)
@@ -281,8 +358,18 @@ class SystemHealthService:
                     last_sync_at = _utc(completed_at)
         except Exception:  # noqa: BLE001
             logger.warning("System health could not read last Drive sync")
+            job_history_available = DriveHealthAvailability.UNAVAILABLE
+            self._record_system_error("system_drive_status_failed", observed_at)
+        try:
+            latest_failure = service.get_latest_unresolved_failure()
+            if latest_failure is not None:
+                last_failure_at = _event_time(latest_failure, observed_at)
+        except Exception:  # noqa: BLE001
+            logger.warning("System health could not read latest Drive failure")
+            job_history_available = DriveHealthAvailability.UNAVAILABLE
             self._record_system_error("system_drive_status_failed", observed_at)
         unsynced: int | None = None
+        capacity_available = DriveHealthAvailability.AVAILABLE
         try:
             capacity = service.capacity()
             unsynced_value = getattr(capacity, "unsynced_bytes", None)
@@ -290,6 +377,7 @@ class SystemHealthService:
                 unsynced = max(0, unsynced_value)
         except Exception:  # noqa: BLE001
             logger.warning("System health could not calculate unsynced bytes")
+            capacity_available = DriveHealthAvailability.UNAVAILABLE
             self._record_system_error("system_drive_capacity_failed", observed_at)
         return (
             DriveHealthView(
@@ -299,6 +387,10 @@ class SystemHealthService:
                 pending,
                 failed,
                 last_failure_at,
+                connection_available,
+                sync_status_available,
+                job_history_available,
+                capacity_available,
             ),
             unsynced,
         )
@@ -355,14 +447,31 @@ class SystemHealthService:
                     created_at=_event_time(generation, self._now_factory()),
                     category="generation",
                     severity=ErrorSeverity.ERROR,
-                    error_code=getattr(generation, "error_code", None) or "generation_failed",
-                    summary=getattr(generation, "error_summary", None) or "Generation failed",
+                    error_code=(
+                        sanitize_error_text(
+                            getattr(generation, "error_code", None),
+                            max_length=64,
+                        )
+                        or "generation_failed"
+                    ),
+                    summary=(
+                        sanitize_error_text(
+                            getattr(generation, "error_summary", None),
+                            max_length=MAX_ERROR_SUMMARY_LENGTH,
+                        )
+                        or "Generation failed"
+                    ),
                     generation_id=generation_id,
                     job_id=getattr(job, "id", None),
                     retryable=True,
                 )
             )
-        if drive.failed_sync_count and drive.last_failure_at is not None:
+        if drive.last_failure_at is not None:
+            failure_count = (
+                str(drive.failed_sync_count)
+                if drive.failed_sync_count is not None
+                else "unresolved"
+            )
             events.append(
                 SystemErrorEvent(
                     id=uuid5(NAMESPACE_URL, "drive-sync-failed"),
@@ -370,7 +479,7 @@ class SystemHealthService:
                     category="drive_sync",
                     severity=ErrorSeverity.ERROR,
                     error_code="drive_sync_failed",
-                    summary=f"{drive.failed_sync_count} Drive synchronization job(s) failed",
+                    summary=f"{failure_count} Drive synchronization job(s) failed",
                     generation_id=None,
                     job_id=None,
                     retryable=True,
@@ -385,6 +494,8 @@ def _queue_health(counts: QueueHealthCounts) -> GenerationQueueHealthView:
         counts.pending_count,
         counts.running_count,
         counts.failed_count,
+        counts.historical_failed_count or 0,
+        counts.unresolved_failed_count,
     )
 
 
@@ -407,7 +518,16 @@ def _overall_status(
     queue = _queue_health(queue_counts)
     if (
         queue.failed_count > 0
-        or drive.failed_sync_count > 0
+        or (drive.failed_sync_count is not None and drive.failed_sync_count > 0)
+        or (
+            drive.configured
+            and (
+                drive.connection_available is DriveHealthAvailability.UNAVAILABLE
+                or drive.sync_status_available is DriveHealthAvailability.UNAVAILABLE
+                or drive.job_history_available is DriveHealthAvailability.UNAVAILABLE
+                or drive.capacity_available is DriveHealthAvailability.UNAVAILABLE
+            )
+        )
         or (drive.configured and not drive.connected)
         or storage.local_free_bytes < settings.warning_free_disk_bytes
         or comfy_warning

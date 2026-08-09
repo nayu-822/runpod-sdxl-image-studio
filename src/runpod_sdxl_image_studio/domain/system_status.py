@@ -51,6 +51,13 @@ class QueueHealthAvailability(StrEnum):
     UNAVAILABLE = "unavailable"
 
 
+class DriveHealthAvailability(StrEnum):
+    """Whether one independent Google Drive health read was available."""
+
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+
+
 class ErrorSeverity(StrEnum):
     """Severity values persisted for operational error history."""
 
@@ -78,6 +85,14 @@ class GenerationQueueHealthView:
     pending_count: int
     running_count: int
     failed_count: int
+    historical_failed_count: int = 0
+    unresolved_failed_count: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.unresolved_failed_count is None:
+            object.__setattr__(self, "unresolved_failed_count", self.failed_count)
+        else:
+            object.__setattr__(self, "failed_count", self.unresolved_failed_count)
 
 
 @dataclass(frozen=True)
@@ -87,7 +102,7 @@ class StorageHealthView:
     local_total_bytes: int
     local_free_bytes: int
     local_used_bytes: int
-    unsynced_bytes: int
+    unsynced_bytes: int | None
 
 
 @dataclass(frozen=True)
@@ -97,9 +112,13 @@ class DriveHealthView:
     configured: bool
     connected: bool
     last_sync_at: datetime | None
-    pending_sync_count: int
-    failed_sync_count: int
+    pending_sync_count: int | None
+    failed_sync_count: int | None
     last_failure_at: datetime | None = None
+    connection_available: DriveHealthAvailability = DriveHealthAvailability.AVAILABLE
+    sync_status_available: DriveHealthAvailability = DriveHealthAvailability.AVAILABLE
+    job_history_available: DriveHealthAvailability = DriveHealthAvailability.AVAILABLE
+    capacity_available: DriveHealthAvailability = DriveHealthAvailability.AVAILABLE
 
 
 @dataclass(frozen=True)
@@ -182,6 +201,14 @@ class SystemHealthView:
         return self.queue.failed_count
 
     @property
+    def historical_failed_count(self) -> int:
+        return self.queue.historical_failed_count
+
+    @property
+    def unresolved_failed_count(self) -> int:
+        return self.queue.unresolved_failed_count or 0
+
+    @property
     def local_total_bytes(self) -> int:
         return self.storage.local_total_bytes
 
@@ -194,7 +221,7 @@ class SystemHealthView:
         return self.storage.local_used_bytes
 
     @property
-    def unsynced_bytes(self) -> int:
+    def unsynced_bytes(self) -> int | None:
         return self.storage.unsynced_bytes
 
     @property
@@ -210,11 +237,11 @@ class SystemHealthView:
         return self.drive.last_sync_at
 
     @property
-    def pending_sync_count(self) -> int:
+    def pending_sync_count(self) -> int | None:
         return self.drive.pending_sync_count
 
     @property
-    def failed_sync_count(self) -> int:
+    def failed_sync_count(self) -> int | None:
         return self.drive.failed_sync_count
 
     @property
