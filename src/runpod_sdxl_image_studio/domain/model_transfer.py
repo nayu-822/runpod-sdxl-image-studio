@@ -59,7 +59,13 @@ class ModelTransferErrorCode(StrEnum):
     STATELESS_RESTORE_INTERRUPTED = "stateless_restore_interrupted"
 
 
-_MODEL_EXTENSIONS = frozenset({".safetensors", ".ckpt", ".pt", ".pth", ".bin"})
+_MODEL_EXTENSIONS_BY_KIND = {
+    RemoteModelKind.CHECKPOINT: frozenset({".safetensors", ".ckpt", ".pt", ".pth", ".bin"}),
+    RemoteModelKind.LORA: frozenset({".safetensors", ".ckpt", ".pt", ".pth", ".bin"}),
+    RemoteModelKind.VAE: frozenset({".safetensors", ".ckpt", ".pt", ".pth", ".bin"}),
+    # Keep this in lockstep with UpscalerCatalog, which is the local source of truth.
+    RemoteModelKind.UPSCALER: frozenset({".safetensors", ".pth", ".pt", ".bin"}),
+}
 
 
 def normalize_model_relative_path(value: str) -> str:
@@ -74,10 +80,15 @@ def normalize_model_relative_path(value: str) -> str:
     return validate_remote_relative_path(path.as_posix())
 
 
-def is_supported_model_filename(value: str) -> bool:
-    """Use the common model extension set for remote and local catalogs."""
+def is_supported_model_filename(value: str, kind: RemoteModelKind | None = None) -> bool:
+    """Use the local-compatible extension set for a remote model category."""
 
-    return PurePosixPath(value).suffix.casefold() in _MODEL_EXTENSIONS
+    extensions = (
+        frozenset().union(*_MODEL_EXTENSIONS_BY_KIND.values())
+        if kind is None
+        else _MODEL_EXTENSIONS_BY_KIND[kind]
+    )
+    return PurePosixPath(value).suffix.casefold() in extensions
 
 
 @dataclass(frozen=True)

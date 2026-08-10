@@ -73,7 +73,9 @@ RCLONE_REMOTE=drive
 ```
 
 準備処理はSQLiteの`model_transfer_jobs`へ保存され、ブラウザを閉じてもバックグラウンドWorkerが継続します。
-Remoteのカテゴリ内相対pathをComfyUIのローカルmodel pathへ保持し、`.safetensors`、`.ckpt`、`.pt`、`.pth`、`.bin`以外は候補にしません。
+Remoteのカテゴリ内相対pathをComfyUIのローカルmodel pathへ保持し、checkpoint/LoRA/VAEは
+`.safetensors`、`.ckpt`、`.pt`、`.pth`、`.bin`、upscalerはローカルCatalogと同じ
+`.safetensors`、`.pt`、`.pth`、`.bin`だけを候補にします。
 最終ファイルへ直接書き込まず、一時ファイルのサイズ/hash検証、許可root内のsymlink確認、atomic replace、ComfyUI capabilityのexact visibility確認後に完了します。
 
 RemoteにあるだけのモデルはGenerationのdropdownへ表示されません。ダウンロード後にComfyUI capabilityが更新され、

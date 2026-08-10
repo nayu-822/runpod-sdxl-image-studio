@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path, PurePosixPath
@@ -129,6 +130,7 @@ class UpscaleEnqueueService:
         settings: Settings,
         *,
         catalog: UpscalerCatalog | None = None,
+        catalog_provider: Callable[[], UpscalerCatalog] | None = None,
         metadata_import_repository: MetadataImportRepositoryProtocol | None = None,
         imported_image_storage: ImportedImageStorage | None = None,
         upscale_settings_repository: UpscaleSettingsRepositoryProtocol | None = None,
@@ -139,6 +141,7 @@ class UpscaleEnqueueService:
         self._queue = queue_repository
         self._settings = settings
         self._catalog = catalog or UpscalerCatalog.scan(settings.upscaler_dir)
+        self._catalog_provider = catalog_provider
         self._metadata_import_repository = metadata_import_repository
         self._imported_image_storage = imported_image_storage
         self._upscale_settings_repository = upscale_settings_repository
@@ -146,6 +149,13 @@ class UpscaleEnqueueService:
 
     def set_capabilities(self, capabilities: ComfyUICapabilities | None) -> None:
         self._capabilities = capabilities
+
+    def current_catalog(self) -> UpscalerCatalog:
+        """Return the current local catalog, not an application-start snapshot."""
+
+        if self._catalog_provider is not None:
+            return self._catalog_provider()
+        return self._catalog
 
     def latest_completed_generation_id(self) -> UUID | None:
         page = self._generations.list_history(
@@ -325,7 +335,7 @@ class UpscaleEnqueueService:
         source = verify_source_artifact(artifact, self._settings)
         if upscale_settings.method.value == "image":
             model_name = validate_upscaler_name(upscale_settings.upscaler_name)
-            if not self._catalog.contains(model_name):
+            if not self.current_catalog().contains(model_name):
                 raise UpscaleEnqueueError(
                     "upscale_model_missing", "指定されたupscalerが取得済みではありません。"
                 )
@@ -373,7 +383,7 @@ class UpscaleEnqueueService:
         source = verify_source_artifact(artifact, self._settings)
         if upscale_settings.method.value == "image":
             model_name = validate_upscaler_name(upscale_settings.upscaler_name)
-            if not self._catalog.contains(model_name):
+            if not self.current_catalog().contains(model_name):
                 raise UpscaleEnqueueError(
                     "upscale_model_missing", "指定されたupscalerが取得済みではありません。"
                 )
@@ -581,7 +591,7 @@ class UpscaleEnqueueService:
     ) -> UpscalePlan:
         if upscale_settings.method.value == "image":
             model_name = validate_upscaler_name(upscale_settings.upscaler_name)
-            if not self._catalog.contains(model_name):
+            if not self.current_catalog().contains(model_name):
                 raise UpscaleEnqueueError(
                     "upscale_model_missing", "指定されたupscalerが取得済みではありません。"
                 )

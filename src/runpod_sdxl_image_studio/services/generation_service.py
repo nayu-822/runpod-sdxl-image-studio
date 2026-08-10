@@ -178,6 +178,7 @@ class GenerationService:
         upscale_settings_repository: UpscaleSettingsRepositoryProtocol | None = None,
         upscale_workflow_adapter: UpscaleWorkflowAdapter | None = None,
         upscaler_catalog: UpscalerCatalog | None = None,
+        upscaler_catalog_provider: Callable[[], UpscalerCatalog] | None = None,
         metadata_import_repository: MetadataImportRepositoryProtocol | None = None,
         imported_image_storage: ImportedImageStorage | None = None,
         drive_sync_enqueue_handler: Callable[[UUID], object] | None = None,
@@ -240,6 +241,7 @@ class GenerationService:
         self._upscaler_catalog = upscaler_catalog or UpscalerCatalog.scan(
             self._settings.upscaler_dir
         )
+        self._upscaler_catalog_provider = upscaler_catalog_provider
         self._metadata_import_repository = metadata_import_repository
         self._imported_image_storage = imported_image_storage
         self._drive_sync_enqueue_handler = drive_sync_enqueue_handler
@@ -1104,9 +1106,14 @@ class GenerationService:
 
         if upscale_snapshot.method.value == "image":
             model_name = upscale_snapshot.upscaler_name or ""
+            current_catalog = (
+                self._upscaler_catalog_provider()
+                if self._upscaler_catalog_provider is not None
+                else self._upscaler_catalog
+            )
             if model_name not in getattr(
                 capabilities, "upscale_models", ()
-            ) or not self._upscaler_catalog.contains(model_name):
+            ) or not current_catalog.contains(model_name):
                 raise UpscaleEnqueueError(
                     "upscale_model_missing",
                     "the selected upscaler is unavailable",

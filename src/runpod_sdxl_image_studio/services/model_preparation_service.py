@@ -9,7 +9,7 @@ import os
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import UUID
 
 from runpod_sdxl_image_studio.adapters.comfyui.models import ComfyUICapabilities
@@ -23,6 +23,7 @@ from runpod_sdxl_image_studio.adapters.rclone.remote_model_catalog import (
     ProcessStartedCallback,
     ProgressCallback,
     RemoteModelAdapterError,
+    ShutdownCheck,
 )
 from runpod_sdxl_image_studio.config import Settings
 from runpod_sdxl_image_studio.domain.model_transfer import (
@@ -52,6 +53,7 @@ class ModelCatalogPort(Protocol):
         process_started_callback: ProcessStartedCallback | None = None,
         process_finished_callback: ProcessFinishedCallback | None = None,
         cancel_check: CancelCheck | None = None,
+        shutdown_check: ShutdownCheck | None = None,
         timeout_seconds: float | None = None,
     ) -> None: ...
 
@@ -110,6 +112,11 @@ class ModelPreparationService:
             catalog = await self._catalog_adapter.list_catalog()
         except RemoteModelAdapterError as exc:
             raise ModelPreparationServiceError(exc.code, str(exc)) from exc
+        if not catalog.is_available:
+            raise ModelPreparationServiceError(
+                ModelTransferErrorCode.CATALOG_UNAVAILABLE.value,
+                "Google Drive model catalog is unavailable",
+            )
         self._catalog = catalog
         return catalog
 
@@ -145,7 +152,7 @@ class ModelPreparationService:
         if not selections:
             return ModelPreparationResult((), "準備するモデルを選択してください。", catalog)
 
-        jobs: list[ModelTransferJob] = []
+        resolved_entries: list[RemoteModelEntry] = []
         for kind, relative in selections:
             try:
                 entry = catalog.find(kind, relative)
@@ -161,7 +168,11 @@ class ModelPreparationService:
                     "選択したモデルがRemote一覧にありません。再取得してください。",
                     retryable=False,
                 )
-            jobs.append(await self.prepare_entry(entry))
+            resolved_entries.append(entry)
+
+        # Resolve and validate every selection before persisting the first job.
+        # This keeps an invalid later selection from leaving an earlier download queued.
+        jobs = [await self.prepare_entry(entry) for entry in resolved_entries]
         self._notify_state_changed()
         return ModelPreparationResult(
             tuple(jobs), f"{len(jobs)}件のモデル準備をキューへ登録しました。", catalog
@@ -172,9 +183,25 @@ class ModelPreparationService:
         local_relative = entry.relative_path
         existing_sha = _matching_local_sha256(local_path, entry)
         if existing_sha is not None:
-            job = self._repository.enqueue(entry, local_relative)
+            try:
+                job = self._repository.enqueue(entry, local_relative)
+                await self._refresh_and_check_visibility(entry)
+            except ModelPreparationServiceError:
+                raise
+            except ModelTransferRepositoryError as exc:
+                raise ModelPreparationServiceError(
+                    ModelTransferErrorCode.PERSISTENCE_FAILED.value,
+                    "モデル準備ジョブを保存できませんでした。",
+                ) from exc
             try:
                 return self._repository.mark_already_prepared(job.id, existing_sha)
+            except ModelPreparationServiceError:
+                raise
+            except ModelTransferRepositoryError as exc:
+                raise ModelPreparationServiceError(
+                    ModelTransferErrorCode.PERSISTENCE_FAILED.value,
+                    "モデル準備ジョブを保存できませんでした。",
+                ) from exc
             except AttributeError:
                 # Keep the service usable with small test fakes that only implement
                 # the original repository protocol.
@@ -206,7 +233,18 @@ class ModelPreparationService:
                 retryable=False,
             ) from exc
 
-    async def process_job(self, job: ModelTransferJob, worker_id: str) -> ModelTransferJob:
+    async def process_job(
+        self,
+        job: ModelTransferJob,
+        worker_id: str,
+        *,
+        shutdown_check: ShutdownCheck | None = None,
+    ) -> ModelTransferJob:
+        if shutdown_check is not None and await _invoke_check(shutdown_check):
+            raise ModelPreparationServiceError(
+                ModelTransferErrorCode.APP_RESTART_INTERRUPTED.value,
+                "モデル準備はアプリケーション終了により中断されました。",
+            )
         entry = RemoteModelEntry(
             kind=job.kind,
             relative_path=job.remote_relative_path,
@@ -248,15 +286,16 @@ class ModelPreparationService:
             return current is not None and current.status is ModelTransferStatus.CANCEL_REQUESTED
 
         try:
-            await self._catalog_adapter.download(
-                entry,
-                temp_path,
-                progress_callback=on_progress,
-                process_started_callback=on_started,
-                process_finished_callback=on_finished,
-                cancel_check=cancel_check,
-                timeout_seconds=self._settings.remote_model_download_timeout_seconds,
-            )
+            download_kwargs: dict[str, Any] = {
+                "progress_callback": on_progress,
+                "process_started_callback": on_started,
+                "process_finished_callback": on_finished,
+                "cancel_check": cancel_check,
+                "timeout_seconds": self._settings.remote_model_download_timeout_seconds,
+            }
+            if shutdown_check is not None:
+                download_kwargs["shutdown_check"] = shutdown_check
+            await self._catalog_adapter.download(entry, temp_path, **download_kwargs)
             _verify_file(temp_path, entry)
             local_sha256 = _sha256(temp_path)
             self._assert_contained(final_path, entry.kind)
@@ -493,6 +532,13 @@ def _hash(path: Path, algorithm: str) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+async def _invoke_check(callback: ShutdownCheck) -> bool:
+    result = callback()
+    if hasattr(result, "__await__"):
+        result = await result
+    return bool(result)
 
 
 __all__ = [

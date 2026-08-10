@@ -29,6 +29,8 @@ ProgressCallback = Callable[[ModelTransferProgress], Awaitable[None] | None]
 ProcessStartedCallback = Callable[[int], Awaitable[None] | None]
 ProcessFinishedCallback = Callable[[], Awaitable[None] | None]
 CancelCheck = Callable[[], Awaitable[bool] | bool]
+ShutdownCheck = Callable[[], Awaitable[bool] | bool]
+_REMOTE_CATEGORY_NOT_FOUND = "remote_model_category_not_found"
 
 
 class RemoteModelAdapterError(RuntimeError):
@@ -77,11 +79,16 @@ class RemoteModelCatalogAdapter:
         entries: list[RemoteModelEntry] = []
         try:
             for kind in RemoteModelKind:
-                stdout = await self._run_json(
-                    self.build_list_command(kind),
-                    timeout=self._settings.remote_model_list_timeout_seconds,
-                    error_code=ModelTransferErrorCode.CATALOG_UNAVAILABLE.value,
-                )
+                try:
+                    stdout = await self._run_json(
+                        self.build_list_command(kind),
+                        timeout=self._settings.remote_model_list_timeout_seconds,
+                        error_code=ModelTransferErrorCode.CATALOG_UNAVAILABLE.value,
+                    )
+                except RemoteModelAdapterError as exc:
+                    if exc.code == _REMOTE_CATEGORY_NOT_FOUND:
+                        continue
+                    raise
                 entries.extend(self._parse_entries(kind, stdout))
         except RemoteModelAdapterError:
             raise
@@ -104,6 +111,7 @@ class RemoteModelCatalogAdapter:
         process_started_callback: ProcessStartedCallback | None = None,
         process_finished_callback: ProcessFinishedCallback | None = None,
         cancel_check: CancelCheck | None = None,
+        shutdown_check: ShutdownCheck | None = None,
         timeout_seconds: float | None = None,
     ) -> None:
         command = self.build_download_command(entry, destination)
@@ -121,6 +129,7 @@ class RemoteModelCatalogAdapter:
 
         callback_error: Exception | None = None
         cancelled = False
+        interrupted = False
         timed_out = False
         if process_started_callback is not None:
             try:
@@ -137,18 +146,19 @@ class RemoteModelCatalogAdapter:
         try:
             while stream_tasks or process.returncode is None:
                 if (
+                    shutdown_check is not None
+                    and await _invoke(shutdown_check)
+                    and process.returncode is None
+                ):
+                    interrupted = True
+                    await _terminate_process(process)
+                elif (
                     cancel_check is not None
                     and await _invoke(cancel_check)
                     and process.returncode is None
                 ):
                     cancelled = True
-                    with contextlib.suppress(ProcessLookupError):
-                        process.terminate()
-                    with contextlib.suppress(ProcessLookupError):
-                        await asyncio.wait_for(process.wait(), timeout=5.0)
-                    if process.returncode is None:
-                        process.kill()
-                        await process.wait()
+                    await _terminate_process(process)
                 if (
                     timeout_seconds is not None
                     and asyncio.get_running_loop().time() - started_at > timeout_seconds
@@ -200,6 +210,11 @@ class RemoteModelCatalogAdapter:
                 ModelTransferErrorCode.CANCELLED.value,
                 "model transfer was cancelled",
             )
+        if interrupted:
+            raise RemoteModelAdapterError(
+                ModelTransferErrorCode.APP_RESTART_INTERRUPTED.value,
+                "model transfer was interrupted during application shutdown",
+            )
         if timed_out:
             raise RemoteModelAdapterError(
                 ModelTransferErrorCode.DOWNLOAD_TIMEOUT.value,
@@ -225,13 +240,15 @@ class RemoteModelCatalogAdapter:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, _stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
         except FileNotFoundError as exc:
             raise RemoteModelAdapterError(error_code, "rclone executable was not found") from exc
         except TimeoutError as exc:
             if process is not None:
                 with contextlib.suppress(ProcessLookupError):
                     process.kill()
+                with contextlib.suppress(Exception):
+                    await process.wait()
             raise RemoteModelAdapterError(
                 error_code, "remote model catalog request timed out"
             ) from exc
@@ -240,6 +257,12 @@ class RemoteModelCatalogAdapter:
                 error_code, "remote model catalog request failed"
             ) from exc
         if process.returncode != 0:
+            failure_code = _classify_list_failure(stderr)
+            if failure_code == _REMOTE_CATEGORY_NOT_FOUND:
+                raise RemoteModelAdapterError(
+                    _REMOTE_CATEGORY_NOT_FOUND,
+                    "remote model category was not found",
+                )
             raise RemoteModelAdapterError(error_code, "remote model catalog request failed")
         try:
             payload = json.loads(stdout.decode("utf-8"))
@@ -261,7 +284,9 @@ class RemoteModelCatalogAdapter:
         for item in payload:
             if not isinstance(item, Mapping) or item.get("IsDir") is True:
                 continue
-            raw_name = item.get("Name", item.get("Path"))
+            # rclone's Name is basename-only for nested entries.  Path is the
+            # category-relative identity and must win whenever the backend sent it.
+            raw_name = item.get("Path") if "Path" in item else item.get("Name")
             if not isinstance(raw_name, str):
                 continue
             try:
@@ -269,7 +294,7 @@ class RemoteModelCatalogAdapter:
             except ValueError:
                 logger.warning("unsafe remote model entry ignored kind=%s", kind.value)
                 continue
-            if not is_supported_model_filename(relative):
+            if not is_supported_model_filename(relative, kind):
                 continue
             size = item.get("Size", 0)
             if not isinstance(size, int) or isinstance(size, bool) or size < 0:
@@ -314,6 +339,21 @@ class RemoteModelCatalogAdapter:
         return f"{self._remote_path(kind)}/{relative}"
 
 
+async def _terminate_process(process: asyncio.subprocess.Process) -> None:
+    """Stop a transfer process without allowing a timeout to orphan it."""
+
+    if process.returncode is not None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        process.terminate()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5.0)
+    except TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        await process.wait()
+
+
 async def _invoke(callback: Callable[..., Any], *args: Any) -> Any:
     result = callback(*args)
     if hasattr(result, "__await__"):
@@ -339,6 +379,37 @@ def _parse_modified(value: object) -> datetime | None:
     except ValueError:
         return None
     return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+
+def _classify_list_failure(stderr: bytes) -> str:
+    """Classify rclone output into a stable internal category without exposing it."""
+
+    normalized = stderr.decode("utf-8", errors="replace").casefold()
+    if any(
+        token in normalized
+        for token in (
+            "auth",
+            "unauthorized",
+            "forbidden",
+            "401",
+            "403",
+        )
+    ):
+        return ModelTransferErrorCode.CATALOG_UNAVAILABLE.value
+    if any(
+        token in normalized
+        for token in (
+            "not found",
+            "no such file",
+            "doesn't exist",
+            "does not exist",
+            "directory not found",
+            "file not found",
+            "object not found",
+        )
+    ):
+        return _REMOTE_CATEGORY_NOT_FOUND
+    return ModelTransferErrorCode.CATALOG_UNAVAILABLE.value
 
 
 _PROGRESS_RE = re.compile(r"(?P<percent>\d+(?:\.\d+)?)%")

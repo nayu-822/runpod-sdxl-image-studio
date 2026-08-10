@@ -5,6 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from runpod_sdxl_image_studio.domain.model_transfer import (
+    RemoteModelKind,
+    is_supported_model_filename,
+)
+
 
 @dataclass(frozen=True)
 class UpscalerCatalog:
@@ -22,7 +27,7 @@ class UpscalerCatalog:
             return cls(None)
         found: list[str] = []
         for candidate in root.rglob("*"):
-            if candidate.suffix.lower() not in {".safetensors", ".pth", ".pt", ".bin"}:
+            if not is_supported_model_filename(candidate.name, RemoteModelKind.UPSCALER):
                 continue
             try:
                 resolved = candidate.resolve(strict=True)

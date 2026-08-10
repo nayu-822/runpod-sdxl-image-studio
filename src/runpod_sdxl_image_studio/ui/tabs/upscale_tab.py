@@ -11,6 +11,7 @@ from uuid import UUID
 import gradio as gr
 
 from runpod_sdxl_image_studio.adapters.catalog.upscaler_catalog import UpscalerCatalog
+from runpod_sdxl_image_studio.config import Settings
 from runpod_sdxl_image_studio.domain.upscale import (
     UpscaleMethod,
     UpscaleSettings,
@@ -134,6 +135,26 @@ def build_upscale_tab(
         result,
         comparison,
     )
+
+
+def make_local_upscaler_refresh_handler(
+    settings: Settings,
+) -> Callable[[str | None], tuple[object, str]]:
+    """Refresh the Image Upscale selector after a model-preparation action."""
+
+    def handler(current: str | None) -> tuple[object, str]:
+        catalog = UpscalerCatalog.scan(settings.upscaler_dir)
+        choices = list(catalog.models or ())
+        value = current if current in choices else None
+        if catalog.models is None:
+            message = "upscalerカタログを取得できません。設定ディレクトリを確認してください。"
+        elif not choices:
+            message = "upscalerカタログは取得済みですが、利用可能なモデルがありません。"
+        else:
+            message = f"upscalerカタログ: {len(choices)}件"
+        return gr.Dropdown(choices=choices, value=value), message
+
+    return handler
 
 
 def make_latest_parent_handler(
@@ -468,6 +489,7 @@ def _settings_from_inputs(
 __all__ = [
     "UpscaleTabComponents",
     "build_upscale_tab",
+    "make_local_upscaler_refresh_handler",
     "begin_upscale_enqueue",
     "make_latest_parent_handler",
     "make_latest_parent_selection_handler",

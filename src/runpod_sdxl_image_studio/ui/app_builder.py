@@ -238,6 +238,7 @@ from runpod_sdxl_image_studio.ui.tabs.upscale_tab import (
     begin_upscale_enqueue,
     build_upscale_tab,
     make_latest_parent_selection_handler,
+    make_local_upscaler_refresh_handler,
     make_parent_selection_handler,
     make_upscale_enqueue_details_handler,
     make_upscale_plan_handler,
@@ -358,6 +359,7 @@ def build_app(
         dispatch_queue_repository,
         app_settings,
         catalog=upscale_catalog,
+        catalog_provider=lambda: UpscalerCatalog.scan(app_settings.upscaler_dir),
         metadata_import_repository=metadata_import_repository,
         imported_image_storage=imported_image_storage,
         upscale_settings_repository=upscale_settings_repository,
@@ -392,6 +394,7 @@ def build_app(
             loaded_image_upscale.as_mapping(), loaded_latent_upscale.as_mapping()
         ),
         upscaler_catalog=upscale_catalog,
+        upscaler_catalog_provider=lambda: UpscalerCatalog.scan(app_settings.upscaler_dir),
         metadata_import_repository=metadata_import_repository,
         imported_image_storage=imported_image_storage,
     )
@@ -561,6 +564,18 @@ def build_app(
             drive_sync = build_drive_sync_tab()
         with gr.Tab("モデル準備"):
             model_preparation = build_model_preparation_tab(app_settings.max_loras)
+
+        capability_inputs = [
+            generation.checkpoint,
+            generation.vae,
+            generation.sampler,
+            generation.scheduler,
+            generation.upscaler,
+            generation.lora_editor.state,
+            generation.lora_editor.choices,
+            generation.lora_category_filter,
+        ]
+        capability_outputs = capability_refresh_outputs(generation)
 
         health_handler = make_system_health_handler(
             system_health_service,
@@ -745,6 +760,21 @@ def build_app(
             fn=make_model_jobs_refresh_handler(model_preparation_service),
             outputs=[model_preparation.jobs, model_preparation.status],
             concurrency_limit=1,
+        ).then(
+            fn=make_refresh_handler(
+                comfyui_service,
+                generation,
+                catalog_service,
+                set_phase6_capabilities,
+            ),
+            inputs=capability_inputs,
+            outputs=[system.capability_message, *capability_outputs],
+            concurrency_limit=1,
+        ).then(
+            fn=make_local_upscaler_refresh_handler(app_settings),
+            inputs=[upscale.upscaler_name],
+            outputs=[upscale.upscaler_name, upscale.catalog_message],
+            queue=False,
         )
         model_preparation.cancel_button.click(
             fn=make_model_cancel_handler(model_preparation_service),
@@ -891,17 +921,6 @@ def build_app(
                 queue=False,
             )
 
-        capability_inputs = [
-            generation.checkpoint,
-            generation.vae,
-            generation.sampler,
-            generation.scheduler,
-            generation.upscaler,
-            generation.lora_editor.state,
-            generation.lora_editor.choices,
-            generation.lora_category_filter,
-        ]
-        capability_outputs = capability_refresh_outputs(generation)
         system.connection_button.click(
             fn=make_check_connection_handler(
                 comfyui_service,

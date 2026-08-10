@@ -46,6 +46,7 @@ class ModelTransferWorker:
         self._stop_requested = threading.Event()
         self._wake_requested = threading.Event()
         self._thread: threading.Thread | None = None
+        self._active_job_id: UUID | None = None
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -60,10 +61,18 @@ class ModelTransferWorker:
         self._thread.start()
 
     def stop(self) -> None:
+        """Request a graceful subprocess stop and wait for the worker to observe it."""
+
         self._stop_requested.set()
         self._wake_requested.set()
         if self._thread is not None and self._thread is not threading.current_thread():
-            self._thread.join(timeout=max(1.0, self._settings.drive_sync_lease_seconds))
+            self._thread.join(timeout=max(6.0, self._settings.drive_sync_lease_seconds))
+            if self._thread.is_alive():
+                logger.warning(
+                    "model transfer worker did not stop within the graceful shutdown window "
+                    "active_job_id=%s",
+                    self._active_job_id,
+                )
 
     def wake(self) -> None:
         self._wake_requested.set()
@@ -112,10 +121,15 @@ class ModelTransferWorker:
             return False
         if job is None:
             return False
+        self._active_job_id = job.id
         self._notify_state_changed()
         heartbeat = asyncio.create_task(self._heartbeat(job.id))
         try:
-            await self._service.process_job(job, self.worker_id)
+            await self._service.process_job(
+                job,
+                self.worker_id,
+                shutdown_check=self._stop_requested.is_set,
+            )
         except ModelPreparationServiceError as exc:
             if exc.code == ModelTransferErrorCode.CANCELLED.value:
                 self._mark_cancelled(job)
@@ -134,6 +148,7 @@ class ModelTransferWorker:
             heartbeat.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat
+            self._active_job_id = None
             self._notify_state_changed()
         return True
 

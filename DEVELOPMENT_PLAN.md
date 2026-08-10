@@ -498,7 +498,6 @@ RunPod bootstrap/Docker image、RunPod API、自動Terminate、複数Pod、モ�
 - 自動 caption
 - 画像評価・採否
 - LoRA 作成プロジェクトとのモデル共有
-- GDrive からのモデル取得
 - RunPod API による Pod lifecycle
 - 複数ユーザー対応
 
