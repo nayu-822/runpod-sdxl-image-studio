@@ -6,21 +6,44 @@ import asyncio
 import hashlib
 import threading
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
+from PIL import Image
 from sqlalchemy import create_engine
 
+from runpod_sdxl_image_studio.adapters.catalog.upscaler_catalog import UpscalerCatalog
 from runpod_sdxl_image_studio.adapters.comfyui.models import ComfyUICapabilities
 from runpod_sdxl_image_studio.adapters.database.engine import create_session_factory
 from runpod_sdxl_image_studio.adapters.database.models import Base
+from runpod_sdxl_image_studio.adapters.database.repositories.generation_dispatch_queue_repository import (  # noqa: E501
+    GenerationDispatchQueueRepository,
+)
+from runpod_sdxl_image_studio.adapters.database.repositories.generation_repository import (
+    GenerationArtifactRepository,
+    GenerationCompletionRepository,
+    GenerationRepository,
+)
+from runpod_sdxl_image_studio.adapters.database.repositories.generation_start_repository import (
+    GenerationStartRepository,
+)
 from runpod_sdxl_image_studio.adapters.database.repositories.model_transfer_repository import (
     ModelTransferRepository,
+)
+from runpod_sdxl_image_studio.adapters.database.repositories.upscale_settings_repository import (
+    UpscaleSettingsRepository,
 )
 from runpod_sdxl_image_studio.adapters.rclone.remote_model_catalog import (
     RemoteModelAdapterError,
 )
+from runpod_sdxl_image_studio.adapters.storage.local_storage import LocalStorageAdapter
 from runpod_sdxl_image_studio.config import Settings
+from runpod_sdxl_image_studio.domain.generation import GenerationKind
+from runpod_sdxl_image_studio.domain.generation_artifact import ArtifactType, GenerationArtifact
+from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
+from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
 from runpod_sdxl_image_studio.domain.model_transfer import (
     ModelTransferErrorCode,
     ModelTransferProgress,
@@ -30,13 +53,20 @@ from runpod_sdxl_image_studio.domain.model_transfer import (
     RemoteModelKind,
 )
 from runpod_sdxl_image_studio.domain.system_status import CapabilityRefreshResult
+from runpod_sdxl_image_studio.domain.upscale import (
+    UpscaleMethod,
+    UpscaleSettings,
+    UpscaleSizingMode,
+)
 from runpod_sdxl_image_studio.jobs.model_transfer_worker import ModelTransferWorker
+from runpod_sdxl_image_studio.services.generation_service import GenerationService
 from runpod_sdxl_image_studio.services.model_preparation_service import (
     ModelPreparationService,
 )
+from runpod_sdxl_image_studio.services.upscale_enqueue_service import UpscaleEnqueueService
 
 
-def _fixture(tmp_path: Path, *, visible: bool = True):
+def _fixture(tmp_path: Path, *, visible: bool = True, upscale_nodes: bool = False):
     payload = b"phase-11-integration-model"
     settings = Settings(
         _env_file=None,
@@ -68,7 +98,19 @@ def _fixture(tmp_path: Path, *, visible: bool = True):
         schedulers=(),
         loras=(),
         upscale_models=(entry.relative_path,) if visible else (),
-        available_node_classes=frozenset(),
+        available_node_classes=(
+            frozenset(
+                {
+                    "LoadImage",
+                    "UpscaleModelLoader",
+                    "ImageUpscaleWithModel",
+                    "ImageScale",
+                    "SaveImage",
+                }
+            )
+            if upscale_nodes
+            else frozenset()
+        ),
         warnings=(),
     )
 
@@ -268,4 +310,133 @@ def test_worker_integration_retry_reuses_catalog_and_completes_after_failure(
     assert completed is not None
     assert completed.status is ModelTransferStatus.COMPLETED, completed.error_code
     assert (settings.upscaler_dir / entry.relative_path).read_bytes() == payload
+    engine.dispose()
+
+
+def test_same_session_upscaler_transfer_updates_enqueue_and_generation_preflight(
+    tmp_path: Path,
+) -> None:
+    """A completed transfer is immediately visible to both upscale service boundaries."""
+
+    settings, transfer_repository, transfer_service, adapter, entry, _payload, engine = _fixture(
+        tmp_path, upscale_nodes=True
+    )
+    assert UpscalerCatalog.scan(settings.upscaler_dir).contains(entry.relative_path) is False
+
+    created_at = datetime.now(UTC)
+    parent_id, parent_job_id = uuid4(), uuid4()
+    parent_settings = GenerationSettings(
+        positive_prompt="a cat",
+        negative_prompt="",
+        seed=42,
+        width=64,
+        height=64,
+        steps=1,
+        cfg_scale=1.0,
+        sampler_name="euler",
+        scheduler_name="normal",
+        checkpoint_name="base.safetensors",
+    )
+    parent_snapshot = GenerationSettingsSnapshot.from_settings(parent_settings)
+    factory = create_session_factory(engine)
+    GenerationStartRepository(factory).create_pending(
+        parent_snapshot,
+        generation_id=parent_id,
+        job_id=parent_job_id,
+        kind=GenerationKind.STANDARD,
+        parent_generation_id=None,
+        created_at=created_at,
+    )
+    image_bytes = BytesIO()
+    Image.new("RGB", (64, 64), "white").save(image_bytes, format="PNG")
+    stored = LocalStorageAdapter(settings).store_image(
+        image_bytes.getvalue(), parent_id, created_at
+    )
+    parent_artifact = GenerationArtifact(
+        id=uuid4(),
+        generation_id=parent_id,
+        artifact_type=ArtifactType.IMAGE,
+        local_path=LocalStorageAdapter(settings).relative_path(stored.path),
+        sha256=stored.sha256,
+        size_bytes=stored.size_bytes,
+        width=stored.width,
+        height=stored.height,
+        mime_type=stored.mime_type,
+        created_at=created_at,
+    )
+    GenerationCompletionRepository(factory).complete_generation(
+        parent_id, parent_job_id, parent_artifact, created_at
+    )
+
+    upscale_settings = UpscaleSettings(
+        method=UpscaleMethod.IMAGE,
+        sizing_mode=UpscaleSizingMode.FACTOR,
+        scale_factor=2,
+        upscaler_name=entry.relative_path,
+    )
+    enqueue_service = UpscaleEnqueueService(
+        GenerationRepository(factory),
+        GenerationArtifactRepository(factory),
+        GenerationDispatchQueueRepository(factory),
+        settings,
+        catalog_provider=lambda: UpscalerCatalog.scan(settings.upscaler_dir),
+    )
+
+    transfer_job = transfer_repository.enqueue(entry, entry.relative_path)
+    worker = _worker(transfer_repository, transfer_service, settings)
+    assert asyncio.run(worker.run_once()) is True
+    completed_transfer = transfer_repository.get(transfer_job.id)
+    assert completed_transfer is not None
+    assert completed_transfer.status is ModelTransferStatus.COMPLETED
+    assert adapter.download_calls == 1
+
+    plan = enqueue_service.plan(parent_id, upscale_settings)
+    assert plan.target_width == 128
+    assert plan.target_height == 128
+    queue_item = enqueue_service.enqueue(parent_id, upscale_settings)
+    persisted_upscale = UpscaleSettingsRepository(factory).get_by_generation(
+        queue_item.generation.id
+    )
+    assert persisted_upscale is not None
+
+    async def capability_refresh() -> CapabilityRefreshResult:
+        return CapabilityRefreshResult(
+            True,
+            "ok",
+            ComfyUICapabilities(
+                checkpoints=("base.safetensors",),
+                vaes=(),
+                samplers=("euler",),
+                schedulers=("normal",),
+                loras=(),
+                upscale_models=(entry.relative_path,),
+                available_node_classes=frozenset(
+                    {
+                        "LoadImage",
+                        "UpscaleModelLoader",
+                        "ImageUpscaleWithModel",
+                        "ImageScale",
+                        "SaveImage",
+                    }
+                ),
+                warnings=(),
+            ),
+        )
+
+    generation_service = GenerationService(
+        object(),
+        object(),
+        object(),
+        LocalStorageAdapter(settings),
+        capability_refresh,
+        settings,
+        upscaler_catalog_provider=lambda: UpscalerCatalog.scan(settings.upscaler_dir),
+    )
+    asyncio.run(
+        generation_service._preflight_upscale(  # noqa: SLF001 - final preflight regression boundary
+            persisted_upscale,
+            parent_snapshot,
+        )
+    )
+    assert UpscalerCatalog.scan(settings.upscaler_dir).contains(entry.relative_path) is True
     engine.dispose()

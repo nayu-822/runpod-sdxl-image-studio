@@ -128,83 +128,104 @@ class RemoteModelCatalogAdapter:
             ) from exc
 
         callback_error: Exception | None = None
+        finished_callback_error: Exception | None = None
         cancelled = False
         interrupted = False
         timed_out = False
-        if process_started_callback is not None:
-            try:
-                await _invoke(process_started_callback, process.pid)
-            except Exception as exc:  # noqa: BLE001 - cannot track an unpersisted process
-                callback_error = exc
-                process.kill()
-
+        cleanup_error: Exception | None = None
         stream_tasks: dict[asyncio.Task[bytes], asyncio.StreamReader] = {}
-        for stream in (process.stdout, process.stderr):
-            if stream is not None:
-                stream_tasks[asyncio.create_task(stream.readline())] = stream
-        started_at = asyncio.get_running_loop().time()
         try:
-            while stream_tasks or process.returncode is None:
-                if (
-                    shutdown_check is not None
-                    and await _invoke(shutdown_check)
-                    and process.returncode is None
-                ):
-                    interrupted = True
-                    await _terminate_process(process)
-                elif (
-                    cancel_check is not None
-                    and await _invoke(cancel_check)
-                    and process.returncode is None
-                ):
-                    cancelled = True
-                    await _terminate_process(process)
-                if (
-                    timeout_seconds is not None
-                    and asyncio.get_running_loop().time() - started_at > timeout_seconds
-                    and process.returncode is None
-                ):
-                    timed_out = True
-                    process.kill()
-                    await process.wait()
-                if stream_tasks:
-                    done, _ = await asyncio.wait(
-                        stream_tasks,
-                        timeout=0.25,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    for task in done:
-                        stream = stream_tasks.pop(task, None)
-                        raw_line = task.result()
-                        if raw_line:
-                            progress = _progress_from_line(
-                                raw_line.decode("utf-8", errors="replace"),
-                                entry.size_bytes,
-                            )
-                            if progress is not None and progress_callback is not None:
-                                await _invoke(progress_callback, progress)
-                            if stream is not None:
-                                stream_tasks[asyncio.create_task(stream.readline())] = stream
-                        else:
-                            # An EOF task is intentionally not re-added.
-                            continue
-                elif process.returncode is None:
-                    await process.wait()
+            if process_started_callback is not None:
+                try:
+                    await _invoke(process_started_callback, process.pid)
+                except Exception as exc:  # noqa: BLE001 - cannot track an unpersisted process
+                    callback_error = exc
+
+            if callback_error is None:
+                for stream in (process.stdout, process.stderr):
+                    if stream is not None:
+                        stream_tasks[asyncio.create_task(stream.readline())] = stream
+                started_at = asyncio.get_running_loop().time()
+                while stream_tasks or process.returncode is None:
+                    if (
+                        shutdown_check is not None
+                        and await _invoke(shutdown_check)
+                        and process.returncode is None
+                    ):
+                        interrupted = True
+                        await _terminate_process(process)
+                    elif (
+                        cancel_check is not None
+                        and await _invoke(cancel_check)
+                        and process.returncode is None
+                    ):
+                        cancelled = True
+                        await _terminate_process(process)
+                    if (
+                        timeout_seconds is not None
+                        and asyncio.get_running_loop().time() - started_at > timeout_seconds
+                        and process.returncode is None
+                    ):
+                        timed_out = True
+                        await _terminate_process(process)
+                    if stream_tasks:
+                        done, _ = await asyncio.wait(
+                            stream_tasks,
+                            timeout=0.25,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for task in done:
+                            stream = stream_tasks.pop(task, None)
+                            raw_line = task.result()
+                            if raw_line:
+                                progress = _progress_from_line(
+                                    raw_line.decode("utf-8", errors="replace"),
+                                    entry.size_bytes,
+                                )
+                                if progress is not None and progress_callback is not None:
+                                    await _invoke(progress_callback, progress)
+                                if stream is not None:
+                                    stream_tasks[asyncio.create_task(stream.readline())] = stream
+                            else:
+                                # An EOF task is intentionally not re-added.
+                                continue
+                    elif process.returncode is None:
+                        await process.wait()
         finally:
+            # Any callback, stream, or internal error must still reap rclone before
+            # the PID cleanup callback is allowed to run.
+            if process.returncode is None:
+                try:
+                    await _terminate_process(process)
+                except Exception as exc:  # noqa: BLE001 - preserve cleanup failure safely
+                    cleanup_error = exc
             for task in stream_tasks:
                 task.cancel()
             for task in stream_tasks:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
-            if process_finished_callback is not None:
-                with contextlib.suppress(Exception):
+            if process_finished_callback is not None and process.returncode is not None:
+                try:
                     await _invoke(process_finished_callback)
+                except Exception as exc:  # noqa: BLE001 - report callback failures safely
+                    finished_callback_error = exc
+
+        if cleanup_error is not None and process.returncode is None:
+            raise RemoteModelAdapterError(
+                ModelTransferErrorCode.DOWNLOAD_FAILED.value,
+                "model transfer process could not be stopped",
+            ) from cleanup_error
 
         if callback_error is not None:
             raise RemoteModelAdapterError(
                 ModelTransferErrorCode.PERSISTENCE_FAILED.value,
                 "model transfer process state could not be persisted",
             ) from callback_error
+        if finished_callback_error is not None:
+            raise RemoteModelAdapterError(
+                ModelTransferErrorCode.PERSISTENCE_FAILED.value,
+                "model transfer process state could not be persisted",
+            ) from finished_callback_error
         if cancelled:
             raise RemoteModelAdapterError(
                 ModelTransferErrorCode.CANCELLED.value,

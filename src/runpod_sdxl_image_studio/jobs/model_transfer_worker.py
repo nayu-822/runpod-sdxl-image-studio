@@ -96,7 +96,7 @@ class ModelTransferWorker:
         try:
             interrupted = self._repository.reconcile_interrupted()
             count = self._repository.reconcile_stale()
-            repaired = self._service.reconcile_files()
+            repaired = await self._service.reconcile_files()
             if interrupted or count or repaired:
                 logger.info(
                     "model transfer startup reconciliation interrupted=%s stale=%s repaired=%s",
@@ -109,7 +109,7 @@ class ModelTransferWorker:
             logger.warning("model transfer startup reconciliation failed", exc_info=True)
 
     async def run_once(self) -> bool:
-        if self._stop_requested.is_set():
+        if self._stop_requested.is_set() or not self._settings.remote_model_enabled:
             return False
         try:
             job = self._repository.claim_next(

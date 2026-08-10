@@ -184,8 +184,8 @@ class ModelPreparationService:
         existing_sha = _matching_local_sha256(local_path, entry)
         if existing_sha is not None:
             try:
-                job = self._repository.enqueue(entry, local_relative)
                 await self._refresh_and_check_visibility(entry)
+                job = self._repository.enqueue(entry, local_relative)
             except ModelPreparationServiceError:
                 raise
             except ModelTransferRepositoryError as exc:
@@ -432,7 +432,7 @@ class ModelPreparationService:
             self._notify_state_changed()
         return count
 
-    def reconcile_files(self) -> int:
+    async def reconcile_files(self) -> int:
         repaired = 0
         for job in self.list_jobs(500):
             if job.status is ModelTransferStatus.COMPLETED:
@@ -452,6 +452,7 @@ class ModelPreparationService:
             try:
                 _verify_file(path, entry)
                 local_sha256 = _sha256(path)
+                await self._refresh_and_check_visibility(entry)
                 repaired_job = self._repository.repair_completed(job.id, local_sha256)
                 if repaired_job.status is ModelTransferStatus.COMPLETED:
                     repaired += 1

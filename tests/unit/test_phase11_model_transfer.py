@@ -31,6 +31,7 @@ from runpod_sdxl_image_studio.domain.model_transfer import (
     RemoteModelKind,
 )
 from runpod_sdxl_image_studio.domain.system_status import CapabilityRefreshResult
+from runpod_sdxl_image_studio.jobs.model_transfer_worker import ModelTransferWorker
 from runpod_sdxl_image_studio.services.model_preparation_service import (
     ModelPreparationService,
     ModelPreparationServiceError,
@@ -56,7 +57,7 @@ def _settings(tmp_path: Path) -> Settings:
     )
 
 
-def _fixture(tmp_path: Path, *, visible: bool = True):
+def _fixture(tmp_path: Path, *, visible: bool = True, capability_available: bool = True):
     settings = _settings(tmp_path)
     engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
@@ -84,7 +85,11 @@ def _fixture(tmp_path: Path, *, visible: bool = True):
     )
 
     async def refresh() -> CapabilityRefreshResult:
-        return CapabilityRefreshResult(True, "ok", capabilities)
+        return CapabilityRefreshResult(
+            capability_available,
+            "ok" if capability_available else "unavailable",
+            capabilities if capability_available else None,
+        )
 
     service = ModelPreparationService(repository, adapter, settings, refresh)
     return settings, repository, adapter, service, entry, payload
@@ -124,6 +129,14 @@ class FakeModelAdapter:
 class _EofStream:
     async def readline(self) -> bytes:
         return b""
+
+
+class _ProgressStream:
+    def __init__(self) -> None:
+        self._lines = iter((b'{"bytes": 1, "totalBytes": 1}', b""))
+
+    async def readline(self) -> bytes:
+        return next(self._lines)
 
 
 class _NonTerminatingProcess:
@@ -311,6 +324,84 @@ def test_remote_download_shutdown_marks_transfer_interrupted(
     assert process.returncode is not None
 
 
+def test_remote_download_reaps_process_when_cancel_check_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _settings(tmp_path)
+    adapter = RemoteModelCatalogAdapter(settings)
+    entry = RemoteModelEntry(RemoteModelKind.UPSCALER, "4x.pth", "4x.pth", 1)
+    process = _NonTerminatingProcess()
+    finished_returncodes: list[int | None] = []
+
+    async def spawn(*args, **kwargs):
+        del args, kwargs
+        return process
+
+    async def cancel_check() -> bool:
+        raise RuntimeError("repository read failed")
+
+    async def process_finished() -> None:
+        finished_returncodes.append(process.returncode)
+
+    monkeypatch.setattr(
+        "runpod_sdxl_image_studio.adapters.rclone.remote_model_catalog.asyncio.create_subprocess_exec",
+        spawn,
+    )
+
+    with pytest.raises(RuntimeError, match="repository read failed"):
+        asyncio.run(
+            adapter.download(
+                entry,
+                tmp_path / "4x.pth",
+                cancel_check=cancel_check,
+                process_finished_callback=process_finished,
+            )
+        )
+
+    assert process.terminate_called is True
+    assert process.kill_called is True
+    assert process.returncode is not None
+    assert process.wait_calls == 2
+    assert finished_returncodes == [process.returncode]
+
+
+def test_remote_download_reaps_process_when_progress_callback_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _settings(tmp_path)
+    adapter = RemoteModelCatalogAdapter(settings)
+    entry = RemoteModelEntry(RemoteModelKind.UPSCALER, "4x.pth", "4x.pth", 1)
+    process = _NonTerminatingProcess()
+    process.stdout = _ProgressStream()
+
+    async def spawn(*args, **kwargs):
+        del args, kwargs
+        return process
+
+    def progress_callback(progress: ModelTransferProgress) -> None:
+        del progress
+        raise RuntimeError("progress persistence failed")
+
+    monkeypatch.setattr(
+        "runpod_sdxl_image_studio.adapters.rclone.remote_model_catalog.asyncio.create_subprocess_exec",
+        spawn,
+    )
+
+    with pytest.raises(RuntimeError, match="progress persistence failed"):
+        asyncio.run(
+            adapter.download(
+                entry,
+                tmp_path / "4x.pth",
+                progress_callback=progress_callback,
+            )
+        )
+
+    assert process.terminate_called is True
+    assert process.kill_called is True
+    assert process.returncode is not None
+    assert process.wait_calls == 2
+
+
 def test_upscale_catalog_provider_reads_models_after_service_creation(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     current = [UpscalerCatalog(())]
@@ -407,9 +498,10 @@ def test_local_matching_model_requires_comfyui_visibility(tmp_path: Path) -> Non
 
     assert caught.value.code == ModelTransferErrorCode.MODEL_NOT_VISIBLE.value
     assert adapter.download_calls == 0
-    prepared = repository.list_jobs()
-    assert len(prepared) == 1
-    assert prepared[0].status is ModelTransferStatus.PENDING
+    assert repository.list_jobs() == ()
+    worker = ModelTransferWorker(repository, service, settings, worker_id="worker-1")
+    assert asyncio.run(worker.run_once()) is False
+    assert adapter.download_calls == 0
 
 
 def test_prepare_selected_validates_all_remote_entries_before_enqueue(tmp_path: Path) -> None:
@@ -485,6 +577,113 @@ def test_reconciliation_can_repair_valid_file_after_db_completion_gap(tmp_path: 
     assert repaired.status is ModelTransferStatus.COMPLETED
     assert repaired.local_sha256 == hashlib.sha256(payload).hexdigest()
     assert final_path.read_bytes() == payload
+
+
+def test_reconciliation_repairs_valid_file_only_after_comfyui_visibility(
+    tmp_path: Path,
+) -> None:
+    settings, repository, _adapter, service, entry, payload = _fixture(tmp_path, visible=True)
+    final_path = settings.checkpoint_dir / entry.relative_path
+    final_path.parent.mkdir(parents=True)
+    final_path.write_bytes(payload)
+    job = repository.enqueue(entry, entry.relative_path)
+    claimed = repository.claim_next("worker-1", 120)
+    assert claimed is not None
+
+    assert asyncio.run(service.reconcile_files()) == 1
+    repaired = repository.get(job.id)
+    assert repaired is not None
+    assert repaired.status is ModelTransferStatus.COMPLETED
+    assert final_path.read_bytes() == payload
+
+
+def test_reconciliation_does_not_complete_when_comfyui_model_is_invisible(
+    tmp_path: Path,
+) -> None:
+    settings, repository, _adapter, service, entry, payload = _fixture(tmp_path, visible=False)
+    final_path = settings.checkpoint_dir / entry.relative_path
+    final_path.parent.mkdir(parents=True)
+    final_path.write_bytes(payload)
+    job = repository.enqueue(entry, entry.relative_path)
+    claimed = repository.claim_next("worker-1", 120)
+    assert claimed is not None
+
+    assert asyncio.run(service.reconcile_files()) == 0
+    unrepaired = repository.get(job.id)
+    assert unrepaired is not None
+    assert unrepaired.status is ModelTransferStatus.DOWNLOADING
+    assert final_path.read_bytes() == payload
+
+
+def test_reconciliation_keeps_file_and_state_when_comfyui_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    settings, repository, _adapter, service, entry, payload = _fixture(
+        tmp_path, capability_available=False
+    )
+    final_path = settings.checkpoint_dir / entry.relative_path
+    final_path.parent.mkdir(parents=True)
+    final_path.write_bytes(payload)
+    job = repository.enqueue(entry, entry.relative_path)
+    claimed = repository.claim_next("worker-1", 120)
+    assert claimed is not None
+
+    assert asyncio.run(service.reconcile_files()) == 0
+    unrepaired = repository.get(job.id)
+    assert unrepaired is not None
+    assert unrepaired.status is ModelTransferStatus.DOWNLOADING
+    assert final_path.read_bytes() == payload
+
+
+@pytest.mark.parametrize(
+    ("visible", "capability_available", "expected_status"),
+    [
+        (True, True, ModelTransferStatus.COMPLETED),
+        (False, True, ModelTransferStatus.FAILED),
+        (True, False, ModelTransferStatus.FAILED),
+    ],
+)
+def test_worker_startup_reconciliation_requires_comfyui_visibility(
+    tmp_path: Path,
+    visible: bool,
+    capability_available: bool,
+    expected_status: ModelTransferStatus,
+) -> None:
+    settings, repository, _adapter, service, entry, payload = _fixture(
+        tmp_path, visible=visible, capability_available=capability_available
+    )
+    final_path = settings.checkpoint_dir / entry.relative_path
+    final_path.parent.mkdir(parents=True)
+    final_path.write_bytes(payload)
+    job = repository.enqueue(entry, entry.relative_path)
+    claimed = repository.claim_next("old-worker", 120)
+    assert claimed is not None
+
+    worker = ModelTransferWorker(repository, service, settings, worker_id="new-worker")
+    asyncio.run(worker.startup_reconcile())
+
+    reconciled = repository.get(job.id)
+    assert reconciled is not None
+    assert reconciled.status is expected_status
+    assert final_path.read_bytes() == payload
+
+
+def test_disabled_remote_model_worker_leaves_pending_job_untouched(tmp_path: Path) -> None:
+    settings, repository, adapter, service, entry, _payload = _fixture(tmp_path)
+    disabled_settings = settings.model_copy(update={"remote_model_enabled": False})
+    job = repository.enqueue(entry, entry.relative_path)
+    worker = ModelTransferWorker(
+        repository,
+        service,
+        disabled_settings,
+        worker_id="disabled-worker",
+    )
+
+    assert asyncio.run(worker.run_once()) is False
+    pending = repository.get(job.id)
+    assert pending is not None
+    assert pending.status is ModelTransferStatus.PENDING
+    assert adapter.download_calls == 0
 
 
 def test_model_preparation_is_a_separate_mobile_ready_tab() -> None:
