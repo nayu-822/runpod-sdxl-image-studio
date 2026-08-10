@@ -98,6 +98,23 @@ async def test_delete_timeout_is_ambiguous_without_a_second_delete() -> None:
 
 
 @pytest.mark.asyncio
+async def test_connection_failure_is_unavailable_without_raw_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("secret connection detail", request=request)
+
+    async with _client(handler) as client:
+        adapter = RunPodLifecycleAdapter(
+            client=client,
+            env={"RUNPOD_POD_ID": "pod-123", "RUNPOD_API_KEY": "secret"},
+        )
+        with pytest.raises(RunPodTerminateError) as raised:
+            await adapter.terminate_self()
+    assert raised.value.code == "runpod_terminate_unavailable"
+    assert "secret connection detail" not in str(raised.value)
+    assert "secret" not in str(raised.value)
+
+
+@pytest.mark.asyncio
 async def test_missing_identity_fails_closed_without_http() -> None:
     async with _client(lambda request: httpx.Response(204)) as client:
         adapter = RunPodLifecycleAdapter(client=client, env={})

@@ -92,12 +92,17 @@ class FakeModelRepository:
 
 
 class FakeDriveRepository:
-    def __init__(self, record: object) -> None:
+    def __init__(
+        self,
+        record: object,
+        counts: dict[DriveSyncStatus, int] | None = None,
+    ) -> None:
         self.record = record
+        self.counts = counts or {DriveSyncStatus.SYNCED: 1}
         self.manifest_jobs: list[object] = []
 
     def status_counts(self) -> dict[DriveSyncStatus, int]:
-        return {DriveSyncStatus.SYNCED: 1}
+        return self.counts
 
     def get_by_generation(self, generation_id: object) -> object:
         return self.record
@@ -114,19 +119,32 @@ class FakeDriveRepository:
 
 
 class FakeStateSync:
-    enabled = True
-    backup_in_progress = False
-    is_clean = True
-    has_latest_remote_backup = True
-
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        status: StateSyncStatus = StateSyncStatus.SYNCED,
+        dirty_on_backup: bool = False,
+        fail_on_backup: bool = False,
+    ) -> None:
+        self.enabled = True
+        self.backup_in_progress = False
+        self.is_clean = True
+        self.has_latest_remote_backup = True
+        self.status = status
+        self.dirty_on_backup = dirty_on_backup
+        self.fail_on_backup = fail_on_backup
         self.backup_calls = 0
 
     def get_status(self) -> StateSyncView:
-        return StateSyncView(StateSyncStatus.SYNCED)
+        return StateSyncView(self.status)
 
     async def backup(self, *, wait_for_clean: bool = True) -> StateSyncView:
         self.backup_calls += 1
+        if self.dirty_on_backup:
+            self.is_clean = False
+        if self.fail_on_backup:
+            self.status = StateSyncStatus.FAILED
+            self.is_clean = False
         return self.get_status()
 
 
@@ -249,6 +267,49 @@ async def test_cancelled_generation_blocks_termination_readiness() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("boundary", "reason"),
+    [
+        ("comfyui", "comfyui_queue_active"),
+        ("model_transfer", "model_transfer_active"),
+        ("drive_sync", "drive_sync_active"),
+        ("manifest", "manifest_active"),
+        ("state_backup", "state_backup_dirty"),
+    ],
+)
+async def test_each_readiness_boundary_fails_closed(
+    boundary: str,
+    reason: str,
+) -> None:
+    service, runpod, _ = _service()
+    if boundary == "comfyui":
+
+        async def active_comfy_queue() -> ComfyUIQueueStatus:
+            return ComfyUIQueueStatus(("prompt",), ())
+
+        service._comfyui_queue_provider = active_comfy_queue  # type: ignore[attr-defined]
+    elif boundary == "model_transfer":
+        service._model_transfer_repository.counts = {  # type: ignore[attr-defined]
+            ModelTransferStatus.DOWNLOADING: 1
+        }
+    elif boundary == "drive_sync":
+        service._drive_sync_repository.counts = {  # type: ignore[attr-defined]
+            DriveSyncStatus.SYNCING: 1
+        }
+    elif boundary == "manifest":
+        service._drive_sync_repository.manifest_jobs.append(  # type: ignore[attr-defined]
+            SimpleNamespace(status=DriveSyncStatus.SYNCING)
+        )
+    else:
+        service._state_sync_service.is_clean = False  # type: ignore[attr-defined]
+    service.arm_on_generation_enqueue()
+    readiness = await service.check_readiness()
+    assert not readiness.is_safe
+    assert reason in readiness.block_reasons
+    assert runpod.calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("job_status", "submission_state"),
     [
         (GenerationStatus.RUNNING, SubmissionState.SUBMITTED),
@@ -348,6 +409,26 @@ async def test_auto_terminate_waits_for_startup_restore_gate() -> None:
         startup_restore_ready=lambda: startup_ready,
     )
     assert await coordinator.run_once() is None
+    assert runpod.calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["dirty", "failed"])
+async def test_final_backup_race_or_failure_aborts_termination(mode: str) -> None:
+    service, runpod, state_sync = _service()
+    state_sync.dirty_on_backup = mode == "dirty"
+    state_sync.fail_on_backup = mode == "failed"
+    service.arm_on_generation_enqueue()
+    coordinator = AutoTerminateCoordinator(
+        service,
+        SimpleNamespace(
+            auto_terminate_grace_seconds=0.0,
+            auto_terminate_check_interval_seconds=1.0,
+        ),
+    )
+    await coordinator.run_once()
+    await coordinator.run_once()
+    assert state_sync.backup_calls == 1
     assert runpod.calls == 0
 
 
