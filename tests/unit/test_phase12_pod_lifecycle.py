@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -13,17 +15,35 @@ from runpod_sdxl_image_studio.adapters.runpod.pod_lifecycle import (
     RunPodTerminateResult,
     RunPodTerminateStatus,
 )
+from runpod_sdxl_image_studio.config import Settings
 from runpod_sdxl_image_studio.domain.drive_sync import DriveManifestState, DriveSyncStatus
 from runpod_sdxl_image_studio.domain.generation import Generation, GenerationKind, GenerationStatus
 from runpod_sdxl_image_studio.domain.generation_queue import SubmissionState
+from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
 from runpod_sdxl_image_studio.domain.model_transfer import ModelTransferStatus
 from runpod_sdxl_image_studio.domain.pod_lifecycle import AutoTerminateState, PodLifecycleSession
 from runpod_sdxl_image_studio.domain.state_sync import StateSyncStatus, StateSyncView
 from runpod_sdxl_image_studio.jobs.auto_terminate_worker import AutoTerminateCoordinator
+from runpod_sdxl_image_studio.services.drive_sync_service import (
+    DriveSyncService,
+    DriveSyncServiceError,
+)
+from runpod_sdxl_image_studio.services.generation_queue_service import (
+    GenerationQueueService,
+    GenerationQueueServiceError,
+)
+from runpod_sdxl_image_studio.services.model_preparation_service import (
+    ModelPreparationService,
+    ModelPreparationServiceError,
+)
 from runpod_sdxl_image_studio.services.pod_lifecycle_service import (
     PodLifecycleService,
     PodLifecycleWorkBlockedError,
+)
+from runpod_sdxl_image_studio.services.upscale_enqueue_service import (
+    UpscaleEnqueueError,
+    UpscaleEnqueueService,
 )
 
 
@@ -96,9 +116,11 @@ class FakeDriveRepository:
         self,
         record: object,
         counts: dict[DriveSyncStatus, int] | None = None,
+        manifest_state: DriveManifestState = DriveManifestState.SYNCED,
     ) -> None:
         self.record = record
         self.counts = counts or {DriveSyncStatus.SYNCED: 1}
+        self.manifest_state = manifest_state
         self.manifest_jobs: list[object] = []
 
     def status_counts(self) -> dict[DriveSyncStatus, int]:
@@ -115,7 +137,7 @@ class FakeDriveRepository:
         local_date: str,
         destination: object,
     ) -> DriveManifestState:
-        return DriveManifestState.SYNCED
+        return self.manifest_state
 
 
 class FakeStateSync:
@@ -134,6 +156,7 @@ class FakeStateSync:
         self.dirty_on_backup = dirty_on_backup
         self.fail_on_backup = fail_on_backup
         self.backup_calls = 0
+        self.mark_dirty_calls = 0
 
     def get_status(self) -> StateSyncView:
         return StateSyncView(self.status)
@@ -146,6 +169,10 @@ class FakeStateSync:
             self.status = StateSyncStatus.FAILED
             self.is_clean = False
         return self.get_status()
+
+    def mark_dirty(self) -> None:
+        self.mark_dirty_calls += 1
+        self.is_clean = False
 
 
 class FakeRunPod:
@@ -160,6 +187,35 @@ class FakeRunPod:
     async def terminate_self(self) -> RunPodTerminateResult:
         self.calls += 1
         return RunPodTerminateResult(RunPodTerminateStatus.TERMINATED)
+
+
+class BlockingDispatchRepository:
+    def __init__(self, generation: Generation | None = None) -> None:
+        self.persisted = 0
+        self.batch_persisted = 0
+        self.item: object | None = None
+        self.generation = generation
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def enqueue_single(self, snapshot: object, **_: object) -> object:
+        self.persisted += 1
+        self.entered.set()
+        self.release.wait(timeout=2.0)
+        self.item = SimpleNamespace(
+            entry=SimpleNamespace(sequence=1),
+            generation=self.generation,
+            job=SimpleNamespace(status=GenerationStatus.PENDING),
+        )
+        return self.item
+
+    def enqueue_batch(self, snapshots: object, **_: object) -> object:
+        del snapshots
+        self.batch_persisted += 1
+        raise AssertionError("batch repository must not be called after DRAINING")
+
+    def list_queue(self, **_: object) -> tuple[object, ...]:
+        return (self.item,) if self.item is not None else ()
 
 
 def _generation(status: GenerationStatus = GenerationStatus.COMPLETED) -> Generation:
@@ -201,8 +257,26 @@ def _generation(status: GenerationStatus = GenerationStatus.COMPLETED) -> Genera
     )
 
 
+def _settings() -> GenerationSettings:
+    return GenerationSettings(
+        positive_prompt="p",
+        negative_prompt="n",
+        seed=1,
+        width=1024,
+        height=1024,
+        steps=20,
+        cfg_scale=5.0,
+        sampler_name="euler",
+        scheduler_name="normal",
+        checkpoint_name="model.safetensors",
+    )
+
+
 def _service(
     generations: tuple[Generation, ...] = (),
+    *,
+    state_changed_callback: object | None = None,
+    state_sync: FakeStateSync | None = None,
 ) -> tuple[
     PodLifecycleService,
     FakeRunPod,
@@ -215,7 +289,7 @@ def _service(
         remote_name="gdrive",
         remote_base_path="studio",
     )
-    state_sync = FakeStateSync()
+    state_sync = state_sync or FakeStateSync()
     runpod = FakeRunPod()
     service = PodLifecycleService(
         FakeLifecycleRepository(),
@@ -228,6 +302,7 @@ def _service(
         settings=SimpleNamespace(auto_terminate_enabled=True),
         comfyui_queue_provider=lambda: _empty_comfy_queue(),
         now_factory=lambda: datetime(2026, 8, 10, 12, tzinfo=UTC),
+        state_changed_callback=state_changed_callback,
     )
     service.initialize_session()
     return service, runpod, state_sync
@@ -263,6 +338,30 @@ async def test_cancelled_generation_blocks_termination_readiness() -> None:
     readiness = await service.check_readiness()
     assert not readiness.is_safe
     assert "generation_cancelled" in readiness.block_reasons
+
+
+@pytest.mark.asyncio
+async def test_historical_failed_manifest_does_not_block_after_latest_sync() -> None:
+    service, runpod, _ = _service()
+    service._drive_sync_repository.manifest_jobs.append(  # type: ignore[attr-defined]
+        SimpleNamespace(status=DriveSyncStatus.FAILED)
+    )
+    service.arm_on_generation_enqueue()
+    readiness = await service.check_readiness()
+    assert readiness.is_safe
+    assert "manifest_failed" not in readiness.block_reasons
+    assert runpod.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_current_required_failed_manifest_still_blocks_readiness() -> None:
+    service, runpod, _ = _service()
+    service._drive_sync_repository.manifest_state = DriveManifestState.FAILED  # type: ignore[attr-defined]
+    service.arm_on_generation_enqueue()
+    readiness = await service.check_readiness()
+    assert not readiness.is_safe
+    assert "manifest_failed" in readiness.block_reasons
+    assert runpod.calls == 0
 
 
 @pytest.mark.asyncio
@@ -393,6 +492,217 @@ async def test_grace_and_final_backup_terminate_once() -> None:
     # A second worker tick cannot issue another DELETE after REQUESTING.
     await coordinator.run_once()
     assert runpod.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_terminate_uses_same_drain_backup_path() -> None:
+    service, runpod, state_sync = _service()
+    service.arm_on_generation_enqueue()
+    readiness = await service.drain_backup_and_terminate(require_armed=False)
+    assert readiness.is_safe
+    assert state_sync.backup_calls == 1
+    assert runpod.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("grace_seconds", [0.0, 15.0])
+async def test_lifecycle_transient_states_do_not_mark_state_sync_dirty(
+    grace_seconds: float,
+) -> None:
+    state_sync = FakeStateSync()
+    service, runpod, _ = _service(
+        state_changed_callback=state_sync.mark_dirty,
+        state_sync=state_sync,
+    )
+    service.arm_on_generation_enqueue()
+    coordinator = AutoTerminateCoordinator(
+        service,
+        SimpleNamespace(
+            auto_terminate_grace_seconds=grace_seconds,
+            auto_terminate_check_interval_seconds=1.0,
+        ),
+        now_factory=lambda: datetime(2026, 8, 10, 12, tzinfo=UTC),
+    )
+    await coordinator.run_once()
+    await coordinator.run_once()
+    assert state_sync.mark_dirty_calls == 0
+    assert state_sync.is_clean
+    if grace_seconds == 0.0:
+        assert runpod.calls == 1
+    else:
+        assert runpod.calls == 0
+
+
+def test_enqueue_admission_wins_race_with_draining_without_losing_generation() -> None:
+    lifecycle, _, _ = _service()
+    repository = BlockingDispatchRepository()
+    queue = GenerationQueueService(
+        repository,
+        Settings(_env_file=None),
+        lifecycle_gate=lifecycle,
+        generation_enqueued_callback=lifecycle.arm_on_generation_enqueue,
+    )
+    errors: list[BaseException] = []
+
+    def enqueue() -> None:
+        try:
+            queue.enqueue(_settings())
+        except BaseException as exc:  # pragma: no cover - assertion below reports races
+            errors.append(exc)
+
+    enqueue_thread = threading.Thread(
+        target=enqueue,
+        daemon=True,
+    )
+    enqueue_thread.start()
+    assert repository.entered.wait(timeout=2.0)
+
+    drain_thread = threading.Thread(target=lifecycle.begin_draining, daemon=True)
+    drain_thread.start()
+    assert drain_thread.is_alive()
+    repository.release.set()
+    enqueue_thread.join(timeout=2.0)
+    drain_thread.join(timeout=2.0)
+    assert not errors
+    assert repository.persisted == 1
+    assert lifecycle.session is not None
+    assert lifecycle.session.status is AutoTerminateState.DRAINING
+
+
+def test_draining_wins_before_enqueue_and_repository_is_not_called() -> None:
+    lifecycle, _, _ = _service()
+    repository = BlockingDispatchRepository()
+    queue = GenerationQueueService(
+        repository,
+        Settings(_env_file=None),
+        lifecycle_gate=lifecycle,
+        generation_enqueued_callback=lifecycle.arm_on_generation_enqueue,
+    )
+    lifecycle.begin_draining()
+    with pytest.raises(GenerationQueueServiceError):
+        queue.enqueue(_settings())
+    assert repository.persisted == 0
+
+
+def test_batch_enqueue_is_rejected_before_repository_after_draining() -> None:
+    lifecycle, _, _ = _service()
+    repository = BlockingDispatchRepository()
+    queue = GenerationQueueService(
+        repository,
+        Settings(_env_file=None),
+        lifecycle_gate=lifecycle,
+    )
+    lifecycle.begin_draining()
+
+    with pytest.raises(GenerationQueueServiceError):
+        queue.enqueue_batch(
+            _settings(),
+            count=2,
+            seed_strategy="sequential",
+            start_seed=1,
+            seed_step=1,
+            name="blocked batch",
+        )
+
+    assert repository.batch_persisted == 0
+
+
+def test_upscale_enqueue_is_rejected_before_source_lookup_after_draining() -> None:
+    lifecycle, _, _ = _service()
+    service = UpscaleEnqueueService(
+        object(),
+        object(),
+        object(),
+        Settings(_env_file=None),
+        work_gate=lifecycle,
+    )
+    lifecycle.begin_draining()
+
+    with pytest.raises(UpscaleEnqueueError) as error:
+        service.enqueue(uuid4(), object())  # type: ignore[arg-type]
+
+    assert error.value.code == "pod_lifecycle_draining"
+
+
+@pytest.mark.asyncio
+async def test_model_preparation_is_rejected_before_catalog_lookup_after_draining() -> None:
+    lifecycle, _, _ = _service()
+    service = ModelPreparationService(
+        object(),
+        object(),
+        Settings(_env_file=None, remote_model_enabled=True, rclone_remote="drive"),
+        lambda: None,  # type: ignore[arg-type]
+        work_gate=lifecycle,
+    )
+    lifecycle.begin_draining()
+
+    with pytest.raises(ModelPreparationServiceError) as error:
+        await service.prepare_selected("checkpoints/model.safetensors", None, (), None)
+
+    assert error.value.code == "pod_lifecycle_draining"
+
+
+def test_drive_manifest_rebuild_is_rejected_before_repository_after_draining() -> None:
+    lifecycle, _, _ = _service()
+    service = DriveSyncService(
+        object(),
+        object(),
+        object(),
+        Settings(_env_file=None, rclone_remote="drive"),
+        adapter=object(),
+        work_gate=lifecycle,
+    )
+    lifecycle.begin_draining()
+
+    with pytest.raises(DriveSyncServiceError) as error:
+        service.enqueue_manifest_rebuild("2026-08-10")
+
+    assert error.value.code == "pod_lifecycle_draining"
+
+
+def test_manual_terminate_waits_for_enqueue_admission_and_aborts_on_pending_generation() -> None:
+    pending = _generation(GenerationStatus.PENDING)
+    lifecycle, runpod, _ = _service((pending,))
+    repository = BlockingDispatchRepository(pending)
+    queue = GenerationQueueService(
+        repository,
+        Settings(_env_file=None),
+        lifecycle_gate=lifecycle,
+        generation_enqueued_callback=lifecycle.arm_on_generation_enqueue,
+    )
+    enqueue_errors: list[BaseException] = []
+    terminate_errors: list[BaseException] = []
+    terminate_started = threading.Event()
+
+    def enqueue() -> None:
+        try:
+            queue.enqueue(_settings())
+        except BaseException as exc:  # pragma: no cover - assertion below reports races
+            enqueue_errors.append(exc)
+
+    def terminate() -> None:
+        terminate_started.set()
+        try:
+            asyncio.run(lifecycle.drain_backup_and_terminate())
+        except BaseException as exc:  # pragma: no cover - assertion below reports races
+            terminate_errors.append(exc)
+
+    enqueue_thread = threading.Thread(target=enqueue, daemon=True)
+    terminate_thread = threading.Thread(target=terminate, daemon=True)
+    enqueue_thread.start()
+    assert repository.entered.wait(timeout=2.0)
+    terminate_thread.start()
+    assert terminate_started.wait(timeout=2.0)
+    repository.release.set()
+    enqueue_thread.join(timeout=2.0)
+    terminate_thread.join(timeout=2.0)
+
+    assert not enqueue_errors
+    assert terminate_errors
+    assert repository.persisted == 1
+    assert runpod.calls == 0
+    assert lifecycle.session is not None
+    assert lifecycle.session.status is AutoTerminateState.ARMED
 
 
 @pytest.mark.asyncio

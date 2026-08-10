@@ -75,26 +75,10 @@ class AutoTerminateCoordinator:
             return readiness
 
         try:
-            self._service.begin_draining()
-            final_readiness = await self._service.check_readiness()
-            self.last_readiness = final_readiness
-            if not final_readiness.is_safe:
-                self._ready_since = None
-                self._service.abort_draining()
-                return final_readiness
-
-            # This is an explicit final flush, not the Phase 10 debounce timer.
-            await self._service.final_state_backup()
-            final_readiness = await self._service.check_readiness()
-            self.last_readiness = final_readiness
-            if not final_readiness.is_safe:
-                self._ready_since = None
-                self._service.abort_draining()
-                return final_readiness
-            await self._service.request_terminate(
-                readiness=final_readiness,
+            final_readiness = await self._service.drain_backup_and_terminate(
                 require_armed=True,
             )
+            self.last_readiness = final_readiness
             return final_readiness
         except PodLifecycleError:
             self._ready_since = None

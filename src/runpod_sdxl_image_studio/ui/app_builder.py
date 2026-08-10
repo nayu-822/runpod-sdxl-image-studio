@@ -250,6 +250,7 @@ from runpod_sdxl_image_studio.ui.tabs.system_tab import (
     make_pod_lifecycle_terminate_handler,
     make_pod_lifecycle_toggle_handler,
     make_refresh_handler,
+    make_startup_restore_handler,
     make_state_backup_handler,
     make_system_health_handler,
     size_preset_values,
@@ -375,7 +376,6 @@ def build_app(
         RunPodLifecycleAdapter(),
         settings=app_settings,
         comfyui_queue_provider=client.get_queue_status,
-        state_changed_callback=state_sync_service.mark_dirty,
     )
     lifecycle_service.initialize_session()
     catalog_service = LoraCatalogService(
@@ -573,6 +573,7 @@ def build_app(
         form_state_service,
         model_preparation_service,
         app_settings,
+        capability_refresh=comfyui_service.refresh_capabilities,
     )
     auto_terminate_runtime = AutoTerminateRuntime(
         AutoTerminateCoordinator(
@@ -599,55 +600,6 @@ def build_app(
         queue_service,
         history_service,
     )
-
-    def restore_form_state_handler(
-        checkpoint_choices: object,
-        vae_choices: object,
-        sampler_choices: object,
-        scheduler_choices: object,
-        upscaler_choices: object,
-        lora_choices: object,
-    ) -> tuple[object, ...]:
-        if not app_settings.restore_last_settings_on_startup:
-            return tuple(gr.skip() for _ in range(15))
-        restored = form_state_service.restore()
-        snapshot = restored.snapshot
-        if snapshot is None:
-            return tuple(gr.skip() for _ in range(15))
-
-        def available(value: str | None, choices: object) -> str | None:
-            if value is None:
-                return None
-            if isinstance(choices, (list, tuple, set, frozenset)):
-                return value if value in choices else None
-            return None
-
-        lora_rows = [
-            {
-                "row_id": f"restored-{index}",
-                "lora_name": item.name,
-                "model_strength": item.model_strength,
-                "clip_strength": item.clip_strength,
-            }
-            for index, item in enumerate(snapshot.loras)
-        ]
-        return (
-            snapshot.positive_prompt,
-            snapshot.negative_prompt,
-            snapshot.ui_seed_mode,
-            snapshot.seed,
-            snapshot.width,
-            snapshot.height,
-            snapshot.steps,
-            snapshot.cfg_scale,
-            available(snapshot.checkpoint_name, checkpoint_choices),
-            available(snapshot.sampler_name, sampler_choices),
-            available(snapshot.scheduler_name, scheduler_choices),
-            available(snapshot.vae_name, vae_choices),
-            available(snapshot.upscaler_name, upscaler_choices),
-            lora_rows,
-            snapshot.model_dump(mode="json"),
-        )
 
     with gr.Blocks(title=APP_TITLE, css=APP_CSS) as demo:
         gr.Markdown(f"# {APP_TITLE}")
@@ -809,17 +761,20 @@ def build_app(
             ],
             outputs=[system.capability_message, *capability_outputs],
             concurrency_limit=1,
-        ).then(
-            fn=restore_form_state_handler,
-            inputs=[
-                generation.checkpoint_choices,
-                generation.vae_choices,
-                generation.sampler_choices,
-                generation.scheduler_choices,
-                generation.upscaler_choices,
-                generation.lora_editor.choices,
-            ],
+        )
+        generation.startup_restore_timer.tick(
+            fn=make_startup_restore_handler(
+                startup_model_restore_runtime,
+                comfyui_service,
+                generation,
+                catalog_service,
+                set_phase6_capabilities,
+            ),
+            inputs=capability_inputs,
             outputs=[
+                generation.startup_restore_timer,
+                system.capability_message,
+                *capability_outputs,
                 generation.positive_prompt,
                 generation.negative_prompt,
                 generation.seed_mode,
@@ -828,12 +783,6 @@ def build_app(
                 generation.height,
                 generation.steps,
                 generation.cfg_scale,
-                generation.checkpoint,
-                generation.sampler,
-                generation.scheduler,
-                generation.vae,
-                generation.upscaler,
-                generation.lora_editor.state,
                 generation.restored_form_state,
             ],
             concurrency_limit=1,

@@ -7,9 +7,10 @@ import hashlib
 import logging
 import os
 from collections.abc import Awaitable, Callable, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 from uuid import UUID
 
 from runpod_sdxl_image_studio.adapters.comfyui.models import ComfyUICapabilities
@@ -37,8 +38,12 @@ from runpod_sdxl_image_studio.domain.model_transfer import (
     normalize_model_relative_path,
 )
 from runpod_sdxl_image_studio.domain.system_status import CapabilityRefreshResult
+from runpod_sdxl_image_studio.services.pod_lifecycle_service import (
+    PodLifecycleWorkBlockedError,
+)
 
 logger = logging.getLogger(__name__)
+_AdmissionResult = TypeVar("_AdmissionResult")
 
 
 class ModelCatalogPort(Protocol):
@@ -241,29 +246,34 @@ class ModelPreparationService:
         if existing_sha is not None:
             try:
                 await self._refresh_and_check_visibility(entry)
-                job = self._repository.enqueue(entry, local_relative)
             except ModelPreparationServiceError:
                 raise
-            except ModelTransferRepositoryError as exc:
-                raise ModelPreparationServiceError(
-                    ModelTransferErrorCode.PERSISTENCE_FAILED.value,
-                    "モデル準備ジョブを保存できませんでした。",
-                ) from exc
-            try:
-                return self._repository.mark_already_prepared(job.id, existing_sha)
-            except ModelPreparationServiceError:
-                raise
-            except ModelTransferRepositoryError as exc:
-                raise ModelPreparationServiceError(
-                    ModelTransferErrorCode.PERSISTENCE_FAILED.value,
-                    "モデル準備ジョブを保存できませんでした。",
-                ) from exc
-            except AttributeError:
-                # Keep the service usable with small test fakes that only implement
-                # the original repository protocol.
-                return job
+            return self._persist_entry(entry, local_relative, existing_sha)
+        return self._persist_entry(entry, local_relative, None)
+
+    def _persist_entry(
+        self,
+        entry: RemoteModelEntry,
+        local_relative: str,
+        existing_sha: str | None,
+    ) -> ModelTransferJob:
         try:
-            return self._repository.enqueue(entry, local_relative)
+            with self._admission_context():
+                job = self._repository.enqueue(entry, local_relative)
+                if existing_sha is None:
+                    return job
+                try:
+                    return self._repository.mark_already_prepared(job.id, existing_sha)
+                except AttributeError:
+                    # Keep the service usable with small test fakes that only implement
+                    # the original repository protocol.
+                    return job
+        except PodLifecycleWorkBlockedError as exc:
+            raise ModelPreparationServiceError(
+                "pod_lifecycle_draining",
+                "Pod is preparing to terminate; new work is blocked",
+                retryable=False,
+            ) from exc
         except ModelTransferRepositoryError as exc:
             raise ModelPreparationServiceError(
                 ModelTransferErrorCode.PERSISTENCE_FAILED.value,
@@ -459,7 +469,9 @@ class ModelPreparationService:
                 retryable=False,
             )
         try:
-            result = self._repository.retry(job_id, entry, entry.relative_path)
+            result = self._run_with_admission(
+                lambda: self._repository.retry(job_id, entry, entry.relative_path)
+            )
         except ModelTransferRepositoryError as exc:
             raise ModelPreparationServiceError(
                 ModelTransferErrorCode.PERSISTENCE_FAILED.value,
@@ -551,7 +563,31 @@ class ModelPreparationService:
             return
         ensure = getattr(self._work_gate, "ensure_work_allowed", None)
         if callable(ensure):
-            ensure()
+            try:
+                ensure()
+            except PodLifecycleWorkBlockedError as exc:
+                raise ModelPreparationServiceError(
+                    "pod_lifecycle_draining",
+                    "Pod is preparing to terminate; new work is blocked",
+                    retryable=False,
+                ) from exc
+
+    def _admission_context(self) -> AbstractContextManager[object]:
+        if self._work_gate is None:
+            return nullcontext()
+        admit = getattr(self._work_gate, "admit_work", None)
+        return admit() if callable(admit) else nullcontext()
+
+    def _run_with_admission(self, action: Callable[[], _AdmissionResult]) -> _AdmissionResult:
+        try:
+            with self._admission_context():
+                return action()
+        except PodLifecycleWorkBlockedError as exc:
+            raise ModelPreparationServiceError(
+                "pod_lifecycle_draining",
+                "Pod is preparing to terminate; new work is blocked",
+                retryable=False,
+            ) from exc
 
 
 def _matching_local_sha256(path: Path, entry: RemoteModelEntry) -> str | None:

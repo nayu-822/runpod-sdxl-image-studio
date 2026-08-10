@@ -5,8 +5,9 @@ from __future__ import annotations
 import logging
 import secrets
 from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, TypeVar
 from uuid import UUID
 
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_dispatch_queue_repository import (  # noqa: E501
@@ -34,8 +35,12 @@ from runpod_sdxl_image_studio.domain.generation_settings import (
 )
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
 from runpod_sdxl_image_studio.domain.upscale_snapshot import UpscaleSourceKind
+from runpod_sdxl_image_studio.services.pod_lifecycle_service import (
+    PodLifecycleWorkBlockedError,
+)
 
 logger = logging.getLogger(__name__)
+_AdmissionResult = TypeVar("_AdmissionResult")
 
 
 class GenerationCancellationAdapterProtocol(Protocol):
@@ -110,13 +115,13 @@ class GenerationQueueService:
         resolved = settings.model_copy(update={"seed": _resolve_seed(settings.seed)})
         try:
             snapshot = GenerationSettingsSnapshot.from_settings(resolved)
-            item = self._repository.enqueue_single(
-                snapshot,
-                parent_generation_id=parent_generation_id,
-                pending_limit=self._settings.queue_max_pending_jobs,
+            item = self._run_with_admission(
+                lambda: self._repository.enqueue_single(
+                    snapshot,
+                    parent_generation_id=parent_generation_id,
+                    pending_limit=self._settings.queue_max_pending_jobs,
+                )
             )
-            self._wake()
-            self._notify_generation_enqueued()
             return QueueEnqueueResult(item=item, queue_position=item.entry.sequence)
         except (GenerationDispatchQueueRepositoryError, ValueError) as exc:
             raise GenerationQueueServiceError(_enqueue_error_message(exc, "生成")) from exc
@@ -140,16 +145,16 @@ class GenerationQueueService:
                 GenerationSettingsSnapshot.from_settings(settings.model_copy(update={"seed": seed}))
                 for seed in seeds
             )
-            batch, items = self._repository.enqueue_batch(
-                snapshots,
-                name=name,
-                seed_strategy=strategy,
-                start_seed=start_seed,
-                seed_step=seed_step,
-                pending_limit=self._settings.queue_max_pending_jobs,
+            batch, items = self._run_with_admission(
+                lambda: self._repository.enqueue_batch(
+                    snapshots,
+                    name=name,
+                    seed_strategy=strategy,
+                    start_seed=start_seed,
+                    seed_step=seed_step,
+                    pending_limit=self._settings.queue_max_pending_jobs,
+                )
             )
-            self._wake()
-            self._notify_generation_enqueued()
             return BatchEnqueueResult(batch=batch, items=items)
         except (GenerationDispatchQueueRepositoryError, ValueError) as exc:
             raise GenerationQueueServiceError(_enqueue_error_message(exc, "バッチ")) from exc
@@ -280,55 +285,7 @@ class GenerationQueueService:
                 raise GenerationQueueServiceError(
                     "失敗またはキャンセル済みジョブだけ再試行できます。"
                 )
-            if item.generation.kind.value == "upscale":
-                if self._upscale_settings_repository is None:
-                    raise GenerationQueueServiceError("アップスケール設定Repositoryが未設定です。")
-                upscale_snapshot = self._upscale_settings_repository.get_by_generation(
-                    item.generation.id
-                )
-                if (upscale_snapshot is None or item.generation.parent_generation_id is None) and (
-                    upscale_snapshot is None
-                    or upscale_snapshot.source_kind is not UpscaleSourceKind.METADATA_IMPORT
-                    or upscale_snapshot.source_import_id is None
-                ):
-                    raise GenerationQueueServiceError("アップスケール設定を復元できません。")
-                if upscale_snapshot.source_kind is UpscaleSourceKind.METADATA_IMPORT:
-                    new_item = self._repository.enqueue_upscale(
-                        item.generation.settings_snapshot,
-                        upscale_snapshot,
-                        parent_generation_id=None,
-                        source_artifact_id=None,
-                        source_import_id=upscale_snapshot.source_import_id,
-                        retry_of_generation_id=item.generation.id,
-                        retry_attempt=item.generation.retry_attempt + 1,
-                        pending_limit=self._settings.queue_max_pending_jobs,
-                    )
-                else:
-                    if (
-                        item.generation.parent_generation_id is None
-                        or upscale_snapshot.source_artifact_id is None
-                    ):
-                        raise GenerationQueueServiceError("アップスケール設定を復元できません。")
-                    new_item = self._repository.enqueue_upscale(
-                        item.generation.settings_snapshot,
-                        upscale_snapshot,
-                        parent_generation_id=item.generation.parent_generation_id,
-                        source_artifact_id=upscale_snapshot.source_artifact_id,
-                        retry_of_generation_id=item.generation.id,
-                        retry_attempt=item.generation.retry_attempt + 1,
-                        pending_limit=self._settings.queue_max_pending_jobs,
-                    )
-            else:
-                new_item = self._repository.enqueue_single(
-                    item.generation.settings_snapshot,
-                    kind=item.generation.kind,
-                    parent_generation_id=item.generation.parent_generation_id,
-                    retry_of_generation_id=item.generation.id,
-                    retry_attempt=item.generation.retry_attempt + 1,
-                    pending_limit=self._settings.queue_max_pending_jobs,
-                )
-            self._wake()
-            self._notify_generation_enqueued()
+            new_item = self._run_with_admission(lambda: self._enqueue_retry_item(item))
             return QueueEnqueueResult(new_item, new_item.entry.sequence)
         except GenerationQueueServiceError:
             raise
@@ -356,19 +313,19 @@ class GenerationQueueService:
             if source_batch is None:
                 raise GenerationQueueServiceError("対象バッチが見つかりません。")
             snapshots = tuple(item.generation.settings_snapshot for item in failed)
-            batch, items = self._repository.enqueue_batch(
-                snapshots,
-                name=f"{source_batch.name} (failed retry)",
-                seed_strategy=source_batch.seed_strategy,
-                start_seed=source_batch.start_seed,
-                seed_step=source_batch.seed_step,
-                retry_of_batch_id=source_batch.id,
-                retry_of_generations=tuple(item.generation.id for item in failed),
-                retry_attempts=tuple(item.generation.retry_attempt + 1 for item in failed),
-                pending_limit=self._settings.queue_max_pending_jobs,
+            batch, items = self._run_with_admission(
+                lambda: self._repository.enqueue_batch(
+                    snapshots,
+                    name=f"{source_batch.name} (failed retry)",
+                    seed_strategy=source_batch.seed_strategy,
+                    start_seed=source_batch.start_seed,
+                    seed_step=source_batch.seed_step,
+                    retry_of_batch_id=source_batch.id,
+                    retry_of_generations=tuple(item.generation.id for item in failed),
+                    retry_attempts=tuple(item.generation.retry_attempt + 1 for item in failed),
+                    pending_limit=self._settings.queue_max_pending_jobs,
+                )
             )
-            self._wake()
-            self._notify_generation_enqueued()
             return BatchEnqueueResult(batch, items)
         except GenerationQueueServiceError:
             raise
@@ -401,6 +358,71 @@ class GenerationQueueService:
                 if isinstance(exc, GenerationQueueServiceError):
                     raise
                 raise GenerationQueueServiceError(str(exc)) from exc
+
+    def _admission_context(self) -> AbstractContextManager[object]:
+        if self._lifecycle_gate is None:
+            return nullcontext()
+        admit = getattr(self._lifecycle_gate, "admit_work", None)
+        return admit() if callable(admit) else nullcontext()
+
+    def _run_with_admission(self, action: Callable[[], _AdmissionResult]) -> _AdmissionResult:
+        try:
+            with self._admission_context():
+                result = action()
+                self._wake()
+                self._notify_generation_enqueued()
+                return result
+        except GenerationQueueServiceError:
+            raise
+        except PodLifecycleWorkBlockedError as exc:
+            raise GenerationQueueServiceError("新しい処理をキューへ追加できませんでした。") from exc
+
+    def _enqueue_retry_item(self, item: GenerationQueueItem) -> GenerationQueueItem:
+        if item.generation.kind.value == "upscale":
+            if self._upscale_settings_repository is None:
+                raise GenerationQueueServiceError("アップスケール設定Repositoryが未設定です。")
+            upscale_snapshot = self._upscale_settings_repository.get_by_generation(
+                item.generation.id
+            )
+            if (upscale_snapshot is None or item.generation.parent_generation_id is None) and (
+                upscale_snapshot is None
+                or upscale_snapshot.source_kind is not UpscaleSourceKind.METADATA_IMPORT
+                or upscale_snapshot.source_import_id is None
+            ):
+                raise GenerationQueueServiceError("アップスケール設定を復元できません。")
+            if upscale_snapshot.source_kind is UpscaleSourceKind.METADATA_IMPORT:
+                return self._repository.enqueue_upscale(
+                    item.generation.settings_snapshot,
+                    upscale_snapshot,
+                    parent_generation_id=None,
+                    source_artifact_id=None,
+                    source_import_id=upscale_snapshot.source_import_id,
+                    retry_of_generation_id=item.generation.id,
+                    retry_attempt=item.generation.retry_attempt + 1,
+                    pending_limit=self._settings.queue_max_pending_jobs,
+                )
+            if (
+                item.generation.parent_generation_id is None
+                or upscale_snapshot.source_artifact_id is None
+            ):
+                raise GenerationQueueServiceError("アップスケール設定を復元できません。")
+            return self._repository.enqueue_upscale(
+                item.generation.settings_snapshot,
+                upscale_snapshot,
+                parent_generation_id=item.generation.parent_generation_id,
+                source_artifact_id=upscale_snapshot.source_artifact_id,
+                retry_of_generation_id=item.generation.id,
+                retry_attempt=item.generation.retry_attempt + 1,
+                pending_limit=self._settings.queue_max_pending_jobs,
+            )
+        return self._repository.enqueue_single(
+            item.generation.settings_snapshot,
+            kind=item.generation.kind,
+            parent_generation_id=item.generation.parent_generation_id,
+            retry_of_generation_id=item.generation.id,
+            retry_attempt=item.generation.retry_attempt + 1,
+            pending_limit=self._settings.queue_max_pending_jobs,
+        )
 
     def _notify_generation_enqueued(self) -> None:
         if self._generation_enqueued_callback is None:

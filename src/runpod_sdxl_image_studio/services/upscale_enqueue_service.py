@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import logging
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path, PurePosixPath
+from typing import TypeVar
 from uuid import UUID
 from warnings import catch_warnings, simplefilter
 
@@ -58,8 +60,12 @@ from runpod_sdxl_image_studio.domain.upscale_snapshot import (
     UpscaleSettingsSnapshot,
     UpscaleSourceKind,
 )
+from runpod_sdxl_image_studio.services.pod_lifecycle_service import (
+    PodLifecycleWorkBlockedError,
+)
 
 logger = logging.getLogger(__name__)
+_AdmissionResult = TypeVar("_AdmissionResult")
 
 
 class UpscaleEnqueueError(RuntimeError):
@@ -434,16 +440,17 @@ class UpscaleEnqueueService:
             }
         )
         try:
-            item = self._queue.enqueue_upscale(
-                generation_snapshot,
-                upscale_snapshot,
-                parent_generation_id=parent_generation_id,
-                source_artifact_id=source.artifact.id,
-                pending_limit=self._settings.queue_max_pending_jobs,
+            item = self._run_with_admission(
+                lambda: self._queue.enqueue_upscale(
+                    generation_snapshot,
+                    upscale_snapshot,
+                    parent_generation_id=parent_generation_id,
+                    source_artifact_id=source.artifact.id,
+                    pending_limit=self._settings.queue_max_pending_jobs,
+                )
             )
         except GenerationDispatchQueueRepositoryError as exc:
             raise UpscaleEnqueueError("upscale_workflow_error", str(exc)) from exc
-        self._notify_generation_enqueued()
         return item
 
     enqueue_upscale = enqueue
@@ -527,17 +534,18 @@ class UpscaleEnqueueService:
             )
         )
         try:
-            item = self._queue.enqueue_upscale(
-                generation_snapshot,
-                upscale_snapshot,
-                parent_generation_id=None,
-                source_artifact_id=None,
-                source_import_id=import_id,
-                pending_limit=self._settings.queue_max_pending_jobs,
+            item = self._run_with_admission(
+                lambda: self._queue.enqueue_upscale(
+                    generation_snapshot,
+                    upscale_snapshot,
+                    parent_generation_id=None,
+                    source_artifact_id=None,
+                    source_import_id=import_id,
+                    pending_limit=self._settings.queue_max_pending_jobs,
+                )
             )
         except GenerationDispatchQueueRepositoryError as exc:
             raise UpscaleEnqueueError("upscale_workflow_error", str(exc)) from exc
-        self._notify_generation_enqueued()
         return item
 
     def _ensure_work_allowed(self) -> None:
@@ -552,6 +560,26 @@ class UpscaleEnqueueService:
                     "pod_lifecycle_draining",
                     "Pod is preparing to terminate; new work is blocked",
                 ) from exc
+
+    def _admission_context(self) -> AbstractContextManager[object]:
+        if self._work_gate is None:
+            return nullcontext()
+        admit = getattr(self._work_gate, "admit_work", None)
+        return admit() if callable(admit) else nullcontext()
+
+    def _run_with_admission(self, action: Callable[[], _AdmissionResult]) -> _AdmissionResult:
+        try:
+            with self._admission_context():
+                result = action()
+                self._notify_generation_enqueued()
+                return result
+        except UpscaleEnqueueError:
+            raise
+        except PodLifecycleWorkBlockedError as exc:
+            raise UpscaleEnqueueError(
+                "pod_lifecycle_draining",
+                "Pod is preparing to terminate; new work is blocked",
+            ) from exc
 
     def _notify_generation_enqueued(self) -> None:
         if self._generation_enqueued_callback is None:

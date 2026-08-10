@@ -9,11 +9,12 @@ import os
 import shutil
 import warnings
 from collections.abc import Awaitable, Callable
+from contextlib import AbstractContextManager, nullcontext
 from datetime import UTC, date, datetime
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from tempfile import NamedTemporaryFile
-from typing import Protocol
+from typing import Protocol, TypeVar
 from uuid import UUID, uuid4
 
 from PIL import Image, UnidentifiedImageError
@@ -48,8 +49,12 @@ from runpod_sdxl_image_studio.domain.drive_sync import (
 )
 from runpod_sdxl_image_studio.domain.generation import Generation, GenerationStatus
 from runpod_sdxl_image_studio.domain.generation_artifact import ArtifactType, GenerationArtifact
+from runpod_sdxl_image_studio.services.pod_lifecycle_service import (
+    PodLifecycleWorkBlockedError,
+)
 
 logger = logging.getLogger(__name__)
+_AdmissionResult = TypeVar("_AdmissionResult")
 
 _MANIFEST_REBUILD_REQUIRED_MESSAGE = "再同期前に旧保存先のManifestを再構築してください"
 
@@ -153,22 +158,26 @@ class DriveSyncService:
             paths,
             existing=existing,
         )
-        saved_record, saved_job = self._repository.enqueue(record, job)
-        if saved_job is None:
+
+        def persist() -> DriveSyncRecord:
+            saved_record, saved_job = self._repository.enqueue(record, job)
+            if saved_job is None:
+                return saved_record
+            if metadata is None:
+                return self._mark_enqueued_failed(
+                    saved_job,
+                    DriveSyncErrorCode.METADATA_MISSING.value,
+                    "metadata sidecar is not available",
+                )
+            if not self._settings.rclone_remote:
+                return self._mark_enqueued_failed(
+                    saved_job,
+                    DriveSyncErrorCode.NOT_CONFIGURED.value,
+                    "Google Drive is not configured",
+                )
             return saved_record
-        if metadata is None:
-            return self._mark_enqueued_failed(
-                saved_job,
-                DriveSyncErrorCode.METADATA_MISSING.value,
-                "metadata sidecar is not available",
-            )
-        if not self._settings.rclone_remote:
-            return self._mark_enqueued_failed(
-                saved_job,
-                DriveSyncErrorCode.NOT_CONFIGURED.value,
-                "Google Drive is not configured",
-            )
-        return saved_record
+
+        return self._run_with_admission(persist)
 
     def retry_generation(
         self, generation_id: UUID, *, resync: bool = False
@@ -227,10 +236,12 @@ class DriveSyncService:
             existing=existing,
         )
         try:
-            saved_record, saved_job = self._repository.retry(
-                updated_record,
-                job,
-                require_manifest_ready=resync,
+            saved_record, saved_job = self._run_with_admission(
+                lambda: self._repository.retry(
+                    updated_record,
+                    job,
+                    require_manifest_ready=resync,
+                )
             )
         except DriveManifestRebuildRequired as exc:
             raise self._manifest_rebuild_required_error() from exc
@@ -571,7 +582,7 @@ class DriveSyncService:
             created_at=now,
             updated_at=now,
         )
-        return self._repository.enqueue_manifest(job)
+        return self._run_with_admission(lambda: self._repository.enqueue_manifest(job))
 
     def retry_failed_manifests(self, limit: int = 100) -> tuple[str, ...]:
         queued: list[str] = []
@@ -728,7 +739,31 @@ class DriveSyncService:
             return
         ensure = getattr(self._work_gate, "ensure_work_allowed", None)
         if callable(ensure):
-            ensure()
+            try:
+                ensure()
+            except PodLifecycleWorkBlockedError as exc:
+                raise DriveSyncServiceError(
+                    "pod_lifecycle_draining",
+                    "Pod is preparing to terminate; new work is blocked",
+                    retryable=False,
+                ) from exc
+
+    def _admission_context(self) -> AbstractContextManager[object]:
+        if self._work_gate is None:
+            return nullcontext()
+        admit = getattr(self._work_gate, "admit_work", None)
+        return admit() if callable(admit) else nullcontext()
+
+    def _run_with_admission(self, action: Callable[[], _AdmissionResult]) -> _AdmissionResult:
+        try:
+            with self._admission_context():
+                return action()
+        except PodLifecycleWorkBlockedError as exc:
+            raise DriveSyncServiceError(
+                "pod_lifecycle_draining",
+                "Pod is preparing to terminate; new work is blocked",
+                retryable=False,
+            ) from exc
 
     def _get_completed_generation(self, generation_id: UUID) -> Generation:
         generation = self._generation_repository.get_by_id(generation_id)

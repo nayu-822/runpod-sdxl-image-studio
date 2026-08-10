@@ -19,6 +19,10 @@ from runpod_sdxl_image_studio.domain.generation import (
 )
 from runpod_sdxl_image_studio.domain.generation_form_state import GenerationFormStateSnapshot
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
+from runpod_sdxl_image_studio.jobs.startup_model_restore import (
+    StartupModelRestoreRuntime,
+    StartupRestoreState,
+)
 from runpod_sdxl_image_studio.services.comfyui_service import ComfyUIService
 from runpod_sdxl_image_studio.services.generation_preflight_service import (
     GenerationPreflightService,
@@ -43,6 +47,7 @@ from runpod_sdxl_image_studio.ui.components.lora_editor import (
     build_lora_editor,
     component_outputs,
     lora_settings_from_state,
+    normalize_lora_state,
     render_state_updates,
 )
 from runpod_sdxl_image_studio.ui.view_models import (
@@ -138,6 +143,7 @@ class GenerationTabComponents:
     status_card: gr.Markdown
     active_generation_id: gr.State
     status_poll_timer: gr.Timer
+    startup_restore_timer: gr.Timer
     result_seed: gr.Textbox
     result_favorite: gr.Checkbox
     result_regenerate_button: gr.Button
@@ -322,6 +328,7 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
 
         with gr.Column(elem_classes=["generation-preview"]):
             status_components = build_generation_status_card()
+            startup_restore_timer = gr.Timer(value=1.0, active=True)
             progress = gr.Markdown("")
             result_image = gr.Image(label="生成画像", type="filepath")
             result_details = gr.Markdown("")
@@ -426,6 +433,7 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
         status_card=status_components.card,
         active_generation_id=status_components.active_generation_id,
         status_poll_timer=status_components.poll_timer,
+        startup_restore_timer=startup_restore_timer,
         result_seed=result_seed,
         result_favorite=result_favorite,
         result_regenerate_button=result_regenerate_button,
@@ -484,12 +492,15 @@ def make_pod_lifecycle_terminate_handler(
     """Create the guarded manual self-termination action."""
 
     async def handler() -> tuple[str, str]:
-        readiness = await service.check_readiness()
-        if not readiness.is_safe:
-            return _pod_lifecycle_markdown(service, readiness), "NOT READY; Pod was not terminated"
         try:
-            await service.request_terminate(readiness=readiness)
+            readiness = await service.drain_backup_and_terminate(require_armed=False)
         except Exception as exc:  # noqa: BLE001 - no adapter details at the UI boundary
+            try:
+                readiness = await service.check_readiness()
+            except Exception:  # noqa: BLE001 - keep the UI boundary safe
+                readiness = None
+            if readiness is None:
+                return _pod_lifecycle_markdown(service, object()), str(exc)
             return _pod_lifecycle_markdown(service, readiness), str(exc)
         return _pod_lifecycle_markdown(service, readiness), "Termination request accepted"
 
@@ -624,6 +635,117 @@ def make_refresh_handler(
             _catalog_categories(catalog_service),
         )
         return (refresh_result.message, *updates)
+
+    return handler
+
+
+def _choice_values(choices: Sequence[object]) -> tuple[object, ...]:
+    """Return dropdown values from string or ``(label, value)`` choices."""
+
+    return tuple(
+        choice[1] if isinstance(choice, tuple) and len(choice) == 2 else choice
+        for choice in choices
+    )
+
+
+def make_startup_restore_handler(
+    runtime: StartupModelRestoreRuntime,
+    service: ComfyUIService,
+    generation: GenerationTabComponents,
+    catalog_service: LoraCatalogService | None = None,
+    capabilities_callback: Callable[[ComfyUICapabilities | None], None] | None = None,
+) -> Callable[..., Awaitable[tuple[object, ...]]]:
+    """Apply the desired form only after background model preparation is terminal."""
+
+    capability_count = len(capability_refresh_outputs(generation))
+    form_tail_count = 9
+
+    async def handler(
+        checkpoint: str | None,
+        vae: str | None,
+        sampler: str | None,
+        scheduler: str | None,
+        upscaler: str | None,
+        lora_state: object = None,
+        lora_choices: object = None,
+        lora_category: str | None = None,
+    ) -> tuple[object, ...]:
+        del checkpoint, vae, sampler, scheduler, upscaler
+        status = runtime.status()
+        if status.applied or not status.is_terminal or status.snapshot is None:
+            return (
+                gr.Timer(active=not status.is_terminal),
+                status.message,
+                *(gr.skip() for _ in range(capability_count)),
+                *(gr.skip() for _ in range(form_tail_count)),
+            )
+        if status.state is StartupRestoreState.FAILED:
+            return (
+                gr.Timer(active=False),
+                status.message,
+                *(gr.skip() for _ in range(capability_count)),
+                *(gr.skip() for _ in range(form_tail_count)),
+            )
+
+        capabilities = (
+            status.capabilities if isinstance(status.capabilities, ComfyUICapabilities) else None
+        )
+        if capabilities is None:
+            refresh_result = await service.refresh_capabilities()
+            if not refresh_result.is_success or refresh_result.capabilities is None:
+                return (
+                    gr.Timer(active=True),
+                    "前回設定の反映待ち: ComfyUI能力情報を取得できません。",
+                    *(gr.skip() for _ in range(capability_count)),
+                    *(gr.skip() for _ in range(form_tail_count)),
+                )
+            capabilities = refresh_result.capabilities
+        if capabilities_callback is not None:
+            capabilities_callback(capabilities)
+        snapshot = status.snapshot
+        desired_lora_state = [
+            {
+                "row_id": f"restored-{index}",
+                "lora_name": item.name,
+                "model_strength": item.model_strength,
+                "clip_strength": item.clip_strength,
+            }
+            for index, item in enumerate(snapshot.loras)
+        ]
+        updates = _capability_updates(
+            capabilities,
+            (
+                snapshot.checkpoint_name,
+                snapshot.vae_name,
+                snapshot.sampler_name,
+                snapshot.scheduler_name,
+                snapshot.upscaler_name,
+            ),
+            generation,
+            desired_lora_state,
+            _catalog_choices(catalog_service, capabilities),
+            lora_category,
+            _catalog_categories(catalog_service),
+            preserve_unavailable=True,
+        )
+        runtime.mark_applied()
+        message = status.message
+        if status.missing:
+            message += "\n不足model: " + ", ".join(status.missing)
+        return (
+            gr.Timer(active=False),
+            message,
+            *updates,
+            snapshot.positive_prompt,
+            snapshot.negative_prompt,
+            snapshot.ui_seed_mode,
+            snapshot.seed,
+            snapshot.width,
+            snapshot.height,
+            snapshot.steps,
+            snapshot.cfg_scale,
+            snapshot.model_dump(mode="json"),
+        )
 
     return handler
 
@@ -1119,6 +1241,8 @@ def _capability_updates(
     lora_choice_options: object = None,
     lora_category: str | None = None,
     category_options: Sequence[str] = (),
+    *,
+    preserve_unavailable: bool = False,
 ) -> tuple[object, ...]:
     if capabilities is None:
         return _empty_updates(generation)
@@ -1132,14 +1256,30 @@ def _capability_updates(
     )
     updates: list[object] = []
     for component, available_choices, current_value in dropdowns:
+        current_string = current_value if isinstance(current_value, str) else None
+        display_choices: list[str | tuple[str, str]] = list(available_choices)
+        if (
+            preserve_unavailable
+            and current_string is not None
+            and current_string not in available_choices
+        ):
+            display_choices.append((f"{current_string}（現在利用不可）", current_string))
         if component is generation.vae:
             vae_choices: list[tuple[str, str | None]] = [("Checkpoint内蔵VAE", None)] + [
-                (value, value) for value in available_choices
+                (value, value) if isinstance(value, str) else value for value in display_choices
             ]
             updates.append(
                 gr.Dropdown(
                     choices=vae_choices,
-                    value=current_value if current_value in available_choices else None,
+                    value=(
+                        current_string
+                        if current_string in available_choices
+                        or (
+                            preserve_unavailable
+                            and current_string in _choice_values(display_choices)
+                        )
+                        else None
+                    ),
                     label=component.label,
                     interactive=True,
                 )
@@ -1147,23 +1287,49 @@ def _capability_updates(
         else:
             updates.append(
                 gr.Dropdown(
-                    choices=list(available_choices),
-                    value=preserve_selection(
-                        current_value if isinstance(current_value, str) else None,
-                        available_choices,
+                    choices=display_choices,
+                    value=(
+                        preserve_selection(current_string, available_choices)
+                        if not preserve_unavailable
+                        else current_string
+                        if current_string in _choice_values(display_choices)
+                        else None
                     ),
                     label=component.label,
-                    interactive=bool(available_choices),
+                    interactive=bool(display_choices),
                 )
             )
     can_generate = bool(
         capabilities.checkpoints and capabilities.samplers and capabilities.schedulers
     )
+    if preserve_unavailable:
+        can_generate = can_generate and not any(
+            isinstance(value, str) and value and value not in choices[key]
+            for value, key in (
+                (current_values[0], "checkpoint"),
+                (current_values[1], "vae"),
+                (current_values[2], "sampler"),
+                (current_values[3], "scheduler"),
+                (current_values[4], "upscaler"),
+            )
+        )
+        available_lora_values = set(
+            _choice_values(
+                lora_choice_options
+                if isinstance(lora_choice_options, Sequence)
+                and not isinstance(lora_choice_options, (str, bytes, bytearray))
+                else capabilities.loras
+            )
+        )
+        can_generate = can_generate and all(
+            not isinstance(row.get("lora_name"), str) or row["lora_name"] in available_lora_values
+            for row in normalize_lora_state(lora_state, len(generation.lora_editor.rows))
+        )
     rendered = render_state_updates(
         lora_state,
         lora_choice_options if lora_choice_options is not None else capabilities.loras,
         len(generation.lora_editor.rows),
-        clear_unavailable=True,
+        clear_unavailable=not preserve_unavailable,
     )
     selected_options = (
         list(lora_choice_options)

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -72,11 +73,14 @@ class ComfyQueueProvider(Protocol):
 class LifecycleGate(Protocol):
     def ensure_work_allowed(self) -> None: ...
 
+    def admit_work(self) -> AbstractContextManager[None]: ...
+
 
 class PodLifecycleService:
     """Coordinate one process-safe, persisted lifecycle session."""
 
     _termination_lock = threading.Lock()
+    _work_admission_lock = threading.RLock()
 
     def __init__(
         self,
@@ -143,35 +147,45 @@ class PodLifecycleService:
         return self._session
 
     def ensure_work_allowed(self) -> None:
-        session = self._session or self.initialize_session()
-        if session is None:
-            return
-        if session.status in {
-            AutoTerminateState.DRAINING,
-            AutoTerminateState.TERMINATION_REQUESTING,
-            AutoTerminateState.TERMINATION_AMBIGUOUS,
-        }:
-            raise PodLifecycleWorkBlockedError()
+        with self._work_admission_lock:
+            session = self._session or self.initialize_session()
+            if session is None:
+                return
+            if session.status in {
+                AutoTerminateState.DRAINING,
+                AutoTerminateState.TERMINATION_REQUESTING,
+                AutoTerminateState.TERMINATION_AMBIGUOUS,
+            }:
+                raise PodLifecycleWorkBlockedError()
+
+    @contextmanager
+    def admit_work(self) -> Iterator[None]:
+        """Serialize work admission with the durable draining transition."""
+
+        with self._work_admission_lock:
+            self.ensure_work_allowed()
+            yield
 
     def arm_on_generation_enqueue(self) -> PodLifecycleSession | None:
         """Arm only after a new Generation or successful batch was persisted."""
 
-        session = self._session or self.initialize_session()
-        if session is None:
-            return None
-        self.ensure_work_allowed()
-        timestamp = self._now_factory()
-        updated = replace(
-            session,
-            auto_terminate_armed_at=session.auto_terminate_armed_at or timestamp,
-            status=AutoTerminateState.ARMED,
-            last_activity_at=timestamp,
-            last_error_code=None,
-            last_error_summary=None,
-            updated_at=timestamp,
-        )
-        self._session = self._save(updated)
-        return self._session
+        with self._work_admission_lock:
+            session = self._session or self.initialize_session()
+            if session is None:
+                return None
+            self.ensure_work_allowed()
+            timestamp = self._now_factory()
+            updated = replace(
+                session,
+                auto_terminate_armed_at=session.auto_terminate_armed_at or timestamp,
+                status=AutoTerminateState.ARMED,
+                last_activity_at=timestamp,
+                last_error_code=None,
+                last_error_summary=None,
+                updated_at=timestamp,
+            )
+            self._session = self._save(updated)
+            return self._session
 
     def set_auto_terminate_enabled(self, enabled: bool) -> PodLifecycleSession | None:
         session = self._session or self.initialize_session()
@@ -325,8 +339,11 @@ class PodLifecycleService:
                 TerminateBlockReason.RUNPOD_IDENTITY_MISSING.value,
                 "RunPod self-termination identity is unavailable",
             )
-        if readiness is None:
-            readiness = await self.check_readiness()
+        # ``readiness`` is accepted for compatibility with existing callers,
+        # but it is only a display snapshot.  DELETE authorization always uses
+        # a fresh check at the final boundary.
+        del readiness
+        readiness = await self.check_readiness()
         if not readiness.is_safe:
             raise PodLifecycleError("pod_not_safe_to_terminate", "Pod is not safe to terminate")
 
@@ -398,56 +415,88 @@ class PodLifecycleService:
 
         return await self._state_sync_service.backup(wait_for_clean=True)
 
+    async def drain_backup_and_terminate(
+        self, *, require_armed: bool = False
+    ) -> TerminateReadiness:
+        """Use one guarded drain/backup/readiness path for auto and manual termination."""
+
+        self.begin_draining()
+        try:
+            readiness = await self.check_readiness()
+            if not readiness.is_safe:
+                raise PodLifecycleError("pod_not_safe_to_terminate", "Pod is not safe to terminate")
+
+            await self.final_state_backup()
+            final_readiness = await self.check_readiness()
+            if not final_readiness.is_safe:
+                raise PodLifecycleError("pod_not_safe_to_terminate", "Pod is not safe to terminate")
+
+            await self.request_terminate(
+                readiness=final_readiness,
+                require_armed=require_armed,
+            )
+            return final_readiness
+        except Exception:
+            # A failed readiness or backup check must reopen admission.  Once
+            # request_terminate has durably entered REQUESTING/AMBIGUOUS, the
+            # session is intentionally left in that terminal-request state.
+            if self._session is not None and self._session.status is AutoTerminateState.DRAINING:
+                self.abort_draining()
+            raise
+
     def begin_draining(self) -> None:
-        session = self._session or self.initialize_session()
-        if session is None:
-            raise PodLifecycleError(
-                TerminateBlockReason.RUNPOD_IDENTITY_MISSING.value,
-                "RunPod self-termination identity is unavailable",
+        with self._work_admission_lock:
+            session = self._session or self.initialize_session()
+            if session is None:
+                raise PodLifecycleError(
+                    TerminateBlockReason.RUNPOD_IDENTITY_MISSING.value,
+                    "RunPod self-termination identity is unavailable",
+                )
+            if session.status in {
+                AutoTerminateState.TERMINATION_REQUESTING,
+                AutoTerminateState.TERMINATION_AMBIGUOUS,
+            }:
+                raise PodLifecycleError(
+                    TerminateBlockReason.TERMINATION_ALREADY_REQUESTED.value,
+                    "termination request has already been sent",
+                )
+            self._session = self._save(
+                replace(
+                    session,
+                    status=AutoTerminateState.DRAINING,
+                    last_activity_at=self._now_factory(),
+                    updated_at=self._now_factory(),
+                )
             )
-        if session.status in {
-            AutoTerminateState.TERMINATION_REQUESTING,
-            AutoTerminateState.TERMINATION_AMBIGUOUS,
-        }:
-            raise PodLifecycleError(
-                TerminateBlockReason.TERMINATION_ALREADY_REQUESTED.value,
-                "termination request has already been sent",
-            )
-        self._session = self._save(
-            replace(
-                session,
-                status=AutoTerminateState.DRAINING,
-                last_activity_at=self._now_factory(),
-                updated_at=self._now_factory(),
-            )
-        )
 
     def abort_draining(self) -> None:
-        session = self._session
-        if session is None or session.status is not AutoTerminateState.DRAINING:
-            return
-        status = AutoTerminateState.ARMED if session.is_armed else AutoTerminateState.IDLE
-        self._session = self._save(
-            replace(
-                session,
-                status=status,
-                last_activity_at=self._now_factory(),
-                updated_at=self._now_factory(),
+        with self._work_admission_lock:
+            session = self._session
+            if session is None or session.status is not AutoTerminateState.DRAINING:
+                return
+            status = AutoTerminateState.ARMED if session.is_armed else AutoTerminateState.IDLE
+            self._session = self._save(
+                replace(
+                    session,
+                    status=status,
+                    last_activity_at=self._now_factory(),
+                    updated_at=self._now_factory(),
+                )
             )
-        )
 
     def set_transient_state(self, state: AutoTerminateState) -> None:
-        session = self._session or self.initialize_session()
-        if session is None:
-            return
-        self._session = self._save(
-            replace(
-                session,
-                status=state,
-                last_activity_at=self._now_factory(),
-                updated_at=self._now_factory(),
+        with self._work_admission_lock:
+            session = self._session or self.initialize_session()
+            if session is None:
+                return
+            self._session = self._save(
+                replace(
+                    session,
+                    status=state,
+                    last_activity_at=self._now_factory(),
+                    updated_at=self._now_factory(),
+                )
             )
-        )
 
     def _current_generations(self, session: PodLifecycleSession) -> tuple[Any, ...]:
         return self._generation_repository.list_since(session.started_at, limit=5000)
@@ -521,9 +570,6 @@ class PodLifecycleService:
         completed = [item for item in generations if item.status is GenerationStatus.COMPLETED]
         try:
             jobs = self._drive_sync_repository.list_manifest_jobs(limit=5000)
-            if any(job.status is DriveSyncStatus.FAILED for job in jobs):
-                reasons.append(TerminateBlockReason.MANIFEST_FAILED.value)
-                return False
             if any(
                 job.status in {DriveSyncStatus.PENDING, DriveSyncStatus.SYNCING} for job in jobs
             ):
@@ -593,8 +639,9 @@ class PodLifecycleService:
             result = self._repository.save(session)
         except PodLifecycleRepositoryError as exc:
             raise PodLifecycleError("pod_lifecycle_persistence_failed", str(exc)) from exc
-        if self._state_changed_callback is not None:
-            self._state_changed_callback()
+        # Lifecycle session state is local control metadata for this Pod.  It
+        # must survive an application restart, but it is deliberately excluded
+        # from the cross-Pod StateSync dirty stream.
         return result
 
 
