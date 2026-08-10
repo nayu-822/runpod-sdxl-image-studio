@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -55,6 +56,9 @@ from runpod_sdxl_image_studio.domain.system_status import (
 )
 from runpod_sdxl_image_studio.services.generation_preflight_service import (
     GenerationPreflightService,
+)
+from runpod_sdxl_image_studio.services.pod_lifecycle_service import (
+    PodLifecycleWorkBlockedError,
 )
 from runpod_sdxl_image_studio.services.system_health_service import SystemHealthService
 from runpod_sdxl_image_studio.ui.tabs.system_tab import (
@@ -181,6 +185,32 @@ class _FakeQueue:
                 job=SimpleNamespace(id=self.failed_job_id),
             ),
         )
+
+
+class _FakeErrorRecorder:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def record(self, **kwargs: object) -> object:
+        self.calls.append(kwargs)
+        return SimpleNamespace()
+
+    def list_recent(self, _limit: int = 100) -> tuple[object, ...]:
+        return ()
+
+    def search(self, **_kwargs: object) -> tuple[object, ...]:
+        return ()
+
+
+class _MutationGate:
+    def __init__(self, *, blocked: bool = False) -> None:
+        self.blocked = blocked
+
+    @contextmanager
+    def admit_persistent_mutation(self):
+        if self.blocked:
+            raise PodLifecycleWorkBlockedError()
+        yield
 
 
 class _UnsafeFailedQueue(_FakeQueue):
@@ -383,6 +413,51 @@ async def test_system_health_read_does_not_mark_state_dirty_without_persisted_er
     await service.get_health()
 
     assert state_changes == []
+
+
+@pytest.mark.asyncio
+async def test_system_health_error_telemetry_uses_mutation_gate_and_marks_state_dirty(
+    tmp_path: Path,
+) -> None:
+    recorder = _FakeErrorRecorder()
+    state_changes: list[str] = []
+    service = SystemHealthService(
+        _FailingComfyUI(),
+        _FakeQueue(),
+        None,
+        _settings(tmp_path),
+        disk_usage_adapter=_FakeDisk(DiskUsage(1000, 700, 300)),
+        error_history_repository=recorder,
+        state_changed_callback=lambda: state_changes.append("changed"),
+        work_gate=_MutationGate(),
+    )
+
+    view = await service.get_health()
+
+    assert view.comfyui.connected is False
+    assert [call["error_code"] for call in recorder.calls] == ["system_comfyui_status_failed"]
+    assert state_changes == ["changed"]
+
+
+@pytest.mark.asyncio
+async def test_system_health_refresh_skips_error_telemetry_after_draining(
+    tmp_path: Path,
+) -> None:
+    recorder = _FakeErrorRecorder()
+    service = SystemHealthService(
+        _FailingComfyUI(),
+        _FakeQueue(),
+        None,
+        _settings(tmp_path),
+        disk_usage_adapter=_FakeDisk(DiskUsage(1000, 700, 300)),
+        error_history_repository=recorder,
+        work_gate=_MutationGate(blocked=True),
+    )
+
+    view = await service.get_health()
+
+    assert view.comfyui.connected is False
+    assert recorder.calls == []
 
 
 @pytest.mark.asyncio
@@ -1121,6 +1196,51 @@ async def test_preflight_warning_is_ready_and_drive_is_not_a_hard_stop(tmp_path:
     assert result.is_ready is True
     assert any(issue.code == "disk_space_low" for issue in result.warnings)
     assert any(issue.code == "drive_not_connected" for issue in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_preflight_telemetry_marks_state_dirty_after_normal_persistence(
+    tmp_path: Path,
+) -> None:
+    recorder = _FakeErrorRecorder()
+    state_changes: list[str] = []
+    service = GenerationPreflightService(
+        _FakeComfyUI(),
+        _settings(tmp_path),
+        disk_usage_adapter=_FakeDisk(DiskUsage(1000, 700, 300)),
+        workflow_template={"required_node_classes": sorted(REQUIRED_NODES)},
+        error_recorder=recorder,
+        work_gate=_MutationGate(),
+        state_changed_callback=lambda: state_changes.append("changed"),
+    )
+
+    result = await service.check(_generation_settings())
+
+    assert result.is_ready
+    assert any(call["error_code"] == "disk_space_low" for call in recorder.calls)
+    assert state_changes == ["changed"]
+
+
+@pytest.mark.asyncio
+async def test_preflight_telemetry_is_skipped_after_draining(tmp_path: Path) -> None:
+    recorder = _FakeErrorRecorder()
+    state_changes: list[str] = []
+    service = GenerationPreflightService(
+        _FakeComfyUI(),
+        _settings(tmp_path),
+        disk_usage_adapter=_FakeDisk(DiskUsage(1000, 700, 300)),
+        workflow_template={"required_node_classes": sorted(REQUIRED_NODES)},
+        error_recorder=recorder,
+        work_gate=_MutationGate(blocked=True),
+        state_changed_callback=lambda: state_changes.append("changed"),
+    )
+
+    result = await service.check(_generation_settings())
+
+    assert result.is_ready
+    assert any(issue.code == "disk_space_low" for issue in result.warnings)
+    assert recorder.calls == []
+    assert state_changes == []
 
 
 class _FakeEnqueue:

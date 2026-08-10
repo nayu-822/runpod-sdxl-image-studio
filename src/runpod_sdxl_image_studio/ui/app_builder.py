@@ -496,6 +496,8 @@ def build_app(
         },
         drive_status_provider=drive_sync_service.check_connection,
         error_recorder=system_error_repository,
+        work_gate=lifecycle_service,
+        state_changed_callback=state_sync_service.mark_dirty,
     )
     system_health_service = SystemHealthService(
         comfyui_service,
@@ -505,6 +507,7 @@ def build_app(
         disk_usage_adapter=disk_usage_adapter,
         error_history_repository=system_error_repository,
         state_changed_callback=state_sync_service.mark_dirty,
+        work_gate=lifecycle_service,
     )
     execution_service = GenerationExecutionService(
         generation_service,

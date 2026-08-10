@@ -1,14 +1,15 @@
 """UX-facing generation preflight checks.
 
 The queue worker keeps its own final validation.  This service is deliberately
-read-only and runs before queue persistence so a failed preflight cannot leave
-partial Generation, Job, or Queue rows behind.
+read-only with respect to Generation, Job, and Queue rows.  Optional error
+telemetry is persisted only while the lifecycle mutation gate admits it.
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from typing import Protocol
 from uuid import UUID
@@ -25,6 +26,10 @@ from runpod_sdxl_image_studio.domain.preflight import (
     PreflightSeverity,
 )
 from runpod_sdxl_image_studio.domain.system_status import ComfyUIStatus, ErrorSeverity
+from runpod_sdxl_image_studio.services.pod_lifecycle_service import (
+    LifecycleGate,
+    PodLifecycleWorkBlockedError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +71,8 @@ class GenerationPreflightService:
         drive_status_provider: DriveStatusProvider | None = None,
         error_recorder: ErrorEventRecorder | None = None,
         now_factory: Callable[[], datetime] | None = None,
+        work_gate: LifecycleGate | None = None,
+        state_changed_callback: Callable[[], None] | None = None,
     ) -> None:
         self._comfyui_service = comfyui_service
         self._settings = settings
@@ -77,6 +84,8 @@ class GenerationPreflightService:
         self._drive_status_provider = drive_status_provider
         self._error_recorder = error_recorder
         self._now_factory = now_factory or (lambda: datetime.now(UTC))
+        self._work_gate = work_gate
+        self._state_changed_callback = state_changed_callback
 
     async def check(
         self,
@@ -391,20 +400,40 @@ class GenerationPreflightService:
             )
 
     def _record_issues(self, result: PreflightResult) -> None:
-        if self._error_recorder is None:
+        if self._error_recorder is None or not result.issues:
             return
-        for issue in result.issues:
-            try:
-                self._error_recorder.record(
-                    category="generation_preflight",
-                    severity=ErrorSeverity.ERROR if issue.is_error else ErrorSeverity.WARNING,
-                    error_code=issue.code,
-                    summary=issue.message,
-                    retryable=issue.is_error,
-                    created_at=result.checked_at,
-                )
-            except Exception:  # noqa: BLE001 - telemetry must not block enqueue UX
-                logger.warning("Preflight error history could not be saved", exc_info=True)
+        persisted = False
+        try:
+            mutation = (
+                self._work_gate.admit_persistent_mutation()
+                if self._work_gate is not None
+                else nullcontext()
+            )
+            with mutation:
+                for issue in result.issues:
+                    try:
+                        self._error_recorder.record(
+                            category="generation_preflight",
+                            severity=(
+                                ErrorSeverity.ERROR if issue.is_error else ErrorSeverity.WARNING
+                            ),
+                            error_code=issue.code,
+                            summary=issue.message,
+                            retryable=issue.is_error,
+                            created_at=result.checked_at,
+                        )
+                        persisted = True
+                    except Exception:  # noqa: BLE001 - telemetry must not block enqueue UX
+                        logger.warning("Preflight error history could not be saved", exc_info=True)
+                if persisted and self._state_changed_callback is not None:
+                    try:
+                        self._state_changed_callback()
+                    except Exception:  # noqa: BLE001 - backup notification must not block UX
+                        logger.warning("Preflight state change notification failed")
+        except PodLifecycleWorkBlockedError:
+            logger.info("Preflight error history skipped after lifecycle drain")
+        except Exception:  # noqa: BLE001 - telemetry must not block enqueue UX
+            logger.warning("Preflight error history could not be saved", exc_info=True)
 
 
 def _require_choice(

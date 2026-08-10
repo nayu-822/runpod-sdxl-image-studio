@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from typing import Any, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -32,6 +33,10 @@ from runpod_sdxl_image_studio.domain.system_status import (
     SystemErrorEvent,
     SystemHealthStatus,
     SystemHealthView,
+)
+from runpod_sdxl_image_studio.services.pod_lifecycle_service import (
+    LifecycleGate,
+    PodLifecycleWorkBlockedError,
 )
 
 logger = logging.getLogger(__name__)
@@ -110,6 +115,7 @@ class SystemHealthService:
         error_history_repository: ErrorHistoryProvider | None = None,
         now_factory: Callable[[], datetime] | None = None,
         state_changed_callback: Callable[[], None] | None = None,
+        work_gate: LifecycleGate | None = None,
     ) -> None:
         self._comfyui_service = comfyui_service
         self._queue_service = queue_service
@@ -119,6 +125,7 @@ class SystemHealthService:
         self._error_history_repository = error_history_repository
         self._now_factory = now_factory or (lambda: datetime.now(UTC))
         self._state_changed_callback = state_changed_callback
+        self._work_gate = work_gate
 
     async def get_health(self) -> SystemHealthView:
         """Collect one bounded snapshot; no continuous polling is performed here."""
@@ -397,19 +404,27 @@ class SystemHealthService:
         try:
             recorder = getattr(self._error_history_repository, "record", None)
             if callable(recorder):
-                recorder(
-                    category="system_health",
-                    severity=ErrorSeverity.ERROR,
-                    error_code=error_code,
-                    summary=summary,
-                    retryable=True,
-                    created_at=observed_at,
+                mutation = (
+                    self._work_gate.admit_persistent_mutation()
+                    if self._work_gate is not None
+                    else nullcontext()
                 )
-                if self._state_changed_callback is not None:
-                    try:
-                        self._state_changed_callback()
-                    except Exception:  # noqa: BLE001 - backup notification must not break health
-                        logger.warning("System health state change notification failed")
+                with mutation:
+                    recorder(
+                        category="system_health",
+                        severity=ErrorSeverity.ERROR,
+                        error_code=error_code,
+                        summary=summary,
+                        retryable=True,
+                        created_at=observed_at,
+                    )
+                    if self._state_changed_callback is not None:
+                        try:
+                            self._state_changed_callback()
+                        except Exception:  # noqa: BLE001 - backup notification must not break health
+                            logger.warning("System health state change notification failed")
+        except PodLifecycleWorkBlockedError:
+            logger.info("System health error history skipped after lifecycle drain")
         except Exception:  # noqa: BLE001 - telemetry must not block health rendering
             logger.warning("System health error history could not be saved")
 

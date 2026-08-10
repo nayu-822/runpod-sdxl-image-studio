@@ -163,7 +163,6 @@ class PodLifecycleService:
                 AutoTerminateState.DRAINING,
                 AutoTerminateState.TERMINATION_REQUESTING,
                 AutoTerminateState.TERMINATION_AMBIGUOUS,
-                AutoTerminateState.TERMINATION_FAILED,
             }:
                 raise PodLifecycleWorkBlockedError()
 
@@ -191,6 +190,12 @@ class PodLifecycleService:
             if session is None:
                 return None
             self.ensure_work_allowed()
+            if session.status is AutoTerminateState.TERMINATION_FAILED:
+                # A confirmed DELETE failure is recoverable for normal work,
+                # but a new generation must not silently re-enable automatic
+                # termination.  The user can explicitly reopen it with the
+                # lifecycle toggle.
+                return session
             timestamp = self._now_factory()
             updated = replace(
                 session,
@@ -213,10 +218,9 @@ class PodLifecycleService:
                 AutoTerminateState.DRAINING,
                 AutoTerminateState.TERMINATION_REQUESTING,
                 AutoTerminateState.TERMINATION_AMBIGUOUS,
-                AutoTerminateState.TERMINATION_FAILED,
             }:
-                # Stale browser toggles must never reopen or rewrite the
-                # durable termination boundary.
+                # Stale browser toggles must never reopen or rewrite a
+                # request whose delivery state is still ambiguous.
                 return session
             timestamp = self._now_factory()
             updated = replace(
@@ -479,6 +483,7 @@ class PodLifecycleService:
                 AutoTerminateState.ARMED,
                 AutoTerminateState.WAITING,
                 AutoTerminateState.READY,
+                AutoTerminateState.TERMINATION_FAILED,
             }:
                 if session.status in {
                     AutoTerminateState.TERMINATION_REQUESTING,
@@ -540,8 +545,29 @@ class PodLifecycleService:
             )
             return True
 
+    def reset_grace_to_armed(self) -> bool:
+        """Reset only a WAITING/READY grace state after readiness became unsafe."""
+
+        with self._work_admission_lock:
+            session = self._session
+            if session is None or session.status not in {
+                AutoTerminateState.WAITING,
+                AutoTerminateState.READY,
+            }:
+                return False
+            timestamp = self._now_factory()
+            self._session = self._save(
+                replace(
+                    session,
+                    status=AutoTerminateState.ARMED,
+                    last_activity_at=timestamp,
+                    updated_at=timestamp,
+                )
+            )
+            return True
+
     def _current_generations(self, session: PodLifecycleSession) -> tuple[Any, ...]:
-        return self._generation_repository.list_since(session.started_at, limit=5000)
+        return self._generation_repository.list_since_unbounded(session.started_at)
 
     async def _check_comfyui(self, reasons: list[str]) -> bool:
         if self._comfyui_queue_provider is None:

@@ -82,6 +82,8 @@ class GenerationRepositoryProtocol(Protocol):
 
     def list_since(self, started_at: datetime, limit: int = 1000) -> tuple[Generation, ...]: ...
 
+    def list_since_unbounded(self, started_at: datetime) -> tuple[Generation, ...]: ...
+
     def list_completed_optional_artifact_repairs(
         self,
         limit: int = 50,
@@ -230,6 +232,22 @@ class GenerationRepository(GenerationRepositoryProtocol):
                     .where(GenerationModel.created_at >= _utc(started_at))
                     .order_by(GenerationModel.created_at.asc(), GenerationModel.id.asc())
                     .limit(min(max(1, limit), 5000))
+                ).all()
+                return tuple(_generation_domain(row) for row in rows)
+        except (SQLAlchemyError, SnapshotError) as exc:
+            raise GenerationRepositoryError(
+                "current session generations could not be read"
+            ) from exc
+
+    def list_since_unbounded(self, started_at: datetime) -> tuple[Generation, ...]:
+        """Return every generation in a session for fail-closed safety checks."""
+
+        try:
+            with session_scope(self._session_factory) as session:
+                rows = session.scalars(
+                    select(GenerationModel)
+                    .where(GenerationModel.created_at >= _utc(started_at))
+                    .order_by(GenerationModel.created_at.asc(), GenerationModel.id.asc())
                 ).all()
                 return tuple(_generation_domain(row) for row in rows)
         except (SQLAlchemyError, SnapshotError) as exc:

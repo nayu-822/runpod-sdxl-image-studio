@@ -56,27 +56,44 @@ async def test_terminate_self_hides_unauthorized_response(status: int) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("status", "code"),
+    ("delete_status", "get_response", "expected"),
     [
-        (404, "runpod_terminate_not_found"),
-        (503, "runpod_terminate_unavailable"),
-        (200, "runpod_terminate_malformed_response"),
+        (404, httpx.Response(404), "terminated"),
+        (503, httpx.Response(200, json={"status": "running"}), "confirmed"),
+        (200, httpx.Response(200, json={"status": "running"}), "confirmed"),
     ],
 )
-async def test_terminate_self_maps_non_success_responses(status: int, code: str) -> None:
-    async with _client(lambda request: httpx.Response(status, json={"raw": "hidden"})) as client:
+async def test_terminate_self_confirms_non_success_responses(
+    delete_status: int,
+    get_response: httpx.Response,
+    expected: str,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE":
+            return httpx.Response(delete_status, json={"raw": "hidden"})
+        return get_response
+
+    async with _client(handler) as client:
         adapter = RunPodLifecycleAdapter(
             client=client,
             env={"RUNPOD_POD_ID": "pod-123", "RUNPOD_API_KEY": "secret"},
         )
-        with pytest.raises(RunPodTerminateError) as raised:
-            await adapter.terminate_self()
-    assert raised.value.code == code
-    assert "hidden" not in str(raised.value)
+        if expected == "terminated":
+            result = await adapter.terminate_self()
+            assert result.status is RunPodTerminateStatus.TERMINATED
+        else:
+            with pytest.raises(RunPodTerminateError) as raised:
+                await adapter.terminate_self()
+            assert raised.value.ambiguous is False
+            assert raised.value.code in {
+                "runpod_terminate_unavailable",
+                "runpod_terminate_malformed_response",
+            }
+            assert "hidden" not in str(raised.value)
 
 
 @pytest.mark.asyncio
-async def test_delete_timeout_is_ambiguous_without_a_second_delete() -> None:
+async def test_delete_timeout_with_existing_pod_is_confirmed_without_a_second_delete() -> None:
     calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -92,8 +109,48 @@ async def test_delete_timeout_is_ambiguous_without_a_second_delete() -> None:
         )
         with pytest.raises(RunPodTerminateError) as raised:
             await adapter.terminate_self()
+    assert raised.value.code == "runpod_terminate_confirmed_failure"
+    assert not raised.value.ambiguous
+    assert calls == ["DELETE", "GET"]
+
+
+@pytest.mark.asyncio
+async def test_delete_read_error_with_inconclusive_confirmation_is_ambiguous() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        raise httpx.ReadError("connection lost", request=request)
+
+    async with _client(handler) as client:
+        adapter = RunPodLifecycleAdapter(
+            client=client,
+            env={"RUNPOD_POD_ID": "pod-123", "RUNPOD_API_KEY": "secret"},
+        )
+        with pytest.raises(RunPodTerminateError) as raised:
+            await adapter.terminate_self()
     assert raised.value.code == "runpod_terminate_ambiguous"
     assert raised.value.ambiguous
+    assert calls == ["DELETE", "GET"]
+
+
+@pytest.mark.asyncio
+async def test_delete_protocol_error_with_terminated_confirmation_succeeds() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        if request.method == "DELETE":
+            raise httpx.RemoteProtocolError("connection lost", request=request)
+        return httpx.Response(200, json={"status": "deleted"})
+
+    async with _client(handler) as client:
+        adapter = RunPodLifecycleAdapter(
+            client=client,
+            env={"RUNPOD_POD_ID": "pod-123", "RUNPOD_API_KEY": "secret"},
+        )
+        result = await adapter.terminate_self()
+    assert result.status is RunPodTerminateStatus.TERMINATED
     assert calls == ["DELETE", "GET"]
 
 

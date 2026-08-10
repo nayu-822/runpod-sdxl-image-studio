@@ -58,7 +58,7 @@ class AutoTerminateCoordinator:
                 AutoTerminateState.WAITING,
                 AutoTerminateState.READY,
             }:
-                self._service.abort_draining()
+                self._service.reset_grace_to_armed()
             return readiness
 
         now = self._now_factory()

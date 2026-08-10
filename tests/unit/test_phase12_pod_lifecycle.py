@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -13,6 +13,7 @@ import pytest
 from runpod_sdxl_image_studio.adapters.comfyui.models import ComfyUIQueueStatus
 from runpod_sdxl_image_studio.adapters.runpod.pod_lifecycle import (
     RunPodIdentity,
+    RunPodTerminateError,
     RunPodTerminateResult,
     RunPodTerminateStatus,
 )
@@ -97,6 +98,9 @@ class FakeGenerationRepository:
     def list_since(self, started_at: datetime, limit: int = 1000) -> tuple[Generation, ...]:
         return tuple(item for item in self.generations if item.created_at >= started_at)[:limit]
 
+    def list_since_unbounded(self, started_at: datetime) -> tuple[Generation, ...]:
+        return tuple(item for item in self.generations if item.created_at >= started_at)
+
 
 class FakeQueueRepository:
     def __init__(self) -> None:
@@ -148,11 +152,14 @@ class FakeDriveRepository:
         self.counts = counts or {DriveSyncStatus.SYNCED: 1}
         self.manifest_state = manifest_state
         self.manifest_jobs: list[object] = []
+        self.missing_generation_id: object | None = None
 
     def status_counts(self) -> dict[DriveSyncStatus, int]:
         return self.counts
 
     def get_by_generation(self, generation_id: object) -> object:
+        if generation_id == self.missing_generation_id:
+            return None
         return self.record
 
     def list_manifest_jobs(self, limit: int = 50) -> tuple[object, ...]:
@@ -219,6 +226,22 @@ class FakeRunPod:
     async def terminate_self(self) -> RunPodTerminateResult:
         self.calls += 1
         return RunPodTerminateResult(RunPodTerminateStatus.TERMINATED)
+
+
+class FailingRunPod(FakeRunPod):
+    def __init__(self, *, ambiguous: bool) -> None:
+        super().__init__()
+        self.ambiguous = ambiguous
+
+    async def terminate_self(self) -> RunPodTerminateResult:
+        self.calls += 1
+        raise RunPodTerminateError(
+            "runpod_terminate_confirmed_failure"
+            if not self.ambiguous
+            else "runpod_terminate_ambiguous",
+            "termination failed",
+            ambiguous=self.ambiguous,
+        )
 
 
 class BlockingDispatchRepository:
@@ -527,6 +550,201 @@ async def test_grace_and_final_backup_terminate_once() -> None:
 
 
 @pytest.mark.asyncio
+async def test_waiting_readiness_failure_resets_grace_to_armed() -> None:
+    service, _, state_sync = _service()
+    service.arm_on_generation_enqueue()
+    coordinator = AutoTerminateCoordinator(
+        service,
+        SimpleNamespace(
+            auto_terminate_grace_seconds=30.0,
+            auto_terminate_check_interval_seconds=1.0,
+        ),
+    )
+
+    await coordinator.run_once()
+    assert service.session is not None
+    assert service.session.status is AutoTerminateState.WAITING
+    state_sync.is_clean = False
+
+    readiness = await coordinator.run_once()
+
+    assert readiness is not None and not readiness.is_safe
+    assert service.session.status is AutoTerminateState.ARMED
+
+
+@pytest.mark.asyncio
+async def test_ready_readiness_failure_resets_grace_to_armed() -> None:
+    service, _, state_sync = _service()
+    service.arm_on_generation_enqueue()
+    coordinator = AutoTerminateCoordinator(
+        service,
+        SimpleNamespace(
+            auto_terminate_grace_seconds=30.0,
+            auto_terminate_check_interval_seconds=1.0,
+        ),
+    )
+
+    await coordinator.run_once()
+    await coordinator.run_once()
+    assert service.session is not None
+    assert service.session.status is AutoTerminateState.READY
+    state_sync.is_clean = False
+
+    readiness = await coordinator.run_once()
+
+    assert readiness is not None and not readiness.is_safe
+    assert service.session.status is AutoTerminateState.ARMED
+
+
+@pytest.mark.asyncio
+async def test_grace_restarts_after_real_favorite_and_note_mutations() -> None:
+    lifecycle, runpod, state_sync = _service()
+    current = lifecycle._generation_repository.generations[0]  # type: ignore[attr-defined]
+
+    class MutableGenerationRepository:
+        def __init__(self) -> None:
+            self.generation = current
+
+        def get_by_id(self, generation_id: object) -> Generation | None:
+            return self.generation if generation_id == self.generation.id else None
+
+        def set_favorite(self, generation_id: object, favorite: bool) -> Generation:
+            assert generation_id == self.generation.id
+            self.generation = replace(self.generation, favorite=favorite)
+            return self.generation
+
+        def update_note(self, generation_id: object, note: str | None) -> Generation:
+            assert generation_id == self.generation.id
+            self.generation = replace(self.generation, user_note=note)
+            return self.generation
+
+    class EmptyArtifacts:
+        def list_by_generation(self, generation_id: object) -> tuple[object, ...]:
+            del generation_id
+            return ()
+
+    history = GenerationHistoryService(
+        MutableGenerationRepository(),  # type: ignore[arg-type]
+        EmptyArtifacts(),  # type: ignore[arg-type]
+        Settings(_env_file=None),
+        state_changed_callback=state_sync.mark_dirty,
+        work_gate=lifecycle,
+    )
+    lifecycle.arm_on_generation_enqueue()
+    clock = [datetime(2026, 8, 10, 12, tzinfo=UTC)]
+    coordinator = AutoTerminateCoordinator(
+        lifecycle,
+        SimpleNamespace(
+            auto_terminate_grace_seconds=5.0,
+            auto_terminate_check_interval_seconds=1.0,
+        ),
+        now_factory=lambda: clock[0],
+    )
+
+    await coordinator.run_once()
+    history.set_favorite(current.id, True)
+    history.update_note(current.id, "kept")
+    assert state_sync.mark_dirty_calls == 2
+    assert not state_sync.is_clean
+    await coordinator.run_once()
+    assert lifecycle.session is not None
+    assert lifecycle.session.status is AutoTerminateState.ARMED
+
+    state_sync.is_clean = True
+    await coordinator.run_once()
+    assert lifecycle.session.status is AutoTerminateState.WAITING
+    clock[0] += timedelta(seconds=1)
+    await coordinator.run_once()
+    assert lifecycle.session.status is AutoTerminateState.READY
+    clock[0] += timedelta(seconds=5)
+    await coordinator.run_once()
+
+    assert lifecycle.session.status is AutoTerminateState.TERMINATION_REQUESTING
+    assert runpod.calls == 1
+    assert state_sync.backup_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_confirmed_termination_failure_allows_work_and_manual_retry() -> None:
+    service, _, _ = _service()
+    failing_runpod = FailingRunPod(ambiguous=False)
+    service._runpod_adapter = failing_runpod  # type: ignore[attr-defined]
+    service.arm_on_generation_enqueue()
+
+    with pytest.raises(RunPodTerminateError):
+        await service.manual_drain_backup_and_terminate()
+    assert service.session is not None
+    assert service.session.status is AutoTerminateState.TERMINATION_FAILED
+    error_code = service.session.last_error_code
+
+    repository = BlockingDispatchRepository()
+    repository.release.set()
+    queue = GenerationQueueService(
+        repository,
+        Settings(_env_file=None),
+        lifecycle_gate=service,
+        generation_enqueued_callback=service.arm_on_generation_enqueue,
+    )
+    queue.enqueue(_settings())
+    assert repository.persisted == 1
+    assert service.session.status is AutoTerminateState.TERMINATION_FAILED
+
+    coordinator = AutoTerminateCoordinator(
+        service,
+        SimpleNamespace(
+            auto_terminate_grace_seconds=0.0,
+            auto_terminate_check_interval_seconds=1.0,
+        ),
+    )
+    await coordinator.run_once()
+    assert failing_runpod.calls == 1
+
+    with pytest.raises(RunPodTerminateError):
+        await service.manual_drain_backup_and_terminate()
+    assert failing_runpod.calls == 2
+    assert service.session.status is AutoTerminateState.TERMINATION_FAILED
+
+    updated = service.set_auto_terminate_enabled(False)
+    assert updated is not None
+    assert updated.status is AutoTerminateState.IDLE
+    assert updated.last_error_code == error_code
+    updated = service.set_auto_terminate_enabled(True)
+    assert updated is not None
+    assert updated.status is AutoTerminateState.ARMED
+    assert updated.last_error_code == error_code
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_termination_failure_keeps_work_frozen_and_no_duplicate_delete() -> None:
+    service, _, _ = _service()
+    failing_runpod = FailingRunPod(ambiguous=True)
+    service._runpod_adapter = failing_runpod  # type: ignore[attr-defined]
+    service.arm_on_generation_enqueue()
+
+    with pytest.raises(RunPodTerminateError):
+        await service.manual_drain_backup_and_terminate()
+    assert service.session is not None
+    assert service.session.status is AutoTerminateState.TERMINATION_AMBIGUOUS
+    with pytest.raises(PodLifecycleWorkBlockedError):
+        service.ensure_work_allowed()
+
+    repository = BlockingDispatchRepository()
+    repository.release.set()
+    queue = GenerationQueueService(
+        repository,
+        Settings(_env_file=None),
+        lifecycle_gate=service,
+    )
+    with pytest.raises(GenerationQueueServiceError):
+        queue.enqueue(_settings())
+    assert repository.persisted == 0
+
+    readiness = await service.manual_drain_backup_and_terminate()
+    assert not readiness.is_safe
+    assert failing_runpod.calls == 1
+
+
+@pytest.mark.asyncio
 async def test_manual_terminate_uses_same_drain_backup_path() -> None:
     service, runpod, state_sync = _service()
     service.arm_on_generation_enqueue()
@@ -611,6 +829,48 @@ async def test_termination_safety_uses_unbounded_active_generation_and_manifest_
     readiness = await service2.check_readiness()
     assert not readiness.is_safe
     assert "manifest_active" in readiness.block_reasons
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "late_status",
+    [GenerationStatus.FAILED, GenerationStatus.CANCELLED],
+)
+async def test_current_session_safety_does_not_truncate_terminal_generations(
+    late_status: GenerationStatus,
+) -> None:
+    generations = tuple(_generation() for _ in range(5000)) + (_generation(late_status),)
+    service, _, _ = _service(generations)
+    repository = service._generation_repository  # type: ignore[attr-defined]
+    repository.list_since = lambda *_args, **_kwargs: (_ for _ in ()).throw(  # type: ignore[attr-defined]
+        AssertionError("bounded current-session lookup")
+    )
+    service.arm_on_generation_enqueue()
+
+    readiness = await service.check_readiness()
+
+    assert not readiness.is_safe
+    assert (
+        "generation_failed" if late_status is GenerationStatus.FAILED else "generation_cancelled"
+    ) in readiness.block_reasons
+
+
+@pytest.mark.asyncio
+async def test_current_session_safety_does_not_truncate_unsynced_completed_generation() -> None:
+    generations = tuple(_generation() for _ in range(5001))
+    service, _, _ = _service(generations)
+    repository = service._generation_repository  # type: ignore[attr-defined]
+    repository.list_since = lambda *_args, **_kwargs: (_ for _ in ()).throw(  # type: ignore[attr-defined]
+        AssertionError("bounded current-session lookup")
+    )
+    drive = service._drive_sync_repository  # type: ignore[attr-defined]
+    drive.missing_generation_id = generations[-1].id
+    service.arm_on_generation_enqueue()
+
+    readiness = await service.check_readiness()
+
+    assert not readiness.is_safe
+    assert "drive_not_synced" in readiness.block_reasons
 
 
 def test_persistent_mutation_admission_is_closed_after_draining() -> None:
