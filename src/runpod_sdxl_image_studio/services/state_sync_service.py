@@ -74,6 +74,35 @@ class StateSyncService:
         return self._is_configured and not self._remote_write_protected and not self._closed
 
     @property
+    def dirty_version(self) -> int:
+        """Return the mutation version that must be covered by a remote backup."""
+
+        return self._current_dirty_version()
+
+    @property
+    def backed_up_version(self) -> int:
+        with self._timer_lock:
+            return self._backed_up_version
+
+    @property
+    def backup_in_progress(self) -> bool:
+        return self._backup_lock.locked()
+
+    @property
+    def is_clean(self) -> bool:
+        """Whether every observed mutation is covered by the latest backup."""
+
+        with self._timer_lock:
+            return self._backed_up_version >= self._dirty_version
+
+    @property
+    def has_latest_remote_backup(self) -> bool:
+        """Require an actual successful remote backup, not merely version zero."""
+
+        with self._timer_lock:
+            return self._last_hash is not None and self._view.status is StateSyncStatus.SYNCED
+
+    @property
     def _is_configured(self) -> bool:
         return self._settings.state_sync_enabled and self._storage.is_configured
 

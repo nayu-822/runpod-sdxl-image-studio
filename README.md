@@ -601,3 +601,28 @@ alembic upgrade head
 ```
 
 Phase 9の自動テストはFake adapter、SQLite、Alembicを使い、実GPU・実ComfyUI・実RunPod・実Google Driveを必要としません。
+## Phase 12: Session restore and Safe Auto-Terminate
+
+Phase 12 persists a schema-versioned `GenerationFormStateSnapshot` separately from
+the execution snapshot. The form snapshot is written only after a generation or
+batch enqueue succeeds. On startup the app restores the last valid form state,
+falls back to the latest generation snapshot when needed, and prepares the exact
+checkpoint, VAE, LoRA, and optional upscaler through the Phase 11 model-transfer
+service. Missing models are reported without substitutions and startup never
+submits a new ComfyUI prompt.
+
+Pod lifecycle state is stored per `RUNPOD_POD_ID`; API keys are read only from the
+environment and are never persisted or shown. Auto-terminate is disabled by
+default and can be enabled with `IMAGE_STUDIO_AUTO_TERMINATE_ENABLED=true`. The
+coordinator arms only after a successful enqueue, waits for the configured grace
+period, rechecks every readiness boundary, performs an awaited clean state backup,
+and sends one self-only DELETE request to the fixed RunPod REST endpoint. Any
+ambiguous API result is fail-closed and requires operator review.
+
+```dotenv
+IMAGE_STUDIO_RESTORE_LAST_SETTINGS_ON_STARTUP=true
+IMAGE_STUDIO_AUTO_PREPARE_LAST_MODELS=true
+IMAGE_STUDIO_AUTO_TERMINATE_ENABLED=false
+IMAGE_STUDIO_AUTO_TERMINATE_GRACE_SECONDS=15
+IMAGE_STUDIO_AUTO_TERMINATE_CHECK_INTERVAL_SECONDS=2
+```

@@ -78,6 +78,10 @@ class GenerationRepositoryProtocol(Protocol):
 
     def get_by_prompt_id(self, prompt_id: str) -> Generation | None: ...
 
+    def get_latest(self) -> Generation | None: ...
+
+    def list_since(self, started_at: datetime, limit: int = 1000) -> tuple[Generation, ...]: ...
+
     def list_completed_optional_artifact_repairs(
         self,
         limit: int = 50,
@@ -205,6 +209,33 @@ class GenerationRepository(GenerationRepositoryProtocol):
                 return _generation_domain(row) if row is not None else None
         except (SQLAlchemyError, SnapshotError) as exc:
             raise GenerationRepositoryError("generation could not be read") from exc
+
+    def get_latest(self) -> Generation | None:
+        try:
+            with session_scope(self._session_factory) as session:
+                row = session.scalar(
+                    select(GenerationModel)
+                    .order_by(GenerationModel.created_at.desc(), GenerationModel.id.desc())
+                    .limit(1)
+                )
+                return _generation_domain(row) if row is not None else None
+        except (SQLAlchemyError, SnapshotError) as exc:
+            raise GenerationRepositoryError("latest generation could not be read") from exc
+
+    def list_since(self, started_at: datetime, limit: int = 1000) -> tuple[Generation, ...]:
+        try:
+            with session_scope(self._session_factory) as session:
+                rows = session.scalars(
+                    select(GenerationModel)
+                    .where(GenerationModel.created_at >= _utc(started_at))
+                    .order_by(GenerationModel.created_at.asc(), GenerationModel.id.asc())
+                    .limit(min(max(1, limit), 5000))
+                ).all()
+                return tuple(_generation_domain(row) for row in rows)
+        except (SQLAlchemyError, SnapshotError) as exc:
+            raise GenerationRepositoryError(
+                "current session generations could not be read"
+            ) from exc
 
     def list_completed_optional_artifact_repairs(
         self,

@@ -580,3 +580,19 @@ retryはsource provenanceと `retry_of_generation_id` を保持した新規Gener
 source selection、UIの排他再有効化、mapping、外部image/latentのworkerとreconciliation、source mutation、retry idempotency、migrationの候補消失を拒否する安全なdowngrade、
 既存Queue経路を検証します。複数worker、Queue並べ替え、自動retry、
 汎用workflow editorは対象外です。
+## Phase 12: Session restore and Safe Auto-Terminate
+
+The implementation adds a versioned form-state snapshot distinct from the
+execution snapshot. It is persisted only after successful generation or batch
+enqueue, restored asynchronously at startup, and safely falls back to the latest
+generation snapshot. Phase 11 model preparation is reused for exact checkpoint,
+VAE, LoRA, and optional upscaler restoration; missing models never cause a silent
+substitution and startup does not enqueue a ComfyUI prompt.
+
+Pod lifecycle sessions are keyed by the current `RUNPOD_POD_ID`. Auto-terminate
+is opt-in, arms after successful enqueue, enters a grace/draining state, checks
+generation, ComfyUI, model-transfer, Drive, manifest, and state-backup readiness,
+then awaits a clean final backup before the single self-only RunPod DELETE. The
+worker is fail-closed for identity changes, races, ambiguous API responses, and
+dirty state. Migration `0017_phase12_session_lifecycle` creates only the form
+state and pod lifecycle tables and its downgrade removes only those tables.

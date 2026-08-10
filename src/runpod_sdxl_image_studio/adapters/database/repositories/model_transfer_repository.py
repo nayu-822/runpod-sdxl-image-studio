@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -84,6 +84,8 @@ class ModelTransferRepositoryProtocol(Protocol):
     def get(self, job_id: UUID) -> ModelTransferJob | None: ...
 
     def list_jobs(self, limit: int = 100) -> tuple[ModelTransferJob, ...]: ...
+
+    def status_counts(self) -> dict[ModelTransferStatus, int]: ...
 
     def reconcile_stale(self, *, now: datetime | None = None) -> int: ...
 
@@ -476,6 +478,18 @@ class ModelTransferRepository(ModelTransferRepositoryProtocol):
                 return tuple(row.to_domain() for row in rows)
         except Exception as exc:  # noqa: BLE001
             raise ModelTransferRepositoryError("model transfer jobs could not be read") from exc
+
+    def status_counts(self) -> dict[ModelTransferStatus, int]:
+        try:
+            with session_scope(self._session_factory) as session:
+                rows = session.execute(
+                    select(
+                        ModelTransferJobModel.status, func.count(ModelTransferJobModel.id)
+                    ).group_by(ModelTransferJobModel.status)
+                ).all()
+                return {ModelTransferStatus(status): int(count) for status, count in rows}
+        except Exception as exc:  # noqa: BLE001 - repository boundary
+            raise ModelTransferRepositoryError("model transfer status could not be read") from exc
 
     def reconcile_stale(self, *, now: datetime | None = None) -> int:
         timestamp = _utc(now or datetime.now(UTC))

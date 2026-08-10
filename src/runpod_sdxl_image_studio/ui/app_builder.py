@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from uuid import UUID
 
 import gradio as gr
 
@@ -24,6 +25,9 @@ from runpod_sdxl_image_studio.adapters.database.repositories.drive_sync_reposito
 )
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_dispatch_queue_repository import (  # noqa: E501
     GenerationDispatchQueueRepository,
+)
+from runpod_sdxl_image_studio.adapters.database.repositories.generation_form_state_repository import (  # noqa: E501
+    GenerationFormStateRepository,
 )
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_progress_repository import (
     GenerationProgressRepository,
@@ -49,6 +53,9 @@ from runpod_sdxl_image_studio.adapters.database.repositories.metadata_import_rep
 from runpod_sdxl_image_studio.adapters.database.repositories.model_transfer_repository import (
     ModelTransferRepository,
 )
+from runpod_sdxl_image_studio.adapters.database.repositories.pod_lifecycle_repository import (
+    PodLifecycleRepository,
+)
 from runpod_sdxl_image_studio.adapters.database.repositories.preset_repository import (
     PresetRepository,
 )
@@ -63,6 +70,7 @@ from runpod_sdxl_image_studio.adapters.rclone.remote_model_catalog import (
     RemoteModelCatalogAdapter,
 )
 from runpod_sdxl_image_studio.adapters.rclone.state_backup_storage import StateBackupStorage
+from runpod_sdxl_image_studio.adapters.runpod.pod_lifecycle import RunPodLifecycleAdapter
 from runpod_sdxl_image_studio.adapters.storage.disk_usage import LocalDiskUsageAdapter
 from runpod_sdxl_image_studio.adapters.storage.generation_metadata_storage import (
     GenerationMetadataStorage,
@@ -79,6 +87,10 @@ from runpod_sdxl_image_studio.domain.generation_queue import (
     ReconciliationOutcome,
 )
 from runpod_sdxl_image_studio.domain.lora_search import append_trigger_words
+from runpod_sdxl_image_studio.jobs.auto_terminate_worker import (
+    AutoTerminateCoordinator,
+    AutoTerminateRuntime,
+)
 from runpod_sdxl_image_studio.jobs.drive_sync_worker import DriveSyncRuntime, DriveSyncWorker
 from runpod_sdxl_image_studio.jobs.generation_queue_worker import (
     GenerationQueueRuntime,
@@ -88,11 +100,15 @@ from runpod_sdxl_image_studio.jobs.model_transfer_worker import (
     ModelTransferRuntime,
     ModelTransferWorker,
 )
+from runpod_sdxl_image_studio.jobs.startup_model_restore import StartupModelRestoreRuntime
 from runpod_sdxl_image_studio.services.comfyui_service import ComfyUIService
 from runpod_sdxl_image_studio.services.drive_sync_service import DriveSyncService
 from runpod_sdxl_image_studio.services.generation_diff_service import GenerationDiffService
 from runpod_sdxl_image_studio.services.generation_execution_service import (
     GenerationExecutionService,
+)
+from runpod_sdxl_image_studio.services.generation_form_state_service import (
+    GenerationFormStateService,
 )
 from runpod_sdxl_image_studio.services.generation_history_service import (
     GenerationHistoryService,
@@ -114,6 +130,7 @@ from runpod_sdxl_image_studio.services.lora_catalog_service import (
 )
 from runpod_sdxl_image_studio.services.metadata_import_service import MetadataImportService
 from runpod_sdxl_image_studio.services.model_preparation_service import ModelPreparationService
+from runpod_sdxl_image_studio.services.pod_lifecycle_service import PodLifecycleService
 from runpod_sdxl_image_studio.services.preset_service import PresetService
 from runpod_sdxl_image_studio.services.recent_settings_service import RecentSettingsService
 from runpod_sdxl_image_studio.services.state_sync_service import StateSyncService
@@ -229,6 +246,9 @@ from runpod_sdxl_image_studio.ui.tabs.system_tab import (
     make_batch_enqueue_handler,
     make_check_connection_handler,
     make_enqueue_handler,
+    make_pod_lifecycle_readiness_handler,
+    make_pod_lifecycle_terminate_handler,
+    make_pod_lifecycle_toggle_handler,
     make_refresh_handler,
     make_state_backup_handler,
     make_system_health_handler,
@@ -260,6 +280,8 @@ class ApplicationRuntime:
     queue_runtime: GenerationQueueRuntime
     drive_sync_runtime: DriveSyncRuntime | None = None
     model_transfer_runtime: ModelTransferRuntime | None = None
+    auto_terminate_runtime: AutoTerminateRuntime | None = None
+    startup_model_restore_runtime: StartupModelRestoreRuntime | None = None
     state_sync_service: StateSyncService | None = None
     stateless_reconciliation_service: StatelessReconciliationService | None = None
     run_stateless_reconciliation: bool = False
@@ -271,15 +293,25 @@ class ApplicationRuntime:
             result = self.stateless_reconciliation_service.reconcile()
             if not result.is_success:
                 raise RuntimeError("stateless reconciliation failed; workers were not started")
+        # Form/model restoration starts asynchronously before queue workers so
+        # its durable transfer jobs are visible to the normal worker loop.
+        if self.startup_model_restore_runtime is not None:
+            self.startup_model_restore_runtime.start()
         self.queue_runtime.start()
         if self.drive_sync_runtime is not None:
             self.drive_sync_runtime.start()
         if self.model_transfer_runtime is not None:
             self.model_transfer_runtime.start()
+        if self.auto_terminate_runtime is not None:
+            self.auto_terminate_runtime.start()
 
     def stop(self) -> None:
         """Stop the process-level queue worker."""
 
+        if self.auto_terminate_runtime is not None:
+            self.auto_terminate_runtime.stop()
+        if self.startup_model_restore_runtime is not None:
+            self.startup_model_restore_runtime.stop()
         if self.drive_sync_runtime is not None:
             self.drive_sync_runtime.stop()
         if self.model_transfer_runtime is not None:
@@ -320,6 +352,32 @@ def build_app(
         storage=StateBackupStorage(app_settings, drive_adapter),
         initial_remote_sha256=initial_remote_sha256,
     )
+    upscale_settings_repository = UpscaleSettingsRepository(session_factory)
+
+    def legacy_upscaler_name(generation_id: UUID) -> str | None:
+        snapshot = upscale_settings_repository.get_by_generation(generation_id)
+        return snapshot.upscaler_name if snapshot is not None else None
+
+    form_state_repository = GenerationFormStateRepository(session_factory)
+    form_state_service = GenerationFormStateService(
+        form_state_repository,
+        generation_repository.get_latest,
+        upscaler_provider=legacy_upscaler_name,
+        state_changed_callback=state_sync_service.mark_dirty,
+    )
+    lifecycle_service = PodLifecycleService(
+        PodLifecycleRepository(session_factory),
+        generation_repository,
+        dispatch_queue_repository,
+        model_transfer_repository,
+        drive_sync_repository,
+        state_sync_service,
+        RunPodLifecycleAdapter(),
+        settings=app_settings,
+        comfyui_queue_provider=client.get_queue_status,
+        state_changed_callback=state_sync_service.mark_dirty,
+    )
+    lifecycle_service.initialize_session()
     catalog_service = LoraCatalogService(
         LoraMetadataRepository(create_session_factory(database_engine)),
         LoraThumbnailStorage(
@@ -337,6 +395,7 @@ def build_app(
         comfyui_service.refresh_capabilities,
         lora_catalog_service=catalog_service,
         state_changed_callback=state_sync_service.mark_dirty,
+        work_gate=lifecycle_service,
     )
     loaded_workflow = load_txt2img_template(
         app_settings.workflow_dir.parent if app_settings.workflow_dir.exists() else None
@@ -344,7 +403,6 @@ def build_app(
     workflow_root = app_settings.workflow_dir.parent if app_settings.workflow_dir.exists() else None
     loaded_image_upscale = load_workflow_template("sdxl_image_upscale", workflow_root)
     loaded_latent_upscale = load_workflow_template("sdxl_latent_upscale", workflow_root)
-    upscale_settings_repository = UpscaleSettingsRepository(session_factory)
     metadata_import_repository = MetadataImportRepository(session_factory)
     imported_image_storage = ImportedImageStorage(app_settings)
     metadata_import_service = MetadataImportService(
@@ -363,6 +421,8 @@ def build_app(
         metadata_import_repository=metadata_import_repository,
         imported_image_storage=imported_image_storage,
         upscale_settings_repository=upscale_settings_repository,
+        work_gate=lifecycle_service,
+        generation_enqueued_callback=lifecycle_service.arm_on_generation_enqueue,
     )
 
     def set_phase6_capabilities(capabilities: ComfyUICapabilities | None) -> None:
@@ -405,6 +465,7 @@ def build_app(
         app_settings,
         drive_adapter,
         metadata_repair_handler=generation_service.repair_optional_artifacts,
+        work_gate=lifecycle_service,
     )
     generation_service.set_drive_sync_enqueue_handler(drive_sync_service.enqueue_generation)
     cancellation_adapter = ComfyUICancellationAdapter(client, app_settings)
@@ -413,6 +474,8 @@ def build_app(
         app_settings,
         cancellation_adapter,
         upscale_settings_repository=upscale_settings_repository,
+        lifecycle_gate=lifecycle_service,
+        generation_enqueued_callback=lifecycle_service.arm_on_generation_enqueue,
     )
     disk_usage_adapter = LocalDiskUsageAdapter()
     preflight_service = GenerationPreflightService(
@@ -506,6 +569,19 @@ def build_app(
         state_changed_callback=state_sync_service.mark_dirty,
     )
     model_transfer_runtime = ModelTransferRuntime(model_transfer_worker)
+    startup_model_restore_runtime = StartupModelRestoreRuntime(
+        form_state_service,
+        model_preparation_service,
+        app_settings,
+    )
+    auto_terminate_runtime = AutoTerminateRuntime(
+        AutoTerminateCoordinator(
+            lifecycle_service,
+            app_settings,
+            startup_restore_ready=lambda: startup_model_restore_runtime.is_ready,
+        ),
+        app_settings,
+    )
     queue_service.set_wake_callback(queue_runtime.wake)
     preset_repository = PresetRepository(session_factory)
     preset_service = PresetService(preset_repository, app_settings)
@@ -523,6 +599,56 @@ def build_app(
         queue_service,
         history_service,
     )
+
+    def restore_form_state_handler(
+        checkpoint_choices: object,
+        vae_choices: object,
+        sampler_choices: object,
+        scheduler_choices: object,
+        upscaler_choices: object,
+        lora_choices: object,
+    ) -> tuple[object, ...]:
+        if not app_settings.restore_last_settings_on_startup:
+            return tuple(gr.skip() for _ in range(15))
+        restored = form_state_service.restore()
+        snapshot = restored.snapshot
+        if snapshot is None:
+            return tuple(gr.skip() for _ in range(15))
+
+        def available(value: str | None, choices: object) -> str | None:
+            if value is None:
+                return None
+            if isinstance(choices, (list, tuple, set, frozenset)):
+                return value if value in choices else None
+            return None
+
+        lora_rows = [
+            {
+                "row_id": f"restored-{index}",
+                "lora_name": item.name,
+                "model_strength": item.model_strength,
+                "clip_strength": item.clip_strength,
+            }
+            for index, item in enumerate(snapshot.loras)
+        ]
+        return (
+            snapshot.positive_prompt,
+            snapshot.negative_prompt,
+            snapshot.ui_seed_mode,
+            snapshot.seed,
+            snapshot.width,
+            snapshot.height,
+            snapshot.steps,
+            snapshot.cfg_scale,
+            available(snapshot.checkpoint_name, checkpoint_choices),
+            available(snapshot.sampler_name, sampler_choices),
+            available(snapshot.scheduler_name, scheduler_choices),
+            available(snapshot.vae_name, vae_choices),
+            available(snapshot.upscaler_name, upscaler_choices),
+            lora_rows,
+            snapshot.model_dump(mode="json"),
+        )
+
     with gr.Blocks(title=APP_TITLE, css=APP_CSS) as demo:
         gr.Markdown(f"# {APP_TITLE}")
         with gr.Tab("生成"):
@@ -605,6 +731,34 @@ def build_app(
             outputs=[system.state_backup_button],
             queue=False,
         )
+        system.lifecycle_refresh_button.click(
+            fn=make_pod_lifecycle_readiness_handler(lifecycle_service),
+            outputs=[system.lifecycle_markdown, system.lifecycle_message],
+            concurrency_limit=1,
+        )
+        system.lifecycle_terminate_button.click(
+            fn=lambda: gr.Button(interactive=False),
+            outputs=[system.lifecycle_terminate_button],
+            queue=False,
+        ).then(
+            fn=make_pod_lifecycle_terminate_handler(lifecycle_service),
+            outputs=[system.lifecycle_markdown, system.lifecycle_message],
+            concurrency_limit=1,
+        ).then(
+            fn=lambda: gr.Button(interactive=True),
+            outputs=[system.lifecycle_terminate_button],
+            queue=False,
+        )
+        system.lifecycle_toggle_button.click(
+            fn=make_pod_lifecycle_toggle_handler(lifecycle_service),
+            outputs=[system.lifecycle_markdown, system.lifecycle_message],
+            queue=False,
+        )
+        demo.load(
+            fn=make_pod_lifecycle_readiness_handler(lifecycle_service),
+            outputs=[system.lifecycle_markdown, system.lifecycle_message],
+            concurrency_limit=1,
+        )
 
         mobile_status_inputs = [
             generation.active_generation_id,
@@ -634,6 +788,54 @@ def build_app(
             fn=mobile_status_handler,
             inputs=mobile_status_inputs,
             outputs=mobile_status_outputs,
+            concurrency_limit=1,
+        )
+        demo.load(
+            fn=make_refresh_handler(
+                comfyui_service,
+                generation,
+                catalog_service,
+                set_phase6_capabilities,
+            ),
+            inputs=[
+                generation.checkpoint,
+                generation.vae,
+                generation.sampler,
+                generation.scheduler,
+                generation.upscaler,
+                generation.lora_editor.state,
+                generation.lora_editor.choices,
+                generation.lora_category_filter,
+            ],
+            outputs=[system.capability_message, *capability_outputs],
+            concurrency_limit=1,
+        ).then(
+            fn=restore_form_state_handler,
+            inputs=[
+                generation.checkpoint_choices,
+                generation.vae_choices,
+                generation.sampler_choices,
+                generation.scheduler_choices,
+                generation.upscaler_choices,
+                generation.lora_editor.choices,
+            ],
+            outputs=[
+                generation.positive_prompt,
+                generation.negative_prompt,
+                generation.seed_mode,
+                generation.seed,
+                generation.width,
+                generation.height,
+                generation.steps,
+                generation.cfg_scale,
+                generation.checkpoint,
+                generation.sampler,
+                generation.scheduler,
+                generation.vae,
+                generation.upscaler,
+                generation.lora_editor.state,
+                generation.restored_form_state,
+            ],
             concurrency_limit=1,
         )
         demo.load(
@@ -967,6 +1169,7 @@ def build_app(
                 queue_service,
                 app_settings.max_loras,
                 preflight_service,
+                form_state_service.save,
             ),
             inputs=[
                 generation.checkpoint,
@@ -987,6 +1190,7 @@ def build_app(
                 generation.batch_start_seed,
                 generation.batch_seed_step,
                 generation.batch_name,
+                generation.upscaler,
             ],
             outputs=[
                 generation.batch_enqueue_button,
@@ -1965,6 +2169,7 @@ def build_app(
             generation.restored_from_generation,
             generation.regeneration_valid,
             generation.regeneration_requested,
+            generation.upscaler,
         ]
         regenerate_event = history.regenerate_button.click(
             fn=begin_regeneration,
@@ -1982,7 +2187,12 @@ def build_app(
             outputs=restore_outputs,
         )
         regeneration_generation_event = regenerate_event.then(
-            fn=make_enqueue_handler(queue_service, app_settings.max_loras, preflight_service),
+            fn=make_enqueue_handler(
+                queue_service,
+                app_settings.max_loras,
+                preflight_service,
+                form_state_service.save,
+            ),
             inputs=generation_inputs,
             outputs=[
                 generation.generate_button,
@@ -2008,7 +2218,12 @@ def build_app(
             queue=False,
         )
         generation_enqueue_event = generate_event.then(
-            fn=make_enqueue_handler(queue_service, app_settings.max_loras, preflight_service),
+            fn=make_enqueue_handler(
+                queue_service,
+                app_settings.max_loras,
+                preflight_service,
+                form_state_service.save,
+            ),
             inputs=generation_inputs,
             outputs=[
                 generation.generate_button,
@@ -2066,7 +2281,12 @@ def build_app(
             concurrency_limit=1,
         )
         result_regenerate_enqueue_event = result_regenerate_event.then(
-            fn=make_enqueue_handler(queue_service, app_settings.max_loras, preflight_service),
+            fn=make_enqueue_handler(
+                queue_service,
+                app_settings.max_loras,
+                preflight_service,
+                form_state_service.save,
+            ),
             inputs=generation_inputs,
             outputs=[
                 generation.generate_button,
@@ -2095,8 +2315,11 @@ def build_app(
     demo.generation_queue_runtime = queue_runtime
     demo.drive_sync_runtime = drive_sync_runtime
     demo.model_transfer_runtime = model_transfer_runtime
+    demo.auto_terminate_runtime = auto_terminate_runtime
+    demo.startup_model_restore_runtime = startup_model_restore_runtime
     demo.state_sync_service = state_sync_service
     demo.stateless_reconciliation_service = stateless_reconciliation_service
+    demo.pod_lifecycle_service = lifecycle_service
     return demo
 
 
@@ -2118,6 +2341,12 @@ def build_application_runtime(
     model_runtime = getattr(demo, "model_transfer_runtime", None)
     if not isinstance(model_runtime, ModelTransferRuntime):
         raise RuntimeError("model transfer runtime was not configured")
+    auto_terminate_runtime = getattr(demo, "auto_terminate_runtime", None)
+    if not isinstance(auto_terminate_runtime, AutoTerminateRuntime):
+        raise RuntimeError("auto terminate runtime was not configured")
+    startup_model_restore_runtime = getattr(demo, "startup_model_restore_runtime", None)
+    if not isinstance(startup_model_restore_runtime, StartupModelRestoreRuntime):
+        raise RuntimeError("startup model restore runtime was not configured")
     state_sync_service = getattr(demo, "state_sync_service", None)
     if not isinstance(state_sync_service, StateSyncService):
         raise RuntimeError("state sync service was not configured")
@@ -2129,6 +2358,8 @@ def build_application_runtime(
         queue_runtime=runtime,
         drive_sync_runtime=drive_runtime,
         model_transfer_runtime=model_runtime,
+        auto_terminate_runtime=auto_terminate_runtime,
+        startup_model_restore_runtime=startup_model_restore_runtime,
         state_sync_service=state_sync_service,
         stateless_reconciliation_service=stateless_reconciliation_service,
         run_stateless_reconciliation=run_stateless_reconciliation,

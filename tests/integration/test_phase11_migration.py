@@ -44,11 +44,14 @@ def test_phase11_migration_round_trip_preserves_existing_rows(tmp_path: Path) ->
         assert session.scalar(select(GenerationModel.id).where(GenerationModel.id == generation_id))
 
     command.downgrade(config, "-1")
-    assert not inspect(engine).has_table("model_transfer_jobs")
+    assert inspect(engine).has_table("model_transfer_jobs")
+    assert not inspect(engine).has_table("generation_form_state")
+    assert not inspect(engine).has_table("pod_lifecycle_sessions")
     assert inspect(engine).has_table("generations")
     with Session(engine) as session:
         assert session.scalar(select(GenerationModel.id).where(GenerationModel.id == generation_id))
 
     command.upgrade(config, "head")
     assert inspect(engine).has_table("model_transfer_jobs")
+    assert inspect(engine).has_table("pod_lifecycle_sessions")
     engine.dispose()

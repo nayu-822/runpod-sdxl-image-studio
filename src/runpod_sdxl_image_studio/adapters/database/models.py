@@ -129,6 +129,40 @@ class GenerationModel(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class GenerationFormStateModel(Base):
+    """Singleton UI snapshot for restoring the last successful form values."""
+
+    __tablename__ = "generation_form_state"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    snapshot_json: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class PodLifecycleSessionModel(Base):
+    """Current-pod lifecycle intent; secrets are deliberately not columns."""
+
+    __tablename__ = "pod_lifecycle_sessions"
+    __table_args__ = (UniqueConstraint("pod_id", name="uq_pod_lifecycle_session_pod"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    pod_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    auto_terminate_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    auto_terminate_armed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    status: Mapped[str] = mapped_column(String(40), nullable=False, default="idle")
+    last_activity_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_error_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    last_error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class GenerationArtifactModel(Base):
     __tablename__ = "generation_artifacts"
     __table_args__ = (

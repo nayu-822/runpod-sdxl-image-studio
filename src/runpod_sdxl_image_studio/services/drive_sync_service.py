@@ -100,6 +100,7 @@ class DriveSyncService:
         rclone_adapter: DriveAdapterProtocol | None = None,
         metadata_repair_handler: MetadataRepairHandler | None = None,
         id_factory: Callable[[], UUID] = uuid4,
+        work_gate: object | None = None,
     ) -> None:
         if adapter is not None and rclone_adapter is not None:
             raise ValueError("adapter and rclone_adapter cannot both be configured")
@@ -113,6 +114,7 @@ class DriveSyncService:
         self._adapter = selected_adapter
         self._metadata_repair_handler = metadata_repair_handler
         self._id_factory = id_factory
+        self._work_gate = work_gate
 
     async def check_connection(self) -> DriveConnectionResult:
         return await self._adapter.check_connection()
@@ -125,6 +127,8 @@ class DriveSyncService:
 
     def enqueue_generation(self, generation_id: UUID) -> DriveSyncRecord | None:
         """Create one persistent sync record after generation completion."""
+
+        self._ensure_work_allowed()
 
         generation = self._get_completed_generation(generation_id)
         existing = self._repository.get_by_generation(generation_id)
@@ -170,6 +174,8 @@ class DriveSyncService:
         self, generation_id: UUID, *, resync: bool = False
     ) -> tuple[DriveSyncRecord, DriveSyncJob | None]:
         """Retry a failed record or explicitly resync a synced record."""
+
+        self._ensure_work_allowed()
 
         generation = self._get_completed_generation(generation_id)
         existing = self._repository.get_by_generation(generation_id)
@@ -518,6 +524,7 @@ class DriveSyncService:
         *,
         destination: DriveDestination | None = None,
     ) -> DriveManifestJob:
+        self._ensure_work_allowed()
         if not self._settings.rclone_remote and destination is None:
             raise DriveSyncServiceError(
                 DriveSyncErrorCode.NOT_CONFIGURED.value,
@@ -715,6 +722,13 @@ class DriveSyncService:
 
     def _current_destination(self) -> DriveDestination:
         return DriveDestination(self._settings.rclone_remote, self._settings.rclone_base_path)
+
+    def _ensure_work_allowed(self) -> None:
+        if self._work_gate is None:
+            return
+        ensure = getattr(self._work_gate, "ensure_work_allowed", None)
+        if callable(ensure):
+            ensure()
 
     def _get_completed_generation(self, generation_id: UUID) -> Generation:
         generation = self._generation_repository.get_by_id(generation_id)

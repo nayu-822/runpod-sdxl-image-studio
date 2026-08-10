@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import secrets
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -33,6 +34,8 @@ from runpod_sdxl_image_studio.domain.generation_settings import (
 )
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
 from runpod_sdxl_image_studio.domain.upscale_snapshot import UpscaleSourceKind
+
+logger = logging.getLogger(__name__)
 
 
 class GenerationCancellationAdapterProtocol(Protocol):
@@ -83,11 +86,15 @@ class GenerationQueueService:
         cancellation_adapter: GenerationCancellationAdapterProtocol | None = None,
         *,
         upscale_settings_repository: UpscaleSettingsRepositoryProtocol | None = None,
+        lifecycle_gate: object | None = None,
+        generation_enqueued_callback: Callable[[], object] | None = None,
     ) -> None:
         self._repository = repository
         self._settings = settings
         self._cancellation_adapter = cancellation_adapter
         self._upscale_settings_repository = upscale_settings_repository
+        self._lifecycle_gate = lifecycle_gate
+        self._generation_enqueued_callback = generation_enqueued_callback
         self._wake_callback: Callable[[], None] | None = None
 
     def set_wake_callback(self, callback: Callable[[], None] | None) -> None:
@@ -99,6 +106,7 @@ class GenerationQueueService:
         *,
         parent_generation_id: UUID | None = None,
     ) -> QueueEnqueueResult:
+        self._ensure_work_allowed()
         resolved = settings.model_copy(update={"seed": _resolve_seed(settings.seed)})
         try:
             snapshot = GenerationSettingsSnapshot.from_settings(resolved)
@@ -108,6 +116,7 @@ class GenerationQueueService:
                 pending_limit=self._settings.queue_max_pending_jobs,
             )
             self._wake()
+            self._notify_generation_enqueued()
             return QueueEnqueueResult(item=item, queue_position=item.entry.sequence)
         except (GenerationDispatchQueueRepositoryError, ValueError) as exc:
             raise GenerationQueueServiceError(_enqueue_error_message(exc, "生成")) from exc
@@ -122,6 +131,7 @@ class GenerationQueueService:
         seed_step: int,
         name: str,
     ) -> BatchEnqueueResult:
+        self._ensure_work_allowed()
         strategy = _seed_strategy(seed_strategy)
         self._validate_batch(count, strategy, start_seed, seed_step, name)
         seeds = _batch_seeds(count, strategy, start_seed, seed_step)
@@ -139,6 +149,7 @@ class GenerationQueueService:
                 pending_limit=self._settings.queue_max_pending_jobs,
             )
             self._wake()
+            self._notify_generation_enqueued()
             return BatchEnqueueResult(batch=batch, items=items)
         except (GenerationDispatchQueueRepositoryError, ValueError) as exc:
             raise GenerationQueueServiceError(_enqueue_error_message(exc, "バッチ")) from exc
@@ -260,6 +271,7 @@ class GenerationQueueService:
             ) from exc
 
     def retry(self, generation_id: UUID) -> QueueEnqueueResult:
+        self._ensure_work_allowed()
         try:
             item = self._repository.get_queue_item(generation_id)
             if item is None:
@@ -316,6 +328,7 @@ class GenerationQueueService:
                     pending_limit=self._settings.queue_max_pending_jobs,
                 )
             self._wake()
+            self._notify_generation_enqueued()
             return QueueEnqueueResult(new_item, new_item.entry.sequence)
         except GenerationQueueServiceError:
             raise
@@ -329,6 +342,7 @@ class GenerationQueueService:
             ) from exc
 
     def retry_failed_batch(self, batch_id: UUID) -> BatchEnqueueResult | None:
+        self._ensure_work_allowed()
         try:
             source_items = self._repository.list_batch_items(batch_id)
             failed = [
@@ -354,6 +368,7 @@ class GenerationQueueService:
                 pending_limit=self._settings.queue_max_pending_jobs,
             )
             self._wake()
+            self._notify_generation_enqueued()
             return BatchEnqueueResult(batch, items)
         except GenerationQueueServiceError:
             raise
@@ -374,6 +389,29 @@ class GenerationQueueService:
             raise GenerationQueueServiceError("待機中ジョブ数を確認できませんでした。") from exc
         if len(pending) + additional > self._settings.queue_max_pending_jobs:
             raise GenerationQueueServiceError("待機中ジョブ数の上限に達しています。")
+
+    def _ensure_work_allowed(self) -> None:
+        if self._lifecycle_gate is None:
+            return
+        ensure = getattr(self._lifecycle_gate, "ensure_work_allowed", None)
+        if callable(ensure):
+            try:
+                ensure()
+            except Exception as exc:  # noqa: BLE001 - keep UI error boundary stable
+                if isinstance(exc, GenerationQueueServiceError):
+                    raise
+                raise GenerationQueueServiceError(str(exc)) from exc
+
+    def _notify_generation_enqueued(self) -> None:
+        if self._generation_enqueued_callback is None:
+            return
+        try:
+            self._generation_enqueued_callback()
+        except Exception as exc:  # noqa: BLE001 - queue persistence already succeeded
+            logger.warning(
+                "generation enqueue lifecycle arm failed error=%s",
+                type(exc).__name__,
+            )
 
     def _wake(self) -> None:
         if self._wake_callback is not None:

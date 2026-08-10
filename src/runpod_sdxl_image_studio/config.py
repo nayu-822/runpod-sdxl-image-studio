@@ -233,6 +233,21 @@ class Settings(BaseSettings):
     state_sync_download_timeout_seconds: float = Field(
         600.0, validation_alias="IMAGE_STUDIO_STATE_SYNC_DOWNLOAD_TIMEOUT_SECONDS"
     )
+    restore_last_settings_on_startup: bool = Field(
+        True, validation_alias="IMAGE_STUDIO_RESTORE_LAST_SETTINGS_ON_STARTUP"
+    )
+    auto_prepare_last_models: bool = Field(
+        True, validation_alias="IMAGE_STUDIO_AUTO_PREPARE_LAST_MODELS"
+    )
+    auto_terminate_enabled: bool = Field(
+        False, validation_alias="IMAGE_STUDIO_AUTO_TERMINATE_ENABLED"
+    )
+    auto_terminate_grace_seconds: float = Field(
+        15.0, validation_alias="IMAGE_STUDIO_AUTO_TERMINATE_GRACE_SECONDS"
+    )
+    auto_terminate_check_interval_seconds: float = Field(
+        2.0, validation_alias="IMAGE_STUDIO_AUTO_TERMINATE_CHECK_INTERVAL_SECONDS"
+    )
 
     @field_validator("rclone_remote")
     @classmethod
@@ -369,6 +384,7 @@ class Settings(BaseSettings):
         "remote_model_download_timeout_seconds",
         "state_sync_upload_timeout_seconds",
         "state_sync_download_timeout_seconds",
+        "auto_terminate_check_interval_seconds",
     )
     @classmethod
     def validate_queue_timing(cls, value: float) -> float:
@@ -383,7 +399,11 @@ class Settings(BaseSettings):
             raise ValueError("rclone_transfer_timeout_seconds must be zero or greater")
         return None if value == 0 else value
 
-    @field_validator("reconciliation_grace_seconds", "queue_auto_refresh_seconds")
+    @field_validator(
+        "reconciliation_grace_seconds",
+        "queue_auto_refresh_seconds",
+        "auto_terminate_grace_seconds",
+    )
     @classmethod
     def validate_queue_optional_timing(cls, value: float) -> float:
         if value < 0:

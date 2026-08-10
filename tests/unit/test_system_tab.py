@@ -66,7 +66,7 @@ async def test_system_handler_uses_service_and_returns_dropdown_updates() -> Non
     assert result[2].choices[0][0] == "model.safetensors"
     assert result[6].choices
     assert result[6].choices[0][0] == "upscaler.pth"
-    assert "style.safetensors" in result[9]
+    assert "style.safetensors" in result[14]
 
 
 @pytest.mark.asyncio

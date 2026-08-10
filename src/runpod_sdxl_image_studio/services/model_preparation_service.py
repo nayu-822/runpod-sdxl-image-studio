@@ -78,6 +78,7 @@ class ModelPreparationResult:
     jobs: tuple[ModelTransferJob, ...]
     message: str
     catalog: RemoteModelCatalog | None = None
+    missing: tuple[str, ...] = ()
 
 
 class ModelPreparationService:
@@ -92,6 +93,7 @@ class ModelPreparationService:
         *,
         lora_catalog_service: LoraCatalogPort | None = None,
         state_changed_callback: Callable[[], None] | None = None,
+        work_gate: object | None = None,
     ) -> None:
         self._repository = repository
         self._catalog_adapter = catalog_adapter
@@ -99,6 +101,7 @@ class ModelPreparationService:
         self._capability_refresh = capability_refresh
         self._lora_catalog_service = lora_catalog_service
         self._state_changed_callback = state_changed_callback
+        self._work_gate = work_gate
         self._catalog: RemoteModelCatalog | None = None
 
     async def refresh_catalog(self) -> RemoteModelCatalog:
@@ -130,6 +133,7 @@ class ModelPreparationService:
         loras: Sequence[str] | None,
         upscaler: str | None,
     ) -> ModelPreparationResult:
+        self._ensure_work_allowed()
         catalog = await self.refresh_catalog()
         selections: list[tuple[RemoteModelKind, str]] = []
         for kind, value in (
@@ -177,6 +181,58 @@ class ModelPreparationService:
         return ModelPreparationResult(
             tuple(jobs), f"{len(jobs)}件のモデル準備をキューへ登録しました。", catalog
         )
+
+    async def prepare_previous_models(
+        self,
+        checkpoint: str | None,
+        vae: str | None,
+        loras: Sequence[str] | None,
+        upscaler: str | None = None,
+    ) -> ModelPreparationResult:
+        """Queue exact restored selections independently and report missing ones."""
+
+        self._ensure_work_allowed()
+        catalog = await self.refresh_catalog()
+        selections: list[tuple[RemoteModelKind, str]] = []
+        for kind, value in (
+            (RemoteModelKind.CHECKPOINT, checkpoint),
+            (RemoteModelKind.VAE, vae),
+            (RemoteModelKind.UPSCALER, upscaler),
+        ):
+            if value and value.strip():
+                selections.append((kind, value.strip()))
+        selected_loras = tuple(
+            dict.fromkeys(item.strip() for item in (loras or ()) if item.strip())
+        )
+        if len(selected_loras) > self._settings.max_loras:
+            raise ModelPreparationServiceError(
+                "too_many_loras",
+                f"at most {self._settings.max_loras} LoRAs may be restored",
+                retryable=False,
+            )
+        selections.extend((RemoteModelKind.LORA, item) for item in selected_loras)
+
+        jobs: list[ModelTransferJob] = []
+        missing: list[str] = []
+        for kind, relative in selections:
+            try:
+                entry = catalog.find(kind, relative)
+            except ValueError:
+                entry = None
+            if entry is None:
+                missing.append(f"{kind.value}:{relative}")
+                continue
+            try:
+                jobs.append(await self.prepare_entry(entry))
+            except ModelPreparationServiceError as exc:
+                missing.append(f"{kind.value}:{relative} ({exc.code})")
+        self._notify_state_changed()
+        message = (
+            "Some restored models are unavailable; no substitute was selected"
+            if missing
+            else f"{len(jobs)} restored model selections were queued"
+        )
+        return ModelPreparationResult(tuple(jobs), message, catalog, tuple(missing))
 
     async def prepare_entry(self, entry: RemoteModelEntry) -> ModelTransferJob:
         local_path = self.local_path_for(entry)
@@ -388,6 +444,7 @@ class ModelPreparationService:
         return result
 
     async def retry(self, job_id: UUID) -> ModelTransferJob:
+        self._ensure_work_allowed()
         catalog = await self.refresh_catalog()
         current = self._repository.get(job_id)
         if current is None:
@@ -488,6 +545,13 @@ class ModelPreparationService:
             self._state_changed_callback()
         except Exception:  # noqa: BLE001 - backup notification is best effort
             logger.warning("model transfer state backup notification failed", exc_info=True)
+
+    def _ensure_work_allowed(self) -> None:
+        if self._work_gate is None:
+            return
+        ensure = getattr(self._work_gate, "ensure_work_allowed", None)
+        if callable(ensure):
+            ensure()
 
 
 def _matching_local_sha256(path: Path, entry: RemoteModelEntry) -> str | None:

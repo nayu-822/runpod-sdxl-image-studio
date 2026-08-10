@@ -17,6 +17,7 @@ from runpod_sdxl_image_studio.domain.generation import (
     GenerationProgress,
     GenerationStatus,
 )
+from runpod_sdxl_image_studio.domain.generation_form_state import GenerationFormStateSnapshot
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
 from runpod_sdxl_image_studio.services.comfyui_service import ComfyUIService
 from runpod_sdxl_image_studio.services.generation_preflight_service import (
@@ -31,6 +32,7 @@ from runpod_sdxl_image_studio.services.lora_catalog_service import (
     LoraCatalogError,
     LoraCatalogService,
 )
+from runpod_sdxl_image_studio.services.pod_lifecycle_service import PodLifecycleService
 from runpod_sdxl_image_studio.services.state_sync_service import StateSyncService
 from runpod_sdxl_image_studio.services.system_health_service import SystemHealthService
 from runpod_sdxl_image_studio.ui.components.generation_status_card import (
@@ -71,6 +73,11 @@ class SystemTabComponents:
     state_sync_markdown: gr.Markdown
     state_backup_button: gr.Button
     state_sync_message: gr.Markdown
+    lifecycle_markdown: gr.Markdown
+    lifecycle_refresh_button: gr.Button
+    lifecycle_terminate_button: gr.Button
+    lifecycle_toggle_button: gr.Button
+    lifecycle_message: gr.Markdown
 
 
 @dataclass(frozen=True)
@@ -81,6 +88,9 @@ class GenerationTabComponents:
     vae: gr.Dropdown
     checkpoint_choices: gr.State
     vae_choices: gr.State
+    sampler_choices: gr.State
+    scheduler_choices: gr.State
+    upscaler_choices: gr.State
     sampler: gr.Dropdown
     scheduler: gr.Dropdown
     upscaler: gr.Dropdown
@@ -108,6 +118,7 @@ class GenerationTabComponents:
     result_image: gr.Image
     result_details: gr.Markdown
     restored_from_generation: gr.State
+    restored_form_state: gr.State
     regeneration_valid: gr.State
     regeneration_requested: gr.State
     positive_clear_button: gr.Button
@@ -146,6 +157,9 @@ def capability_refresh_outputs(generation: GenerationTabComponents) -> tuple[Any
         generation.upscaler,
         generation.checkpoint_choices,
         generation.vae_choices,
+        generation.sampler_choices,
+        generation.scheduler_choices,
+        generation.upscaler_choices,
         generation.lora_list,
         generation.generate_button,
         generation.lora_editor.choices,
@@ -162,6 +176,7 @@ def build_system_tab(
     initial_health_markdown: str = "### System Health\nNot checked",
     initial_error_history_markdown: str = "### Recent errors\nNo recent operational errors.",
     initial_state_sync_markdown: str = "### State backup status\nNot checked",
+    initial_lifecycle_markdown: str = "## Pod Lifecycle\nAuto-Terminate unavailable",
 ) -> SystemTabComponents:
     """Build the system tab without making a network request."""
 
@@ -197,6 +212,19 @@ def build_system_tab(
             elem_classes=["mobile-tap-button"],
         )
         state_sync_message = gr.Markdown("")
+    with gr.Accordion("Pod Lifecycle", open=True, elem_classes=["system-lifecycle-section"]):
+        lifecycle_markdown = gr.Markdown(initial_lifecycle_markdown)
+        with gr.Row(elem_classes=["system-actions"]):
+            lifecycle_refresh_button = gr.Button(
+                "Terminate安全判定を更新", elem_classes=["mobile-tap-button"]
+            )
+            lifecycle_terminate_button = gr.Button(
+                "安全ならPodをTerminate", variant="primary", elem_classes=["mobile-tap-button"]
+            )
+            lifecycle_toggle_button = gr.Button(
+                "Auto-Terminate状態", elem_classes=["mobile-tap-button"]
+            )
+        lifecycle_message = gr.Markdown("")
     return SystemTabComponents(
         status,
         connection_button,
@@ -208,6 +236,11 @@ def build_system_tab(
         state_sync_markdown,
         state_backup_button,
         state_sync_message,
+        lifecycle_markdown,
+        lifecycle_refresh_button,
+        lifecycle_terminate_button,
+        lifecycle_toggle_button,
+        lifecycle_message,
     )
 
 
@@ -217,6 +250,9 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
     gr.Markdown("## 画像生成")
     checkpoint_choices = gr.State(None)
     vae_choices = gr.State(None)
+    sampler_choices = gr.State(None)
+    scheduler_choices = gr.State(None)
+    upscaler_choices = gr.State(None)
     with gr.Row(elem_classes=["generation-layout"]):
         with gr.Column(elem_classes=["generation-primary"]):
             with gr.Accordion("最近使った項目", open=True, elem_classes=["recent-settings"]):
@@ -340,6 +376,9 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
         vae=vae,
         checkpoint_choices=checkpoint_choices,
         vae_choices=vae_choices,
+        sampler_choices=sampler_choices,
+        scheduler_choices=scheduler_choices,
+        upscaler_choices=upscaler_choices,
         sampler=sampler,
         scheduler=scheduler,
         upscaler=upscaler,
@@ -367,6 +406,7 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
         result_image=result_image,
         result_details=result_details,
         restored_from_generation=gr.State(None),
+        restored_form_state=gr.State(None),
         regeneration_valid=gr.State(False),
         regeneration_requested=gr.State(False),
         positive_clear_button=positive_clear_button,
@@ -422,6 +462,89 @@ def make_state_backup_handler(
         return state_sync_markdown(view, timezone_name), view.last_message
 
     return handler
+
+
+def make_pod_lifecycle_readiness_handler(
+    service: PodLifecycleService,
+) -> Callable[[], Awaitable[tuple[str, str]]]:
+    """Create the check-only System tab action."""
+
+    async def handler() -> tuple[str, str]:
+        readiness = await service.check_readiness()
+        return _pod_lifecycle_markdown(service, readiness), (
+            "SAFE TO TERMINATE" if readiness.is_safe else "NOT READY"
+        )
+
+    return handler
+
+
+def make_pod_lifecycle_terminate_handler(
+    service: PodLifecycleService,
+) -> Callable[[], Awaitable[tuple[str, str]]]:
+    """Create the guarded manual self-termination action."""
+
+    async def handler() -> tuple[str, str]:
+        readiness = await service.check_readiness()
+        if not readiness.is_safe:
+            return _pod_lifecycle_markdown(service, readiness), "NOT READY; Pod was not terminated"
+        try:
+            await service.request_terminate(readiness=readiness)
+        except Exception as exc:  # noqa: BLE001 - no adapter details at the UI boundary
+            return _pod_lifecycle_markdown(service, readiness), str(exc)
+        return _pod_lifecycle_markdown(service, readiness), "Termination request accepted"
+
+    return handler
+
+
+def make_pod_lifecycle_toggle_handler(
+    service: PodLifecycleService,
+) -> Callable[[], tuple[str, str]]:
+    """Toggle the current session flag without changing RunPod Template config."""
+
+    def handler() -> tuple[str, str]:
+        session = service.session or service.initialize_session()
+        if session is None:
+            return "## Pod Lifecycle\nAuto Terminate unavailable", "RunPod Identity unavailable"
+        updated = service.set_auto_terminate_enabled(not session.auto_terminate_enabled)
+        assert updated is not None
+        enabled_label = "ENABLED" if updated.auto_terminate_enabled else "PAUSED"
+        return (
+            f"## Pod Lifecycle\nAuto Terminate: `{enabled_label}`\n"
+            f"Session: `{updated.status.value}`",
+            "Auto-Terminate state updated for this session",
+        )
+
+    return handler
+
+
+def _pod_lifecycle_markdown(service: PodLifecycleService, readiness: object) -> str:
+    session = service.session
+    is_safe = bool(getattr(readiness, "is_safe", False))
+    reasons = tuple(getattr(readiness, "block_reasons", ()))
+    state = session.status.value if session is not None else "unavailable"
+    enabled = "ENABLED" if session is not None and session.auto_terminate_enabled else "DISABLED"
+    lines = [
+        "## Pod Lifecycle",
+        f"Auto Terminate: `{enabled}`",
+        f"Session: `{state}`",
+        f"Terminate readiness: `{'SAFE TO TERMINATE' if is_safe else 'NOT READY'}`",
+    ]
+    readiness_labels = (
+        ("Generation", "generation_ready"),
+        ("ComfyUI Queue", "comfyui_ready"),
+        ("Model Transfer", "model_transfer_ready"),
+        ("Drive Image/Metadata", "drive_sync_ready"),
+        ("Drive Manifest", "manifest_ready"),
+        ("State Backup", "state_backup_ready"),
+        ("RunPod Identity", "runpod_identity_ready"),
+    )
+    for label, attribute in readiness_labels:
+        value = bool(getattr(readiness, attribute, False))
+        lines.append(f"- {label}: `{'ready' if value else 'blocked'}`")
+    if reasons:
+        lines.append("**Block reasons:**")
+        lines.extend(f"- `{reason}`" for reason in reasons)
+    return "\n".join(lines)
 
 
 def make_check_connection_handler(
@@ -649,6 +772,7 @@ def make_enqueue_handler(
     service: GenerationQueueService,
     max_loras: int,
     preflight_service: GenerationPreflightService | None = None,
+    form_state_saver: Callable[[GenerationFormStateSnapshot], object] | None = None,
 ) -> Callable[..., Awaitable[tuple[object, object, object, object, object, object]]]:
     """Create the non-blocking UI boundary that only persists queue work."""
 
@@ -670,6 +794,7 @@ def make_enqueue_handler(
         restored_from_generation_id: str | None = None,
         regeneration_valid: bool = False,
         regeneration_requested: bool = False,
+        upscaler: str | None = None,
     ) -> tuple[object, object, object, object, object, object]:
         del size_preset
 
@@ -745,6 +870,28 @@ def make_enqueue_handler(
             f"Seed: `{queued.item.generation.settings_snapshot.seed}`"
             + (f"\n\n{preflight_warning}" if preflight_warning else "")
         )
+        if form_state_saver is not None:
+            try:
+                form_state_saver(
+                    GenerationFormStateSnapshot.from_ui(
+                        positive_prompt=positive_prompt,
+                        negative_prompt=negative_prompt,
+                        seed_mode=seed_mode,
+                        seed=-1 if seed_mode == "Random" else int(seed),
+                        width=int(width),
+                        height=int(height),
+                        steps=int(steps),
+                        cfg_scale=float(cfg_scale),
+                        sampler_name=sampler or "",
+                        scheduler_name=scheduler or "",
+                        checkpoint_name=checkpoint or "",
+                        vae_name=vae,
+                        upscaler_name=upscaler,
+                        loras=loras,
+                    )
+                )
+            except Exception:  # noqa: BLE001 - enqueue success must remain durable
+                details += "\n\nLast-used form state could not be saved"
         return (
             gr.Button("生成をキューへ追加", interactive=True),
             "Queued",
@@ -761,6 +908,7 @@ def make_batch_enqueue_handler(
     service: GenerationQueueService,
     max_loras: int,
     preflight_service: GenerationPreflightService | None = None,
+    form_state_saver: Callable[[GenerationFormStateSnapshot], object] | None = None,
 ) -> Callable[..., Awaitable[tuple[object, ...]]]:
     """Create the UI boundary for one atomic batch enqueue."""
 
@@ -783,6 +931,7 @@ def make_batch_enqueue_handler(
         start_seed: float | int,
         seed_step: float | int,
         name: str,
+        upscaler: str | None = None,
     ) -> tuple[object, ...]:
         try:
             settings = GenerationSettings(
@@ -833,6 +982,28 @@ def make_batch_enqueue_handler(
                 if isinstance(exc, GenerationQueueServiceError)
                 else "入力値を確認してください。",
             )
+        if form_state_saver is not None:
+            try:
+                form_state_saver(
+                    GenerationFormStateSnapshot.from_ui(
+                        positive_prompt=positive_prompt,
+                        negative_prompt=negative_prompt,
+                        seed_mode=seed_mode,
+                        seed=-1 if seed_mode == "Random" else int(seed),
+                        width=int(width),
+                        height=int(height),
+                        steps=int(steps),
+                        cfg_scale=float(cfg_scale),
+                        sampler_name=sampler or "",
+                        scheduler_name=scheduler or "",
+                        checkpoint_name=checkpoint or "",
+                        vae_name=vae,
+                        upscaler_name=upscaler,
+                        loras=lora_settings_from_state(lora_state, max_loras=max_loras),
+                    )
+                )
+            except Exception:  # noqa: BLE001 - queue success must remain durable
+                preflight_message += "\n\nLast-used form state could not be saved"
         return (
             gr.Button("バッチをキューへ追加", interactive=True),
             "Queued",
@@ -1003,6 +1174,9 @@ def _capability_updates(
     return tuple(updates) + (
         list(choices["checkpoint"]),
         list(choices["vae"]),
+        list(choices["sampler"]),
+        list(choices["scheduler"]),
+        list(choices["upscaler"]),
         lora_markdown(capabilities),
         gr.Button(interactive=can_generate),
         selected_options,
@@ -1024,6 +1198,9 @@ def _empty_updates(generation: GenerationTabComponents) -> tuple[object, ...]:
         gr.Dropdown([], label=generation.sampler.label, interactive=False),
         gr.Dropdown([], label=generation.scheduler.label, interactive=False),
         gr.Dropdown([], label=generation.upscaler.label, interactive=False),
+        None,
+        None,
+        None,
         None,
         None,
         "**LoRA list:** unavailable",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from io import BytesIO
@@ -57,6 +58,8 @@ from runpod_sdxl_image_studio.domain.upscale_snapshot import (
     UpscaleSettingsSnapshot,
     UpscaleSourceKind,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class UpscaleEnqueueError(RuntimeError):
@@ -135,6 +138,8 @@ class UpscaleEnqueueService:
         imported_image_storage: ImportedImageStorage | None = None,
         upscale_settings_repository: UpscaleSettingsRepositoryProtocol | None = None,
         capabilities: ComfyUICapabilities | None = None,
+        work_gate: object | None = None,
+        generation_enqueued_callback: Callable[[], object] | None = None,
     ) -> None:
         self._generations = generation_repository
         self._artifacts = artifact_repository
@@ -146,6 +151,8 @@ class UpscaleEnqueueService:
         self._imported_image_storage = imported_image_storage
         self._upscale_settings_repository = upscale_settings_repository
         self._capabilities = capabilities
+        self._work_gate = work_gate
+        self._generation_enqueued_callback = generation_enqueued_callback
 
     def set_capabilities(self, capabilities: ComfyUICapabilities | None) -> None:
         self._capabilities = capabilities
@@ -368,6 +375,7 @@ class UpscaleEnqueueService:
     def enqueue(
         self, parent_generation_id: UUID, upscale_settings: UpscaleSettings
     ) -> GenerationQueueItem:
+        self._ensure_work_allowed()
         parent = self._generations.get_by_id(parent_generation_id)
         if parent is None:
             raise UpscaleEnqueueError("upscale_parent_not_found", "親Generationが見つかりません。")
@@ -426,7 +434,7 @@ class UpscaleEnqueueService:
             }
         )
         try:
-            return self._queue.enqueue_upscale(
+            item = self._queue.enqueue_upscale(
                 generation_snapshot,
                 upscale_snapshot,
                 parent_generation_id=parent_generation_id,
@@ -435,6 +443,8 @@ class UpscaleEnqueueService:
             )
         except GenerationDispatchQueueRepositoryError as exc:
             raise UpscaleEnqueueError("upscale_workflow_error", str(exc)) from exc
+        self._notify_generation_enqueued()
+        return item
 
     enqueue_upscale = enqueue
 
@@ -448,6 +458,7 @@ class UpscaleEnqueueService:
     def enqueue_import(
         self, import_id: UUID, upscale_settings: UpscaleSettings
     ) -> GenerationQueueItem:
+        self._ensure_work_allowed()
         imported = self._verified_import(import_id)
         self._validate_import_method(imported.id, upscale_settings)
         size = self._plan_for_dimensions(
@@ -516,7 +527,7 @@ class UpscaleEnqueueService:
             )
         )
         try:
-            return self._queue.enqueue_upscale(
+            item = self._queue.enqueue_upscale(
                 generation_snapshot,
                 upscale_snapshot,
                 parent_generation_id=None,
@@ -526,6 +537,32 @@ class UpscaleEnqueueService:
             )
         except GenerationDispatchQueueRepositoryError as exc:
             raise UpscaleEnqueueError("upscale_workflow_error", str(exc)) from exc
+        self._notify_generation_enqueued()
+        return item
+
+    def _ensure_work_allowed(self) -> None:
+        if self._work_gate is None:
+            return
+        ensure = getattr(self._work_gate, "ensure_work_allowed", None)
+        if callable(ensure):
+            try:
+                ensure()
+            except Exception as exc:  # noqa: BLE001 - keep the enqueue boundary stable
+                raise UpscaleEnqueueError(
+                    "pod_lifecycle_draining",
+                    "Pod is preparing to terminate; new work is blocked",
+                ) from exc
+
+    def _notify_generation_enqueued(self) -> None:
+        if self._generation_enqueued_callback is None:
+            return
+        try:
+            self._generation_enqueued_callback()
+        except Exception as exc:  # noqa: BLE001 - queue persistence already succeeded
+            logger.warning(
+                "upscale enqueue lifecycle arm failed error=%s",
+                type(exc).__name__,
+            )
 
     def _verified_import(self, import_id: UUID) -> ImportedImage:
         if self._metadata_import_repository is None or self._imported_image_storage is None:
