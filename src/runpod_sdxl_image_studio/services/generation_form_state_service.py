@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Protocol
 from uuid import UUID
@@ -50,11 +51,18 @@ class GenerationFormStateService:
         *,
         upscaler_provider: UpscalerProvider | None = None,
         state_changed_callback: Callable[[], None] | None = None,
+        work_gate: object | None = None,
     ) -> None:
         self._repository = repository
         self._latest_generation_provider = latest_generation_provider
         self._upscaler_provider = upscaler_provider
         self._state_changed_callback = state_changed_callback
+        self._work_gate = work_gate
+
+    def set_work_gate(self, work_gate: object) -> None:
+        """Attach the lifecycle admission gate after composition is complete."""
+
+        self._work_gate = work_gate
 
     def restore(self) -> FormStateRestoreResult:
         stored: GenerationFormStateSnapshot | None = None
@@ -102,9 +110,16 @@ class GenerationFormStateService:
     def save(self, snapshot: GenerationFormStateSnapshot) -> GenerationFormStateSnapshot:
         """Persist after a caller has already observed a successful enqueue."""
 
-        result = self._repository.save(snapshot)
-        if self._state_changed_callback is not None:
-            self._state_changed_callback()
+        gate = self._work_gate
+        context = (
+            gate.admit_persistent_mutation()  # type: ignore[attr-defined]
+            if gate is not None
+            else nullcontext()
+        )
+        with context:
+            result = self._repository.save(snapshot)
+            if self._state_changed_callback is not None:
+                self._state_changed_callback()
         return result
 
     def save_from_ui(self, **values: object) -> GenerationFormStateSnapshot:

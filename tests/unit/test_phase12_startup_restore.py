@@ -150,15 +150,12 @@ def test_fresh_pod_reapplies_form_only_after_model_terminal_and_visibility(
     status = runtime.status()
     assert runtime.is_ready
     assert status.capabilities is not None
-    assert not status.applied
     assert preparation.arguments == (
         "checkpoints/A.safetensors",
         "vae/V.safetensors",
         (),
         "upscalers/U.pth",
     )
-    runtime.mark_applied()
-    assert runtime.status().applied
     runtime.stop()
 
 
@@ -258,5 +255,12 @@ async def test_startup_handler_applies_exact_form_and_visible_lora_rows_after_re
     assert result[second_row + 3].value == 0.5
     assert result[2 + capability_count] == "restored positive"
     assert result[3 + capability_count] == "restored negative"
-    assert runtime.status().applied
+    assert result[-1] is True
+
+    # The runtime snapshot is process-common, while the applied bit belongs
+    # to each browser session.  A second session must apply it too.
+    second_session = await handler(None, None, None, None, None, startup_restore_applied=False)
+    assert second_session[-1] is True
+    skipped = await handler(None, None, None, None, None, startup_restore_applied=True)
+    assert skipped[-1] is True
     runtime.stop()

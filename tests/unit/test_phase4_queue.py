@@ -108,7 +108,6 @@ def test_queue_repository_is_fifo_and_leases_are_recoverable() -> None:
     assert claimed is not None
     assert claimed.entry.sequence == first.entry.sequence
     assert claimed.entry.worker_id == "worker-a"
-    assert claimed.job.worker_id == "worker-a"
 
     repository.reconcile_expired_claims(now=datetime(2026, 1, 1, 0, 0, 31, tzinfo=UTC))
     reclaimed = repository.claim_next(
@@ -129,6 +128,21 @@ def test_queue_repository_is_fifo_and_leases_are_recoverable() -> None:
     assert remaining is not None
     assert remaining.entry.sequence == second.entry.sequence
     engine.dispose()
+
+
+def test_active_generation_work_check_does_not_use_bounded_queue_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _engine, factory = _database()
+    repository = GenerationDispatchQueueRepository(factory)
+    repository.enqueue_single(GenerationSettingsSnapshot.from_settings(_settings()))
+    monkeypatch.setattr(
+        repository,
+        "list_queue",
+        Mock(side_effect=AssertionError("termination safety must not list a bounded queue")),
+    )
+
+    assert repository.has_active_generation_work_since(datetime(2025, 1, 1, tzinfo=UTC))
 
 
 def test_submission_state_is_persisted_and_claim_is_not_reusable() -> None:

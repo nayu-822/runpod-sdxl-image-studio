@@ -178,6 +178,8 @@ class GenerationDispatchQueueRepositoryProtocol(Protocol):
         limit: int = 200,
     ) -> tuple[GenerationQueueItem, ...]: ...
 
+    def has_active_generation_work_since(self, started_at: datetime) -> bool: ...
+
     def get_health_counts(self) -> QueueHealthCounts: ...
 
     def list_recent_failed(self, limit: int = 100) -> tuple[GenerationQueueItem, ...]: ...
@@ -1026,6 +1028,51 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
                 return tuple(_queue_item_from_entry(session, entry) for entry in entries)
         except (SQLAlchemyError, ValueError) as exc:
             raise GenerationDispatchQueueRepositoryError("queue could not be listed") from exc
+
+    def has_active_generation_work_since(self, started_at: datetime) -> bool:
+        """Check all current generation work with a bounded SQL existence query."""
+
+        active_statuses = (
+            GenerationStatus.PENDING.value,
+            GenerationStatus.QUEUED.value,
+            GenerationStatus.RUNNING.value,
+        )
+        active_submission_states = (
+            SubmissionState.SUBMITTING.value,
+            SubmissionState.AMBIGUOUS.value,
+        )
+        timestamp = _utc(started_at)
+        try:
+            with session_scope(self._session_factory) as session:
+                statement = (
+                    select(GenerationModel.id)
+                    .select_from(GenerationModel)
+                    .outerjoin(
+                        GenerationJobModel,
+                        GenerationJobModel.generation_id == GenerationModel.id,
+                    )
+                    .outerjoin(
+                        GenerationQueueEntryModel,
+                        GenerationQueueEntryModel.generation_id == GenerationModel.id,
+                    )
+                    .where(
+                        GenerationModel.created_at >= timestamp,
+                        or_(
+                            GenerationModel.status.in_(active_statuses),
+                            GenerationJobModel.status.in_(active_statuses),
+                            GenerationJobModel.status != GenerationModel.status,
+                            GenerationQueueEntryModel.submission_state.in_(
+                                active_submission_states
+                            ),
+                        ),
+                    )
+                    .limit(1)
+                )
+                return bool(session.scalar(select(statement.exists())))
+        except (SQLAlchemyError, ValueError) as exc:
+            raise GenerationDispatchQueueRepositoryError(
+                "active generation work could not be checked"
+            ) from exc
 
     def get_health_counts(self) -> QueueHealthCounts:
         """Count every queued Generation without materializing queue items."""

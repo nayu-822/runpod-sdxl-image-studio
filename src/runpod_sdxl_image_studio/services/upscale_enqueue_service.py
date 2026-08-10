@@ -146,6 +146,7 @@ class UpscaleEnqueueService:
         capabilities: ComfyUICapabilities | None = None,
         work_gate: object | None = None,
         generation_enqueued_callback: Callable[[], object] | None = None,
+        state_changed_callback: Callable[[], None] | None = None,
     ) -> None:
         self._generations = generation_repository
         self._artifacts = artifact_repository
@@ -159,6 +160,7 @@ class UpscaleEnqueueService:
         self._capabilities = capabilities
         self._work_gate = work_gate
         self._generation_enqueued_callback = generation_enqueued_callback
+        self._state_changed_callback = state_changed_callback
 
     def set_capabilities(self, capabilities: ComfyUICapabilities | None) -> None:
         self._capabilities = capabilities
@@ -572,6 +574,7 @@ class UpscaleEnqueueService:
             with self._admission_context():
                 result = action()
                 self._notify_generation_enqueued()
+                self._notify_state_changed()
                 return result
         except UpscaleEnqueueError:
             raise
@@ -591,6 +594,14 @@ class UpscaleEnqueueService:
                 "upscale enqueue lifecycle arm failed error=%s",
                 type(exc).__name__,
             )
+
+    def _notify_state_changed(self) -> None:
+        if self._state_changed_callback is None:
+            return
+        try:
+            self._state_changed_callback()
+        except Exception:  # noqa: BLE001 - notification is best effort after commit
+            logger.warning("upscale state change notification failed", exc_info=True)
 
     def _verified_import(self, import_id: UUID) -> ImportedImage:
         if self._metadata_import_repository is None or self._imported_image_storage is None:

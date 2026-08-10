@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from uuid import UUID
@@ -24,6 +25,7 @@ from runpod_sdxl_image_studio.domain.generation_history import (
     RegenerationPlan,
     RestoreSettingsResult,
 )
+from runpod_sdxl_image_studio.services.pod_lifecycle_service import LifecycleGate
 
 
 class GenerationHistoryError(RuntimeError):
@@ -46,6 +48,7 @@ class GenerationHistoryService:
         settings: Settings | None = None,
         *,
         state_changed_callback: Callable[[], None] | None = None,
+        work_gate: LifecycleGate | None = None,
     ) -> None:
         app_settings = settings or get_settings()
         self._generation_repository = generation_repository
@@ -54,6 +57,7 @@ class GenerationHistoryService:
         self._timezone = ZoneInfo(app_settings.timezone)
         self._page_size = app_settings.history_page_size
         self._state_changed_callback = state_changed_callback
+        self._work_gate = work_gate
 
     @property
     def page_size(self) -> int:
@@ -193,16 +197,18 @@ class GenerationHistoryService:
 
     def set_favorite(self, generation_id: UUID, favorite: bool) -> GenerationDetailView:
         try:
-            self._generation_repository.set_favorite(generation_id, favorite)
-            self._notify_state_changed()
+            with self._mutation_context():
+                self._generation_repository.set_favorite(generation_id, favorite)
+                self._notify_state_changed()
             return self.get_detail(generation_id)
         except (GenerationRepositoryError, ValueError) as exc:
             raise GenerationHistoryError("お気に入りを保存できませんでした。") from exc
 
     def update_note(self, generation_id: UUID, note: str | None) -> GenerationDetailView:
         try:
-            self._generation_repository.update_note(generation_id, note)
-            self._notify_state_changed()
+            with self._mutation_context():
+                self._generation_repository.update_note(generation_id, note)
+                self._notify_state_changed()
             return self.get_detail(generation_id)
         except (GenerationRepositoryError, ValueError) as exc:
             raise GenerationHistoryError("メモを保存できませんでした。") from exc
@@ -223,6 +229,11 @@ class GenerationHistoryService:
             self._state_changed_callback()
         except Exception:  # noqa: BLE001 - backup notification is best effort after commit
             logger.warning("generation history state change notification failed", exc_info=True)
+
+    def _mutation_context(self) -> AbstractContextManager[None]:
+        if self._work_gate is None:
+            return nullcontext()
+        return self._work_gate.admit_persistent_mutation()
 
     def _item(self, generation: Generation) -> GenerationHistoryItem:
         try:

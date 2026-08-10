@@ -144,6 +144,7 @@ class GenerationTabComponents:
     active_generation_id: gr.State
     status_poll_timer: gr.Timer
     startup_restore_timer: gr.Timer
+    startup_restore_applied: gr.State
     result_seed: gr.Textbox
     result_favorite: gr.Checkbox
     result_regenerate_button: gr.Button
@@ -329,6 +330,7 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
         with gr.Column(elem_classes=["generation-preview"]):
             status_components = build_generation_status_card()
             startup_restore_timer = gr.Timer(value=1.0, active=True)
+            startup_restore_applied = gr.State(False)
             progress = gr.Markdown("")
             result_image = gr.Image(label="生成画像", type="filepath")
             result_details = gr.Markdown("")
@@ -434,6 +436,7 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
         active_generation_id=status_components.active_generation_id,
         status_poll_timer=status_components.poll_timer,
         startup_restore_timer=startup_restore_timer,
+        startup_restore_applied=startup_restore_applied,
         result_seed=result_seed,
         result_favorite=result_favorite,
         result_regenerate_button=result_regenerate_button,
@@ -493,7 +496,12 @@ def make_pod_lifecycle_terminate_handler(
 
     async def handler() -> tuple[str, str]:
         try:
-            readiness = await service.drain_backup_and_terminate(require_armed=False)
+            manual_handler = getattr(service, "manual_drain_backup_and_terminate", None)
+            if callable(manual_handler):
+                readiness = await manual_handler()
+            else:
+                # Compatibility for small test doubles and older integrations.
+                readiness = await service.drain_backup_and_terminate(require_armed=False)
         except Exception as exc:  # noqa: BLE001 - no adapter details at the UI boundary
             try:
                 readiness = await service.check_readiness()
@@ -502,6 +510,10 @@ def make_pod_lifecycle_terminate_handler(
             if readiness is None:
                 return _pod_lifecycle_markdown(service, object()), str(exc)
             return _pod_lifecycle_markdown(service, readiness), str(exc)
+        if not readiness.is_safe:
+            return _pod_lifecycle_markdown(
+                service, readiness
+            ), "NOT READY; termination was not requested"
         return _pod_lifecycle_markdown(service, readiness), "Termination request accepted"
 
     return handler
@@ -669,15 +681,17 @@ def make_startup_restore_handler(
         lora_state: object = None,
         lora_choices: object = None,
         lora_category: str | None = None,
+        startup_restore_applied: bool = False,
     ) -> tuple[object, ...]:
         del checkpoint, vae, sampler, scheduler, upscaler
         status = runtime.status()
-        if status.applied or not status.is_terminal or status.snapshot is None:
+        if startup_restore_applied or not status.is_terminal or status.snapshot is None:
             return (
-                gr.Timer(active=not status.is_terminal),
+                gr.Timer(active=not startup_restore_applied and not status.is_terminal),
                 status.message,
                 *(gr.skip() for _ in range(capability_count)),
                 *(gr.skip() for _ in range(form_tail_count)),
+                True if status.is_terminal and status.snapshot is None else startup_restore_applied,
             )
         if status.state is StartupRestoreState.FAILED:
             return (
@@ -685,6 +699,7 @@ def make_startup_restore_handler(
                 status.message,
                 *(gr.skip() for _ in range(capability_count)),
                 *(gr.skip() for _ in range(form_tail_count)),
+                startup_restore_applied,
             )
 
         capabilities = (
@@ -698,6 +713,7 @@ def make_startup_restore_handler(
                     "前回設定の反映待ち: ComfyUI能力情報を取得できません。",
                     *(gr.skip() for _ in range(capability_count)),
                     *(gr.skip() for _ in range(form_tail_count)),
+                    startup_restore_applied,
                 )
             capabilities = refresh_result.capabilities
         if capabilities_callback is not None:
@@ -728,7 +744,6 @@ def make_startup_restore_handler(
             _catalog_categories(catalog_service),
             preserve_unavailable=True,
         )
-        runtime.mark_applied()
         message = status.message
         if status.missing:
             message += "\n不足model: " + ", ".join(status.missing)
@@ -745,6 +760,7 @@ def make_startup_restore_handler(
             snapshot.steps,
             snapshot.cfg_scale,
             snapshot.model_dump(mode="json"),
+            True,
         )
 
     return handler

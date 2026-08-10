@@ -231,7 +231,6 @@ class ModelPreparationService:
                 jobs.append(await self.prepare_entry(entry))
             except ModelPreparationServiceError as exc:
                 missing.append(f"{kind.value}:{relative} ({exc.code})")
-        self._notify_state_changed()
         message = (
             "Some restored models are unavailable; no substitute was selected"
             if missing
@@ -261,9 +260,12 @@ class ModelPreparationService:
             with self._admission_context():
                 job = self._repository.enqueue(entry, local_relative)
                 if existing_sha is None:
+                    self._notify_state_changed()
                     return job
                 try:
-                    return self._repository.mark_already_prepared(job.id, existing_sha)
+                    result = self._repository.mark_already_prepared(job.id, existing_sha)
+                    self._notify_state_changed()
+                    return result
                 except AttributeError:
                     # Keep the service usable with small test fakes that only implement
                     # the original repository protocol.
@@ -444,13 +446,12 @@ class ModelPreparationService:
 
     def cancel(self, job_id: UUID) -> ModelTransferJob:
         try:
-            result = self._repository.request_cancel(job_id)
+            result = self._run_with_admission(lambda: self._repository.request_cancel(job_id))
         except ModelTransferRepositoryError as exc:
             raise ModelPreparationServiceError(
                 ModelTransferErrorCode.PERSISTENCE_FAILED.value,
                 "モデル準備のキャンセルを保存できませんでした。",
             ) from exc
-        self._notify_state_changed()
         return result
 
     async def retry(self, job_id: UUID) -> ModelTransferJob:
@@ -477,7 +478,6 @@ class ModelPreparationService:
                 ModelTransferErrorCode.PERSISTENCE_FAILED.value,
                 "モデル準備を再試行できませんでした。",
             ) from exc
-        self._notify_state_changed()
         return result
 
     def list_jobs(self, limit: int = 100) -> tuple[ModelTransferJob, ...]:
@@ -581,7 +581,9 @@ class ModelPreparationService:
     def _run_with_admission(self, action: Callable[[], _AdmissionResult]) -> _AdmissionResult:
         try:
             with self._admission_context():
-                return action()
+                result = action()
+                self._notify_state_changed()
+                return result
         except PodLifecycleWorkBlockedError as exc:
             raise ModelPreparationServiceError(
                 "pod_lifecycle_draining",

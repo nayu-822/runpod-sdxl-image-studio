@@ -14,8 +14,8 @@ import pytest
 from PIL import Image
 from sqlalchemy import create_engine
 
-from runpod_sdxl_image_studio.adapters.database.engine import create_session_factory
-from runpod_sdxl_image_studio.adapters.database.models import Base
+from runpod_sdxl_image_studio.adapters.database.engine import create_session_factory, session_scope
+from runpod_sdxl_image_studio.adapters.database.models import Base, DriveManifestJobModel
 from runpod_sdxl_image_studio.adapters.database.repositories.drive_sync_repository import (
     DriveSyncRepository,
     DriveSyncRepositoryError,
@@ -53,6 +53,47 @@ from runpod_sdxl_image_studio.ui.tabs.drive_sync_tab import (
     make_drive_manifest_handler,
     make_drive_resync_handler,
 )
+
+
+def test_active_manifest_check_is_unbounded_and_does_not_list_jobs() -> None:
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    factory = create_session_factory(engine)
+    now = datetime(2026, 8, 10, tzinfo=UTC)
+    with session_scope(factory) as session:
+        session.add(
+            DriveManifestJobModel(
+                id=str(uuid4()),
+                local_date="2026-08-10",
+                remote_name="drive",
+                remote_base_path="studio",
+                remote_manifest_path="2026-08-10/manifests/manifest.jsonl",
+                queue_sequence=1,
+                status=DriveSyncStatus.SYNCING.value,
+                progress_bytes=0,
+                total_bytes=1,
+                progress_percentage=0.0,
+                current_artifact=None,
+                worker_id="worker-1",
+                pid=None,
+                claimed_at=now,
+                lease_expires_at=None,
+                started_at=now,
+                completed_at=None,
+                error_code=None,
+                error_summary=None,
+                retryable=True,
+                log_path=None,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    repository = DriveSyncRepository(factory)
+    repository.list_manifest_jobs = lambda limit=50: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("termination safety must not list a bounded manifest window")
+    )
+
+    assert repository.has_active_manifest_jobs()
 
 
 def _png() -> bytes:

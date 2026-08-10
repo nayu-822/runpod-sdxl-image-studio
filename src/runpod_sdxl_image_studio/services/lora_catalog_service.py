@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterable
+from contextlib import AbstractContextManager, nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
@@ -15,6 +16,7 @@ from runpod_sdxl_image_studio.adapters.storage.exceptions import StorageError
 from runpod_sdxl_image_studio.adapters.storage.lora_thumbnail_storage import LoraThumbnailStorage
 from runpod_sdxl_image_studio.domain.lora_metadata import LoraMetadata, LoraMetadataUpdate
 from runpod_sdxl_image_studio.domain.lora_search import LoraSearchQuery, LoraSort
+from runpod_sdxl_image_studio.services.pod_lifecycle_service import LifecycleGate
 
 logger = logging.getLogger(__name__)
 
@@ -32,10 +34,12 @@ class LoraCatalogService:
         thumbnail_storage: LoraThumbnailStorage,
         *,
         state_changed_callback: Callable[[], None] | None = None,
+        work_gate: LifecycleGate | None = None,
     ) -> None:
         self._repository = repository
         self._thumbnails = thumbnail_storage
         self._state_changed_callback = state_changed_callback
+        self._work_gate = work_gate
 
     def sync_with_capabilities(
         self,
@@ -46,10 +50,11 @@ class LoraCatalogService:
         if not capability_success:
             return self._repository.list_all(LoraSearchQuery(include_missing=True))
         try:
-            result = self._repository.upsert_discovered_loras(file_names)
+            with self._mutation_context():
+                result = self._repository.upsert_discovered_loras(file_names)
+                self._notify_state_changed()
         except Exception as exc:  # noqa: BLE001 - service boundary
             raise LoraCatalogError("LoRA一覧を同期できませんでした。") from exc
-        self._notify_state_changed()
         return result
 
     def search(self, query: LoraSearchQuery | None = None) -> tuple[LoraMetadata, ...]:
@@ -78,25 +83,33 @@ class LoraCatalogService:
 
     def update_metadata(self, metadata_id: UUID, update: LoraMetadataUpdate) -> LoraMetadata:
         try:
-            metadata = self._repository.update_metadata(metadata_id, update)
+            with self._mutation_context():
+                metadata = self._repository.update_metadata(metadata_id, update)
+                if metadata is not None:
+                    self._notify_state_changed()
         except Exception as exc:  # noqa: BLE001 - service boundary
             raise LoraCatalogError("LoRA metadataを更新できませんでした。") from exc
         if metadata is None:
             raise LoraCatalogError("対象のLoRA metadataが見つかりません。")
-        self._notify_state_changed()
         return metadata
 
     def set_favorite(self, metadata_id: UUID, is_favorite: bool) -> LoraMetadata:
         try:
-            metadata = self._repository.set_favorite(metadata_id, is_favorite)
+            with self._mutation_context():
+                metadata = self._repository.set_favorite(metadata_id, is_favorite)
+                if metadata is not None:
+                    self._notify_state_changed()
         except Exception as exc:  # noqa: BLE001 - service boundary
             raise LoraCatalogError("お気に入りを更新できませんでした。") from exc
         if metadata is None:
             raise LoraCatalogError("対象のLoRA metadataが見つかりません。")
-        self._notify_state_changed()
         return metadata
 
     def save_thumbnail(self, metadata_id: UUID, payload: bytes) -> LoraMetadata:
+        with self._mutation_context():
+            return self._save_thumbnail(metadata_id, payload)
+
+    def _save_thumbnail(self, metadata_id: UUID, payload: bytes) -> LoraMetadata:
         try:
             current = self._repository.get_by_id(metadata_id)
         except Exception as exc:  # noqa: BLE001 - service boundary
@@ -129,6 +142,10 @@ class LoraCatalogService:
             raise LoraCatalogError("LoRA metadataを更新できませんでした。") from exc
 
     def delete_thumbnail(self, metadata_id: UUID) -> LoraMetadata:
+        with self._mutation_context():
+            return self._delete_thumbnail(metadata_id)
+
+    def _delete_thumbnail(self, metadata_id: UUID) -> LoraMetadata:
         try:
             current = self._repository.get_by_id(metadata_id)
         except Exception as exc:  # noqa: BLE001 - service boundary
@@ -162,8 +179,9 @@ class LoraCatalogService:
         if not names:
             return
         try:
-            self._repository.update_usage(names, completed_at or datetime.now(UTC))
-            self._notify_state_changed()
+            with self._mutation_context():
+                self._repository.update_usage(names, completed_at or datetime.now(UTC))
+                self._notify_state_changed()
         except Exception:  # noqa: BLE001 - usage is explicitly best effort
             logger.warning("LoRA usage statistics update failed", exc_info=True)
 
@@ -188,6 +206,11 @@ class LoraCatalogService:
             ("利用回数", LoraSort.USAGE.value),
             ("名前", LoraSort.NAME.value),
         )
+
+    def _mutation_context(self) -> AbstractContextManager[None]:
+        if self._work_gate is None:
+            return nullcontext()
+        return self._work_gate.admit_persistent_mutation()
 
     def _notify_state_changed(self) -> None:
         if self._state_changed_callback is None:

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from contextlib import suppress
+import logging
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from uuid import UUID
@@ -25,6 +27,9 @@ from runpod_sdxl_image_studio.domain.preset_payload import (
     PromptPresetPayload,
     SeedMode,
 )
+from runpod_sdxl_image_studio.services.pod_lifecycle_service import LifecycleGate
+
+logger = logging.getLogger(__name__)
 
 
 class PresetServiceError(RuntimeError):
@@ -48,9 +53,14 @@ class PresetService:
         self,
         repository: PresetRepositoryProtocol,
         settings: Settings | None = None,
+        *,
+        work_gate: LifecycleGate | None = None,
+        state_changed_callback: Callable[[], None] | None = None,
     ) -> None:
         self._repository = repository
         self._settings = settings or get_settings()
+        self._work_gate = work_gate
+        self._state_changed_callback = state_changed_callback
 
     def create_from_current_settings(
         self,
@@ -102,7 +112,10 @@ class PresetService:
 
     def update(self, preset: Preset) -> Preset:
         try:
-            return self._repository.update(preset)
+            with self._mutation_context():
+                result = self._repository.update(preset)
+                self._notify_state_changed()
+                return result
         except (PresetRepositoryError, PresetPayloadError, ValueError) as exc:
             raise PresetServiceError("Presetを更新できませんでした。") from exc
 
@@ -168,7 +181,9 @@ class PresetService:
 
     def delete(self, preset_id: UUID) -> None:
         try:
-            self._repository.delete(preset_id)
+            with self._mutation_context():
+                self._repository.delete(preset_id)
+                self._notify_state_changed()
         except PresetRepositoryError as exc:
             raise PresetServiceError("Presetを削除できませんでした。") from exc
 
@@ -186,7 +201,10 @@ class PresetService:
 
     def set_favorite(self, preset_id: UUID, favorite: bool) -> Preset:
         try:
-            return self._repository.set_favorite(preset_id, favorite)
+            with self._mutation_context():
+                result = self._repository.set_favorite(preset_id, favorite)
+                self._notify_state_changed()
+                return result
         except PresetRepositoryError as exc:
             raise PresetServiceError("Presetのお気に入りを保存できませんでした。") from exc
 
@@ -264,8 +282,10 @@ class PresetService:
                     raise PresetServiceError("LoRA数が上限を超えています。")
                 warnings.extend(_missing_loras(loras, available_loras))
                 settings = current_settings.model_copy(update={"loras": loras})
-            with suppress(PresetRepositoryError):
-                self._repository.record_usage(preset.id)
+            with self._mutation_context():
+                with suppress(PresetRepositoryError):
+                    self._repository.record_usage(preset.id)
+                self._notify_state_changed()
             return PresetApplyResult(
                 preset=preset,
                 settings=settings,
@@ -290,9 +310,12 @@ class PresetService:
         favorite: bool,
     ) -> Preset:
         try:
-            return self._repository.create(
-                Preset.create(kind, name, payload, description=description, favorite=favorite)
-            )
+            with self._mutation_context():
+                result = self._repository.create(
+                    Preset.create(kind, name, payload, description=description, favorite=favorite)
+                )
+                self._notify_state_changed()
+                return result
         except (PresetRepositoryError, PresetPayloadError, ValueError) as exc:
             raise PresetServiceError("Presetを保存できませんでした。") from exc
 
@@ -304,6 +327,19 @@ class PresetService:
         if preset is None:
             raise PresetServiceError("Presetが見つかりません。")
         return preset
+
+    def _mutation_context(self) -> AbstractContextManager[None]:
+        if self._work_gate is None:
+            return nullcontext()
+        return self._work_gate.admit_persistent_mutation()
+
+    def _notify_state_changed(self) -> None:
+        if self._state_changed_callback is None:
+            return
+        try:
+            self._state_changed_callback()
+        except Exception:  # noqa: BLE001 - notification is best effort after commit
+            logger.warning("preset state change notification failed", exc_info=True)
 
 
 def _apply_text(current: str, value: str, mode: PromptApplyMode) -> str:

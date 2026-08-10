@@ -43,8 +43,10 @@ class AutoTerminateCoordinator:
             self._ready_since = None
             return None
         if session.status in {
+            AutoTerminateState.DRAINING,
             AutoTerminateState.TERMINATION_REQUESTING,
             AutoTerminateState.TERMINATION_AMBIGUOUS,
+            AutoTerminateState.TERMINATION_FAILED,
         }:
             return self.last_readiness
 
@@ -55,7 +57,6 @@ class AutoTerminateCoordinator:
             if (self._service.session or session).status in {
                 AutoTerminateState.WAITING,
                 AutoTerminateState.READY,
-                AutoTerminateState.DRAINING,
             }:
                 self._service.abort_draining()
             return readiness
@@ -66,7 +67,10 @@ class AutoTerminateCoordinator:
             or (self._service.session or session).status is AutoTerminateState.ARMED
         ):
             self._ready_since = now
-            self._service.set_transient_state(AutoTerminateState.WAITING)
+            if not self._service.set_transient_state(AutoTerminateState.WAITING):
+                # A manual drain may have won the CAS race after readiness
+                # was checked.  Preserve the durable DRAINING state.
+                self._ready_since = None
             return readiness
         elapsed = (now - self._ready_since).total_seconds()
         if elapsed < self._settings.auto_terminate_grace_seconds:

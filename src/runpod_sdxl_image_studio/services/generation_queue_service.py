@@ -93,6 +93,7 @@ class GenerationQueueService:
         upscale_settings_repository: UpscaleSettingsRepositoryProtocol | None = None,
         lifecycle_gate: object | None = None,
         generation_enqueued_callback: Callable[[], object] | None = None,
+        state_changed_callback: Callable[[], None] | None = None,
     ) -> None:
         self._repository = repository
         self._settings = settings
@@ -100,6 +101,7 @@ class GenerationQueueService:
         self._upscale_settings_repository = upscale_settings_repository
         self._lifecycle_gate = lifecycle_gate
         self._generation_enqueued_callback = generation_enqueued_callback
+        self._state_changed_callback = state_changed_callback
         self._wake_callback: Callable[[], None] | None = None
 
     def set_wake_callback(self, callback: Callable[[], None] | None) -> None:
@@ -207,7 +209,10 @@ class GenerationQueueService:
 
     async def cancel(self, generation_id: UUID) -> GenerationQueueItem:
         try:
-            requested = self._repository.request_cancel(generation_id)
+            requested = self._run_mutation(
+                lambda: self._repository.request_cancel(generation_id),
+                wake=False,
+            )
             if requested.generation.status in {
                 GenerationStatus.COMPLETED,
                 GenerationStatus.FAILED,
@@ -227,7 +232,10 @@ class GenerationQueueService:
                 and requested.entry.worker_id is None
                 and requested.entry.submission_state is SubmissionState.READY
             ):
-                return self._repository.mark_cancelled(generation_id)
+                return self._run_mutation(
+                    lambda: self._repository.mark_cancelled(generation_id),
+                    wake=False,
+                )
             prompt_id = _shared_prompt_id(requested)
             if not prompt_id:
                 return requested
@@ -235,7 +243,10 @@ class GenerationQueueService:
                 raise GenerationQueueServiceError("実行中ジョブのキャンセルAdapterが未設定です。")
             result = await self._cancellation_adapter.cancel_prompt(prompt_id)
             if result.outcome is CancellationOutcome.CANCELLED:
-                return self._repository.mark_cancelled(generation_id)
+                return self._run_mutation(
+                    lambda: self._repository.mark_cancelled(generation_id),
+                    wake=False,
+                )
             if result.outcome in {
                 CancellationOutcome.COMPLETED,
                 CancellationOutcome.FAILED,
@@ -257,9 +268,9 @@ class GenerationQueueService:
         """Manually attach a prompt ID after an ambiguous submission."""
 
         try:
-            item = self._repository.link_ambiguous_prompt(generation_id, prompt_id)
-            self._wake()
-            return item
+            return self._run_mutation(
+                lambda: self._repository.link_ambiguous_prompt(generation_id, prompt_id)
+            )
         except (GenerationDispatchQueueRepositoryError, ValueError) as exc:
             raise GenerationQueueServiceError("曖昧なprompt状態を手動解決できませんでした") from exc
 
@@ -267,9 +278,7 @@ class GenerationQueueService:
         """Explicitly mark an ambiguous submission failed when prompt is absent."""
 
         try:
-            item = self._repository.fail_ambiguous_prompt(generation_id)
-            self._wake()
-            return item
+            return self._run_mutation(lambda: self._repository.fail_ambiguous_prompt(generation_id))
         except (GenerationDispatchQueueRepositoryError, ValueError) as exc:
             raise GenerationQueueServiceError(
                 "曖昧なprompt状態をfailedへ確定できませんでした"
@@ -377,6 +386,24 @@ class GenerationQueueService:
         except PodLifecycleWorkBlockedError as exc:
             raise GenerationQueueServiceError("新しい処理をキューへ追加できませんでした。") from exc
 
+    def _run_mutation(
+        self,
+        action: Callable[[], _AdmissionResult],
+        *,
+        wake: bool = True,
+    ) -> _AdmissionResult:
+        try:
+            with self._admission_context():
+                result = action()
+                if wake:
+                    self._wake()
+                self._notify_state_changed()
+                return result
+        except PodLifecycleWorkBlockedError as exc:
+            raise GenerationQueueServiceError(
+                "persistent mutation is blocked while Pod termination is draining"
+            ) from exc
+
     def _enqueue_retry_item(self, item: GenerationQueueItem) -> GenerationQueueItem:
         if item.generation.kind.value == "upscale":
             if self._upscale_settings_repository is None:
@@ -438,6 +465,14 @@ class GenerationQueueService:
     def _wake(self) -> None:
         if self._wake_callback is not None:
             self._wake_callback()
+
+    def _notify_state_changed(self) -> None:
+        if self._state_changed_callback is None:
+            return
+        try:
+            self._state_changed_callback()
+        except Exception:  # noqa: BLE001 - notification is best effort after commit
+            logger.warning("queue state change notification failed", exc_info=True)
 
     def _validate_batch(
         self,

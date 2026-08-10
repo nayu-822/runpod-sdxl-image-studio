@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -29,6 +30,7 @@ from runpod_sdxl_image_studio.services.drive_sync_service import (
     DriveSyncService,
     DriveSyncServiceError,
 )
+from runpod_sdxl_image_studio.services.generation_history_service import GenerationHistoryService
 from runpod_sdxl_image_studio.services.generation_queue_service import (
     GenerationQueueService,
     GenerationQueueServiceError,
@@ -39,6 +41,7 @@ from runpod_sdxl_image_studio.services.model_preparation_service import (
 )
 from runpod_sdxl_image_studio.services.pod_lifecycle_service import (
     PodLifecycleService,
+    PodLifecycleTransitionError,
     PodLifecycleWorkBlockedError,
 )
 from runpod_sdxl_image_studio.services.upscale_enqueue_service import (
@@ -102,6 +105,29 @@ class FakeQueueRepository:
     def list_queue(self, *, limit: int = 200, **_: object) -> tuple[object, ...]:
         return tuple(self.items[:limit])
 
+    def has_active_generation_work_since(self, started_at: datetime) -> bool:
+        del started_at
+        active = {
+            GenerationStatus.PENDING,
+            GenerationStatus.QUEUED,
+            GenerationStatus.RUNNING,
+        }
+        active_submission = {SubmissionState.SUBMITTING, SubmissionState.AMBIGUOUS}
+        for item in self.items:
+            generation = getattr(item, "generation", None)
+            job = getattr(item, "job", None)
+            entry = getattr(item, "entry", None)
+            generation_status = getattr(generation, "status", None)
+            job_status = getattr(job, "status", generation_status)
+            if (
+                generation_status in active
+                or job_status in active
+                or job_status != generation_status
+                or getattr(entry, "submission_state", None) in active_submission
+            ):
+                return True
+        return False
+
 
 class FakeModelRepository:
     def __init__(self, counts: dict[ModelTransferStatus, int] | None = None) -> None:
@@ -131,6 +157,12 @@ class FakeDriveRepository:
 
     def list_manifest_jobs(self, limit: int = 50) -> tuple[object, ...]:
         return tuple(self.manifest_jobs[:limit])
+
+    def has_active_manifest_jobs(self) -> bool:
+        return any(
+            job.status in {DriveSyncStatus.PENDING, DriveSyncStatus.SYNCING}
+            for job in self.manifest_jobs
+        )
 
     def manifest_state_for_destination(
         self,
@@ -505,6 +537,143 @@ async def test_manual_terminate_uses_same_drain_backup_path() -> None:
 
 
 @pytest.mark.asyncio
+async def test_manual_terminate_checks_readiness_before_entering_draining() -> None:
+    service, runpod, state_sync = _service((_generation(GenerationStatus.PENDING),))
+    service.arm_on_generation_enqueue()
+
+    readiness = await service.manual_drain_backup_and_terminate()
+
+    assert not readiness.is_safe
+    assert "generation_not_completed" in readiness.block_reasons
+    assert service.session is not None
+    assert service.session.status is AutoTerminateState.ARMED
+    assert state_sync.backup_calls == 0
+    assert runpod.calls == 0
+
+
+def test_transient_lifecycle_updates_use_compare_and_set_transitions() -> None:
+    service, _, _ = _service()
+    service.arm_on_generation_enqueue()
+
+    assert not service.set_transient_state(AutoTerminateState.READY)
+    assert service.session is not None
+    assert service.session.status is AutoTerminateState.ARMED
+    assert service.set_transient_state(AutoTerminateState.WAITING)
+    service.begin_draining()
+    assert not service.set_transient_state(AutoTerminateState.READY)
+    assert service.session.status is AutoTerminateState.DRAINING
+    with pytest.raises(PodLifecycleTransitionError):
+        service.set_transient_state(AutoTerminateState.ARMED)
+
+
+@pytest.mark.asyncio
+async def test_auto_terminate_toggle_cannot_reopen_draining_or_requesting() -> None:
+    service, _, _ = _service()
+    service.arm_on_generation_enqueue()
+    service.begin_draining()
+    updated = service.set_auto_terminate_enabled(False)
+    assert updated is not None
+    assert updated.auto_terminate_enabled
+    assert updated.status is AutoTerminateState.DRAINING
+
+    await service.request_terminate()
+    updated = service.set_auto_terminate_enabled(False)
+    assert updated is not None
+    assert updated.auto_terminate_enabled
+    assert updated.status is AutoTerminateState.TERMINATION_REQUESTING
+
+
+@pytest.mark.asyncio
+async def test_termination_safety_uses_unbounded_active_generation_and_manifest_checks() -> None:
+    service, _, _ = _service()
+    service.arm_on_generation_enqueue()
+    current = service._generation_repository.generations[0]  # type: ignore[attr-defined]
+    queue = service._dispatch_queue_repository  # type: ignore[attr-defined]
+    queue.items.append(  # type: ignore[attr-defined]
+        SimpleNamespace(
+            generation=current,
+            job=SimpleNamespace(status=GenerationStatus.RUNNING),
+            entry=SimpleNamespace(submission_state=SubmissionState.SUBMITTED),
+        )
+    )
+    queue.list_queue = lambda **_: (_ for _ in ()).throw(AssertionError("bounded queue lookup"))  # type: ignore[attr-defined]
+    readiness = await service.check_readiness()
+    assert not readiness.is_safe
+    assert "generation_work_active" in readiness.block_reasons
+
+    service2, _, _ = _service()
+    service2.arm_on_generation_enqueue()
+    drive = service2._drive_sync_repository  # type: ignore[attr-defined]
+    drive.manifest_jobs.append(SimpleNamespace(status=DriveSyncStatus.SYNCING))  # type: ignore[attr-defined]
+    drive.list_manifest_jobs = lambda **_: (_ for _ in ()).throw(  # type: ignore[attr-defined]
+        AssertionError("bounded manifest lookup")
+    )
+    readiness = await service2.check_readiness()
+    assert not readiness.is_safe
+    assert "manifest_active" in readiness.block_reasons
+
+
+def test_persistent_mutation_admission_is_closed_after_draining() -> None:
+    service, _, _ = _service()
+    service.arm_on_generation_enqueue()
+    committed: list[str] = []
+    with service.admit_persistent_mutation():
+        committed.append("before-drain")
+    service.begin_draining()
+    with pytest.raises(PodLifecycleWorkBlockedError), service.admit_persistent_mutation():
+        committed.append("after-drain")
+    assert committed == ["before-drain"]
+
+
+def test_generation_favorite_and_note_mutations_share_drain_admission(tmp_path: Path) -> None:
+    lifecycle, _, state_sync = _service()
+    current = lifecycle._generation_repository.generations[0]  # type: ignore[attr-defined]
+
+    class MutableGenerationRepository:
+        def __init__(self) -> None:
+            self.generation = current
+            self.writes = 0
+
+        def get_by_id(self, generation_id: object) -> Generation | None:
+            return self.generation if self.generation.id == generation_id else None
+
+        def set_favorite(self, generation_id: object, favorite: bool) -> Generation:
+            assert generation_id == self.generation.id
+            self.writes += 1
+            self.generation = replace(self.generation, favorite=favorite)
+            return self.generation
+
+        def update_note(self, generation_id: object, note: str | None) -> Generation:
+            assert generation_id == self.generation.id
+            self.writes += 1
+            self.generation = replace(self.generation, user_note=note)
+            return self.generation
+
+    class EmptyArtifacts:
+        def list_by_generation(self, generation_id: object) -> tuple[object, ...]:
+            del generation_id
+            return ()
+
+    repository = MutableGenerationRepository()
+    history = GenerationHistoryService(
+        repository,  # type: ignore[arg-type]
+        EmptyArtifacts(),  # type: ignore[arg-type]
+        Settings(_env_file=None, data_dir=tmp_path),
+        state_changed_callback=state_sync.mark_dirty,
+        work_gate=lifecycle,
+    )
+    history.set_favorite(current.id, True)
+    assert repository.writes == 1
+    assert state_sync.mark_dirty_calls == 1
+
+    lifecycle.begin_draining()
+    with pytest.raises(PodLifecycleWorkBlockedError):
+        history.update_note(current.id, "blocked")
+    assert repository.writes == 1
+    assert repository.generation.user_note is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("grace_seconds", [0.0, 15.0])
 async def test_lifecycle_transient_states_do_not_mark_state_sync_dirty(
     grace_seconds: float,
@@ -531,6 +700,35 @@ async def test_lifecycle_transient_states_do_not_mark_state_sync_dirty(
         assert runpod.calls == 1
     else:
         assert runpod.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_auto_not_ready_does_not_abort_manual_draining_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, runpod, _ = _service()
+    service.arm_on_generation_enqueue()
+    original_check_readiness = service.check_readiness
+
+    async def racing_check() -> object:
+        readiness = await original_check_readiness()
+        service.begin_draining()
+        return replace(readiness, is_safe=False)
+
+    monkeypatch.setattr(service, "check_readiness", racing_check)
+    coordinator = AutoTerminateCoordinator(
+        service,
+        SimpleNamespace(
+            auto_terminate_grace_seconds=0.0,
+            auto_terminate_check_interval_seconds=1.0,
+        ),
+    )
+
+    await coordinator.run_once()
+
+    assert service.session is not None
+    assert service.session.status is AutoTerminateState.DRAINING
+    assert runpod.calls == 0
 
 
 def test_enqueue_admission_wins_race_with_draining_without_losing_generation() -> None:
@@ -660,9 +858,9 @@ def test_drive_manifest_rebuild_is_rejected_before_repository_after_draining() -
     assert error.value.code == "pod_lifecycle_draining"
 
 
-def test_manual_terminate_waits_for_enqueue_admission_and_aborts_on_pending_generation() -> None:
+def test_manual_terminate_initial_not_ready_does_not_enter_draining() -> None:
     pending = _generation(GenerationStatus.PENDING)
-    lifecycle, runpod, _ = _service((pending,))
+    lifecycle, runpod, state_sync = _service((pending,))
     repository = BlockingDispatchRepository(pending)
     queue = GenerationQueueService(
         repository,
@@ -671,6 +869,7 @@ def test_manual_terminate_waits_for_enqueue_admission_and_aborts_on_pending_gene
         generation_enqueued_callback=lifecycle.arm_on_generation_enqueue,
     )
     enqueue_errors: list[BaseException] = []
+    terminate_results: list[object] = []
     terminate_errors: list[BaseException] = []
     terminate_started = threading.Event()
 
@@ -683,7 +882,7 @@ def test_manual_terminate_waits_for_enqueue_admission_and_aborts_on_pending_gene
     def terminate() -> None:
         terminate_started.set()
         try:
-            asyncio.run(lifecycle.drain_backup_and_terminate())
+            terminate_results.append(asyncio.run(lifecycle.manual_drain_backup_and_terminate()))
         except BaseException as exc:  # pragma: no cover - assertion below reports races
             terminate_errors.append(exc)
 
@@ -698,8 +897,11 @@ def test_manual_terminate_waits_for_enqueue_admission_and_aborts_on_pending_gene
     terminate_thread.join(timeout=2.0)
 
     assert not enqueue_errors
-    assert terminate_errors
+    assert not terminate_errors
+    assert len(terminate_results) == 1
+    assert not getattr(terminate_results[0], "is_safe", True)
     assert repository.persisted == 1
+    assert state_sync.backup_calls == 0
     assert runpod.calls == 0
     assert lifecycle.session is not None
     assert lifecycle.session.status is AutoTerminateState.ARMED

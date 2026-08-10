@@ -6,7 +6,7 @@ import asyncio
 import logging
 import threading
 from collections.abc import Callable, Coroutine
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
@@ -41,7 +41,6 @@ class StartupRestoreStatus:
     missing: tuple[str, ...] = ()
     message: str = ""
     capabilities: object | None = None
-    applied: bool = False
 
     @property
     def is_terminal(self) -> bool:
@@ -92,13 +91,6 @@ class StartupModelRestoreRuntime:
 
         with self._status_lock:
             return self._status
-
-    def mark_applied(self) -> None:
-        """Mark the desired form as applied exactly once by the UI boundary."""
-
-        with self._status_lock:
-            if self._status.is_terminal and self._status.snapshot is not None:
-                self._status = replace(self._status, applied=True)
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -256,7 +248,6 @@ class StartupModelRestoreRuntime:
                 missing,
                 message,
                 capabilities,
-                self._status.applied,
             )
 
     def _finish(

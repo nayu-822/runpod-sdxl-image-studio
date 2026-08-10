@@ -6,7 +6,8 @@ import hashlib
 import logging
 import ntpath
 import posixpath
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
@@ -40,6 +41,7 @@ from runpod_sdxl_image_studio.domain.metadata_import import (
     MetadataRawSource,
     MetadataSourceKind,
 )
+from runpod_sdxl_image_studio.services.pod_lifecycle_service import LifecycleGate
 
 logger = logging.getLogger(__name__)
 
@@ -103,11 +105,15 @@ class MetadataImportService:
         settings: Settings,
         *,
         capabilities: ComfyUICapabilities | None = None,
+        work_gate: LifecycleGate | None = None,
+        state_changed_callback: Callable[[], None] | None = None,
     ) -> None:
         self._repository = repository
         self._storage = storage
         self._settings = settings
         self._capabilities = capabilities
+        self._work_gate = work_gate
+        self._state_changed_callback = state_changed_callback
         self._import_lock = Lock()
 
     def import_image(
@@ -131,11 +137,12 @@ class MetadataImportService:
                         pass
                     else:
                         return _preview(existing)
-            return self._import_image(
-                image_bytes,
-                original_filename,
-                sidecar_bytes=sidecar_bytes,
-            )
+            with self._mutation_context():
+                return self._import_image(
+                    image_bytes,
+                    original_filename,
+                    sidecar_bytes=sidecar_bytes,
+                )
 
     def _import_image(
         self,
@@ -209,6 +216,7 @@ class MetadataImportService:
             )
             self._repository.create(record)
             committed = True
+            self._notify_state_changed()
             return _preview(record)
         except SidecarMetadataError as exc:
             raise MetadataImportError(exc.code, "sidecar metadata could not be parsed") from exc
@@ -336,7 +344,9 @@ class MetadataImportService:
                 }
             )
         )
-        self._repository.save(updated)
+        with self._mutation_context():
+            self._repository.save(updated)
+            self._notify_state_changed()
         return _preview(updated)
 
     def apply_model_mapping(
@@ -406,7 +416,9 @@ class MetadataImportService:
                 "updated_at": datetime.now(UTC),
             }
         )
-        self._repository.save(updated)
+        with self._mutation_context():
+            self._repository.save(updated)
+            self._notify_state_changed()
         return _preview(updated)
 
     def build_generation_settings(self, import_id: UUID) -> GenerationSettings:
@@ -445,6 +457,19 @@ class MetadataImportService:
 
     def set_capabilities(self, capabilities: ComfyUICapabilities | None) -> None:
         self._capabilities = capabilities
+
+    def _mutation_context(self) -> AbstractContextManager[None]:
+        if self._work_gate is None:
+            return nullcontext()
+        return self._work_gate.admit_persistent_mutation()
+
+    def _notify_state_changed(self) -> None:
+        if self._state_changed_callback is None:
+            return
+        try:
+            self._state_changed_callback()
+        except Exception:  # noqa: BLE001 - notification is best effort after commit
+            logger.warning("metadata import state change notification failed", exc_info=True)
 
     def _record(self, import_id: UUID) -> MetadataImportRecord:
         try:

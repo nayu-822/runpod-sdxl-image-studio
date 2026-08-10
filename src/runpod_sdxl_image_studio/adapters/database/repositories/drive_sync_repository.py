@@ -161,6 +161,8 @@ class DriveSyncRepositoryProtocol(Protocol):
 
     def list_manifest_jobs(self, limit: int = 50) -> tuple[DriveManifestJob, ...]: ...
 
+    def has_active_manifest_jobs(self) -> bool: ...
+
     def list_manifest_failure_targets(
         self, limit: int = 100
     ) -> tuple[DriveManifestFailureTarget, ...]: ...
@@ -753,6 +755,26 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
                 return tuple(_manifest_job_domain(row) for row in rows)
         except (SQLAlchemyError, ValueError) as exc:
             raise DriveSyncRepositoryError("drive manifest jobs could not be listed") from exc
+
+    def has_active_manifest_jobs(self) -> bool:
+        """Check all pending/syncing manifest jobs without a list limit."""
+
+        try:
+            with session_scope(self._session_factory) as session:
+                statement = (
+                    select(DriveManifestJobModel.id)
+                    .where(
+                        DriveManifestJobModel.status.in_(
+                            [DriveSyncStatus.PENDING.value, DriveSyncStatus.SYNCING.value]
+                        )
+                    )
+                    .limit(1)
+                )
+                return bool(session.scalar(select(statement.exists())))
+        except (SQLAlchemyError, ValueError) as exc:
+            raise DriveSyncRepositoryError(
+                "active drive manifest jobs could not be checked"
+            ) from exc
 
     def list_manifest_failure_targets(
         self, limit: int = 100
