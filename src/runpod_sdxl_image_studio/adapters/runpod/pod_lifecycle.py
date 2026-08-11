@@ -18,6 +18,14 @@ class RunPodTerminateStatus(StrEnum):
     AMBIGUOUS = "ambiguous"
 
 
+class RunPodTerminateConfirmation(StrEnum):
+    """Fail-closed result of the best-effort GET after DELETE did not succeed."""
+
+    TERMINATED = "terminated"
+    CONFIRMED_RUNNING = "confirmed_running"
+    AMBIGUOUS = "ambiguous"
+
+
 @dataclass(frozen=True)
 class RunPodIdentity:
     pod_id: str | None
@@ -100,6 +108,7 @@ class RunPodLifecycleAdapter:
                     code="runpod_terminate_ambiguous",
                     message="RunPod termination response was ambiguous",
                     cause=exc,
+                    delivery_ambiguous=True,
                 )
             except httpx.ConnectError as exc:
                 # A connect failure is known to occur before a request can be
@@ -117,6 +126,7 @@ class RunPodLifecycleAdapter:
                     code="runpod_terminate_unavailable",
                     message="RunPod termination service was unavailable",
                     cause=exc,
+                    delivery_ambiguous=True,
                 )
             if response.status_code == 204:
                 return RunPodTerminateResult(RunPodTerminateStatus.TERMINATED)
@@ -132,6 +142,7 @@ class RunPodLifecycleAdapter:
                     headers,
                     code="runpod_terminate_not_found",
                     message="RunPod self pod was not found",
+                    delivery_ambiguous=False,
                 )
             if 500 <= response.status_code <= 599:
                 return await self._resolve_delete_failure(
@@ -140,6 +151,7 @@ class RunPodLifecycleAdapter:
                     headers,
                     code="runpod_terminate_unavailable",
                     message="RunPod termination service returned an unavailable response",
+                    delivery_ambiguous=False,
                 )
             return await self._resolve_delete_failure(
                 client,
@@ -147,6 +159,7 @@ class RunPodLifecycleAdapter:
                 headers,
                 code="runpod_terminate_malformed_response",
                 message="RunPod termination returned an unexpected response",
+                delivery_ambiguous=False,
             )
         finally:
             if owns_client:
@@ -161,11 +174,12 @@ class RunPodLifecycleAdapter:
         code: str,
         message: str,
         cause: BaseException | None = None,
+        delivery_ambiguous: bool,
     ) -> RunPodTerminateResult:
-        confirmed, pod_exists = await self._confirm_after_delete_failure(client, path, headers)
-        if confirmed is RunPodTerminateStatus.TERMINATED:
+        confirmation = await self._confirm_after_delete_failure(client, path, headers)
+        if confirmation is RunPodTerminateConfirmation.TERMINATED:
             return RunPodTerminateResult(RunPodTerminateStatus.TERMINATED)
-        if pod_exists:
+        if confirmation is RunPodTerminateConfirmation.CONFIRMED_RUNNING and not delivery_ambiguous:
             error = RunPodTerminateError(
                 "runpod_terminate_confirmed_failure"
                 if code == "runpod_terminate_ambiguous"
@@ -190,26 +204,27 @@ class RunPodLifecycleAdapter:
         client: httpx.AsyncClient,
         path: str,
         headers: dict[str, str],
-    ) -> tuple[RunPodTerminateStatus | None, bool]:
+    ) -> RunPodTerminateConfirmation:
         try:
             response = await client.get(path, headers=headers)
         except (httpx.TimeoutException, httpx.RequestError):
-            return None, False
+            return RunPodTerminateConfirmation.AMBIGUOUS
         if response.status_code == 404:
-            return RunPodTerminateStatus.TERMINATED, False
+            return RunPodTerminateConfirmation.TERMINATED
         if response.status_code != 200:
-            return None, False
+            return RunPodTerminateConfirmation.AMBIGUOUS
         try:
             payload: Any = response.json()
         except ValueError:
-            return None, True
-        if isinstance(payload, dict):
-            status = payload.get("status")
-            if isinstance(status, str) and status.casefold() in {"terminated", "deleted"}:
-                return RunPodTerminateStatus.TERMINATED, False
-        # A successful GET proves that the pod still exists, even if the
-        # response body is not useful enough to classify its lifecycle state.
-        return None, True
+            return RunPodTerminateConfirmation.AMBIGUOUS
+        if not isinstance(payload, dict):
+            return RunPodTerminateConfirmation.AMBIGUOUS
+        desired_status = payload.get("desiredStatus")
+        if desired_status == "TERMINATED":
+            return RunPodTerminateConfirmation.TERMINATED
+        if desired_status == "RUNNING":
+            return RunPodTerminateConfirmation.CONFIRMED_RUNNING
+        return RunPodTerminateConfirmation.AMBIGUOUS
 
 
 def _clean(value: str | None) -> str | None:
@@ -225,6 +240,7 @@ __all__ = [
     "RUNPOD_API_BASE_URL",
     "RunPodIdentity",
     "RunPodLifecycleAdapter",
+    "RunPodTerminateConfirmation",
     "RunPodTerminateError",
     "RunPodTerminateResult",
     "RunPodTerminateStatus",

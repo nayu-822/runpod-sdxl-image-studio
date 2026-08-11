@@ -8,11 +8,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
+import httpx
 import pytest
 
 from runpod_sdxl_image_studio.adapters.comfyui.models import ComfyUIQueueStatus
 from runpod_sdxl_image_studio.adapters.runpod.pod_lifecycle import (
+    RUNPOD_API_BASE_URL,
     RunPodIdentity,
+    RunPodLifecycleAdapter,
     RunPodTerminateError,
     RunPodTerminateResult,
     RunPodTerminateStatus,
@@ -752,6 +755,69 @@ async def test_manual_terminate_uses_same_drain_backup_path() -> None:
     assert readiness.is_safe
     assert state_sync.backup_calls == 1
     assert runpod.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_adapter_terminated_confirmation_completes_service_without_reopening_work() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        if request.method == "DELETE":
+            return httpx.Response(503)
+        return httpx.Response(200, json={"desiredStatus": "TERMINATED"})
+
+    async with httpx.AsyncClient(
+        base_url=RUNPOD_API_BASE_URL,
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        service, _, state_sync = _service()
+        service._runpod_adapter = RunPodLifecycleAdapter(  # type: ignore[attr-defined]
+            client=client,
+            env={"RUNPOD_POD_ID": "pod-current", "RUNPOD_API_KEY": "secret"},
+        )
+        service.arm_on_generation_enqueue()
+
+        readiness = await service.manual_drain_backup_and_terminate()
+
+    assert readiness.is_safe
+    assert calls == ["DELETE", "GET"]
+    assert state_sync.backup_calls == 1
+    assert service.session is not None
+    assert service.session.status is AutoTerminateState.TERMINATION_REQUESTING
+
+
+@pytest.mark.asyncio
+async def test_adapter_delivery_ambiguity_enters_hard_freeze_without_duplicate_delete() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        if request.method == "DELETE":
+            raise httpx.ReadError("connection lost", request=request)
+        return httpx.Response(200, json={"desiredStatus": "RUNNING"})
+
+    async with httpx.AsyncClient(
+        base_url=RUNPOD_API_BASE_URL,
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        service, _, _ = _service()
+        service._runpod_adapter = RunPodLifecycleAdapter(  # type: ignore[attr-defined]
+            client=client,
+            env={"RUNPOD_POD_ID": "pod-current", "RUNPOD_API_KEY": "secret"},
+        )
+        service.arm_on_generation_enqueue()
+
+        with pytest.raises(RunPodTerminateError) as raised:
+            await service.manual_drain_backup_and_terminate()
+        assert raised.value.ambiguous
+        assert service.session is not None
+        assert service.session.status is AutoTerminateState.TERMINATION_AMBIGUOUS
+
+        readiness = await service.manual_drain_backup_and_terminate()
+
+    assert not readiness.is_safe
+    assert calls == ["DELETE", "GET"]
 
 
 @pytest.mark.asyncio
