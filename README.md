@@ -601,23 +601,21 @@ alembic upgrade head
 ```
 
 Phase 9の自動テストはFake adapter、SQLite、Alembicを使い、実GPU・実ComfyUI・実RunPod・実Google Driveを必要としません。
-## Phase 12: Session restore and Safe Auto-Terminate
+## Phase 12: 前回セッション復元と安全なAuto-Terminate
 
-Phase 12 persists a schema-versioned `GenerationFormStateSnapshot` separately from
-the execution snapshot. The form snapshot is written only after a generation or
-batch enqueue succeeds. On startup the app restores the last valid form state,
-falls back to the latest generation snapshot when needed, and prepares the exact
-checkpoint, VAE, LoRA, and optional upscaler through the Phase 11 model-transfer
-service. Missing models are reported without substitutions and startup never
-submits a new ComfyUI prompt.
+Phase 12では、実行snapshotとは別にschema version付きの
+`GenerationFormStateSnapshot`を保存します。generationまたはbatch enqueueの
+成功後だけ書き込み、起動時に最後の有効なform stateを復元します。必要なら
+最新generation snapshotへfallbackし、Phase 11のmodel-transfer serviceで
+checkpoint、VAE、LoRA、任意upscalerを正確に準備します。不足モデルを代替せず、
+起動時に新しいComfyUI promptを送信しません。
 
-Pod lifecycle state is stored per `RUNPOD_POD_ID`; API keys are read only from the
-environment and are never persisted or shown. Auto-terminate is disabled by
-default and can be enabled with `IMAGE_STUDIO_AUTO_TERMINATE_ENABLED=true`. The
-coordinator arms only after a successful enqueue, waits for the configured grace
-period, rechecks every readiness boundary, performs an awaited clean state backup,
-and sends one self-only DELETE request to the fixed RunPod REST endpoint. Any
-ambiguous API result is fail-closed and requires operator review.
+Pod lifecycle stateは`RUNPOD_POD_ID`単位で保存します。API keyはenvironmentから
+読むだけで保存・表示しません。Auto-Terminateは既定で無効で、
+`IMAGE_STUDIO_AUTO_TERMINATE_ENABLED=true`で有効化できます。成功したenqueue後
+だけcoordinatorをarmし、grace period、readiness boundary、cleanなstate backupを
+確認したうえで、固定RunPod REST endpointへself-onlyのDELETEを一度だけ送信します。
+ambiguousなAPI結果はfail-closedとしてoperator確認を要求します。
 
 ```dotenv
 IMAGE_STUDIO_RESTORE_LAST_SETTINGS_ON_STARTUP=true
@@ -627,54 +625,47 @@ IMAGE_STUDIO_AUTO_TERMINATE_GRACE_SECONDS=15
 IMAGE_STUDIO_AUTO_TERMINATE_CHECK_INTERVAL_SECONDS=2
 ```
 
-## RunPod production deployment (Phase 13)
+## RunPod本番デプロイ（Phase 13）
 
-Phase 13 packages the existing ComfyUI application and Image Studio runtime
-in a pinned, reproducible image. The image uses
-runpod/comfyui:1.4.4-cuda12.8 as its base, installs Image Studio into the
-isolated /opt/image-studio-venv, and pins rclone to 1.74.2 with a verified
-SHA256SUMS download. See deploy/runpod/README.md for the complete RunPod
-Template and fresh-Pod procedure.
+Phase 13では、既存のComfyUI applicationとImage Studio runtimeを固定した再現可能な
+imageへまとめます。baseは`runpod/comfyui:1.4.4-cuda12.8`、Image Studioのinstall先は
+分離した`/opt/image-studio-venv`、rcloneは検証済みSHA256SUMSの1.74.2です。完全な
+RunPod TemplateとFresh Pod手順は`deploy/runpod/README.md`に記載します。
 
-The production image does not contain checkpoints, LoRA, VAE, upscaler files,
-generated images, SQLite state, OAuth tokens, API keys, cookies, .env, or
-rclone.conf. The Template materializes rclone.conf from the
-image_studio_rclone_config_b64 Secret at startup with mode 0600. Bootstrap
-starts the base image's existing /start.sh, waits only for the fixed local
-ComfyUI endpoint http://127.0.0.1:8188/system_stats, and then starts the
-installed runpod-sdxl-image-studio entry point. It then probes that fixed
-ComfyUI endpoint every five seconds and fails closed only after twelve
-consecutive failures, stopping Image Studio and the base process in order.
-State restore, Alembic migrations, and model preparation remain in the
-application startup path.
+production imageにはcheckpoint、LoRA、VAE、upscaler、生成画像、SQLite state、OAuth
+token、API key、cookie、`.env`、`rclone.conf`を含めません。Templateは起動時に
+`image_studio_rclone_config_b64` Secretからrclone.confを0600でmaterializeします。
+bootstrapは既存の`/start.sh`を起動し、固定local endpoint
+`http://127.0.0.1:8188/system_stats`のreadinessをwall-clock deadlineで待ってから
+Image Studioを起動します。既定900秒の間、probeの`--max-time`は残り時間と5秒の
+小さい方へ制限し、timeout=0では即時probeを最大1回だけ行います。
 
-Build and publish manually with a traceable tag; do not use latest. Use
-docker build --platform linux/amd64 with a phase13-<git-short-sha> tag, then
-docker tag and docker push the same fixed tag to the selected registry.
+Image Studio起動後は各probe完了後、既定5秒を目安に同じComfyUI endpointを再確認します。
+成功時はfailure countを0へ戻し、12回連続失敗時だけImage Studio、base processの順に
+停止してfail-closedでnon-zero終了します。Docker HEALTHCHECKは7860だけを確認し、
+Fresh Pod用のstart periodは30分です。State restore、Alembic migration、model
+preparationはapplication startup pathの責務です。
 
-The recommended production Template exposes only 7860/http and keeps Public
-Template disabled. Use 50 GB container disk, no Network Volume, and zero
-Volume Disk for the stateless deployment described here. Set the Template
-image to the fixed published tag and copy the environment from
-deploy/runpod/template.env.example. RunPod supplies RUNPOD_POD_ID and
-RUNPOD_API_KEY automatically; do not add them to the Template.
+buildとpublishはtraceable tagで手動実行し、latestは使用しません。
+`docker build --platform linux/amd64`で`phase13-<git-short-sha>` tagを作り、同じ
+固定tagを`docker tag`と`docker push`へ渡します。
 
-Create the image_studio_rclone_config_b64 Secret from a local base64-encoded
-rclone.conf without printing its value. Bootstrap rejects empty or invalid
-data, symlink paths, and write failures, and atomically installs the decoded
-file with mode 0600. Never paste the decoded configuration into the
-repository, image, logs, or README.
+production Templateが公開するHTTP portは7860だけで、Public Templateは無効にします。
+container diskは50 GB、Network Volumeなし、Volume Diskは0 GBを推奨します。Template
+imageには固定publish tagを設定し、環境変数は`deploy/runpod/template.env.example`から
+コピーします。RunPodが自動提供する`RUNPOD_POD_ID`と`RUNPOD_API_KEY`はTemplateへ追加
+しません。
 
-For a fresh-Pod check, first deploy with
-IMAGE_STUDIO_AUTO_TERMINATE_ENABLED=false. Verify /start.sh, ComfyUI local
-readiness, Image Studio on 7860, Drive connectivity, state restore, exact
-model preparation, one generation, image and metadata sync, manifest sync,
-and a clean final state backup. After that flow is confirmed, enable
-auto-terminate on a second Pod and verify the existing Phase 12 grace,
-readiness, final-backup, and fail-closed termination behavior. A second fresh
-Pod must restore state and settings without submitting a new /prompt.
+`image_studio_rclone_config_b64` Secretはlocalのrclone.confから作成し、値をlogや
+repository、image、READMEへ出しません。bootstrapは空値、invalid data、symlink path、
+write failureをrejectし、decoded fileを0600でatomic installします。
 
-The Docker build and live RunPod checks are separate from the normal local
-test suite. On a machine without Docker, report the build and Docker smoke
-test as not executed rather than treating static checks as a successful image
-build.
+Fresh Pod確認は`IMAGE_STUDIO_AUTO_TERMINATE_ENABLED=false`で開始し、`/start.sh`、
+ComfyUI readiness、7860のImage Studio、Drive connectivity、state restore、必要model、
+生成、image/metadata sync、manifest sync、clean final state backupを確認します。
+その後、別PodでAuto-Terminateを有効化し、Phase 12のgrace、readiness、final backup、
+fail-closed terminationを確認します。別のFresh Podでも新しい`/prompt`を送信せずに
+stateと設定を復元できることを確認します。
+
+Docker buildと実RunPod確認はlocal test suiteとは別です。Dockerがない環境ではbuildと
+Docker smoke testを未実施と報告し、static checkをimage build成功とは扱いません。

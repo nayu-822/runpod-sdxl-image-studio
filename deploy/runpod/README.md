@@ -1,33 +1,30 @@
-# RunPod production deployment
+# RunPod本番デプロイ
 
-This directory describes the Phase 13 deployment of the existing RunPod
-ComfyUI application and Image Studio runtime. It does not create Pods through
-the RunPod API. Phase 12's self-only Safe Auto-Terminate remains the only
-RunPod lifecycle API operation in this repository.
+このdirectoryは、既存のRunPod ComfyUI applicationとImage Studio runtimeを
+Phase 13でFresh Podへ配置する手順を説明します。RunPod APIによるPod自動Deployや
+外部orchestrationは実装しません。Phase 12のself-only Safe Auto-Terminateは、
+application側の既存機能として扱います。
 
-## Image contents and boundaries
+## イメージの内容と境界
 
-The image is built from the pinned base image
-runpod/comfyui:1.4.4-cuda12.8. It contains the repository-controlled Image
-Studio source and Python package metadata, Alembic migrations, workflow
-definitions, the Image Studio Python 3.11+ virtual environment at
-/opt/image-studio-venv, the pinned rclone 1.74.2 binary verified against the
-upstream SHA256SUMS file, and the deployment scripts.
+imageは固定したbase image
+`runpod/comfyui:1.4.4-cuda12.8`からbuildします。repository管理下のImage Studio
+sourceとPython package metadata、Alembic migration、workflow定義、
+`/opt/image-studio-venv`のPython 3.11以上のvirtual environment、checksum検証済み
+rclone 1.74.2、deployment scriptを含みます。
 
-It intentionally does not contain checkpoints, LoRA, VAE, upscaler files,
-generated images, SQLite state, rclone.conf, OAuth tokens, API keys, cookies,
-or .env files. Models and state are restored by the existing Phase 11/10
-application services after startup.
+checkpoint、LoRA、VAE、upscaler、生成画像、SQLite state、`rclone.conf`、OAuth
+token、API key、cookie、`.env`はimageへ含めません。modelとstateは起動後に既存の
+Phase 11/10 application serviceが復元します。
 
-The application is installed editable under /opt/image-studio. This keeps
-the repository root, alembic.ini, alembic/, and workflows/ available to the
-existing startup code without a package-data workaround. The Image Studio
-venv is separate from the ComfyUI venv.
+applicationは`/opt/image-studio`へeditable installします。これによりrepository root、
+`alembic.ini`、`alembic/`、`workflows/`を既存startup codeから利用できます。
+Image StudioのvenvはComfyUIのvenvと分離します。
 
-## Build and publish
+## ビルドと公開
 
-Build on a machine with Docker and publish a traceable tag. Do not publish or
-configure latest for a production Template.
+Dockerが利用できる環境でbuildし、追跡可能なtagをpublishします。production Template
+では`latest`をpublishまたは設定しません。
 
 ~~~bash
 git rev-parse --short HEAD
@@ -36,16 +33,16 @@ docker tag runpod-sdxl-image-studio:phase13-<git-short-sha> <registry-user>/runp
 docker push <registry-user>/runpod-sdxl-image-studio:phase13-<git-short-sha>
 ~~~
 
-The build downloads only the pinned rclone release and its checksum file at
-image-build time. Runtime bootstrap never runs git clone, pip install, apt,
-curl | bash, or a model download.
+build時にdownloadするのは固定したrclone releaseとchecksum fileだけです。
+runtimeのbootstrapは`git clone`、`pip install`、`apt`、`curl | bash`、model downloadを
+実行しません。
 
 ## rclone Secret
 
-Create a RunPod Secret named image_studio_rclone_config_b64 containing the
-base64 encoding of the local rclone.conf. Do not commit the value or put it
-in a Docker build argument. The decoded file is created at runtime as
-/run/image-studio/rclone.conf with a 0700 parent and 0600 file mode.
+localの`rclone.conf`をbase64化し、RunPod Secret
+`image_studio_rclone_config_b64`へ登録します。値をcommitせず、Docker build argumentにも
+入れません。runtimeではparent directoryを0700、decoded fileを0600として
+`/run/image-studio/rclone.conf`へ作成します。
 
 PowerShell:
 
@@ -63,7 +60,7 @@ echo "base64 value prepared"
 unset RCLONE_CONFIG_B64
 ~~~
 
-Paste the value only into RunPod Secrets. In the Template environment use:
+値はRunPod Secretsにだけ貼り付けます。Template environmentには次を設定します。
 
 ~~~dotenv
 IMAGE_STUDIO_RCLONE_CONFIG_B64={{ RUNPOD_SECRET_image_studio_rclone_config_b64 }}
@@ -71,81 +68,73 @@ RCLONE_CONFIG=/run/image-studio/rclone.conf
 RCLONE_REMOTE=drive
 ~~~
 
-Bootstrap rejects an empty or invalid value, an existing symlink at the
-configured path or parent, and any write/decode failure. It writes to a
-temporary file, applies 0600, and atomically replaces the final path. It then
-verifies that RCLONE_REMOTE appears in rclone listremotes; remote names and
-command success are used only for validation, never the config contents. If
-state sync, remote model preparation, or a configured remote is enabled
-without a valid config, startup fails fast.
+bootstrapは空値、invalid value、設定pathまたはparentのsymlink、decode/write failureを
+rejectします。temporary fileへ書いて0600を設定し、atomic replaceします。その後、
+`RCLONE_REMOTE`が`rclone listremotes`に存在することだけを確認します。config本文は
+表示もlog出力もしません。state sync、remote model preparation、configured remoteの
+いずれかを有効にして有効なconfigがない場合はstartupをfail-fastします。
 
-## Template settings
+## Template設定
 
-Copy template.env.example into the RunPod Template environment and replace
-only the Secret placeholder through the RunPod Secret mechanism. The
-recommended production Template is:
+`template.env.example`をRunPod Template environmentへコピーし、Secret placeholderだけを
+RunPod Secret機構で置き換えます。production Templateの推奨値は次のとおりです。
 
-| Setting | Value |
+| 設定 | 値 |
 | --- | --- |
 | Name | SDXL Image Studio |
 | Category | NVIDIA |
-| Container image | fixed phase13-<git-short-sha> tag |
+| Container image | 固定したphase13-<git-short-sha> tag |
 | Container disk | 50 GB |
 | Volume disk | 0 GB |
 | Network volume | none |
 | HTTP port | 7860/http only |
 | Public Template | off |
 | Docker Entrypoint | unchanged |
-| Docker Start Command | unchanged; image CMD invokes bootstrap |
+| Docker Start Command | unchanged; image CMDがbootstrapを起動 |
 
-Do not expose 8188/http, 8080/http, or 8888/http in production. ComfyUI is
-reached by Image Studio through 127.0.0.1:8188. Port 22/tcp may be added
-temporarily for debugging but is not part of the production Template. RunPod
-supplies RUNPOD_POD_ID and RUNPOD_API_KEY; do not add or persist them in the
-Template file.
+productionでは8188/http、8080/http、8888/httpを公開しません。ComfyUIにはImage
+Studioから`127.0.0.1:8188`で接続します。debug時だけ一時的に22/tcpを追加できますが、
+production Templateには含めません。RunPodが提供する`RUNPOD_POD_ID`と`RUNPOD_API_KEY`を
+Template fileへ追加・保存しません。
 
-## Startup flow
+## 起動フロー
 
-The bootstrap order is deliberately narrow:
+bootstrapの順序は次のとおりです。
 
-1. Materialize and validate the optional rclone config.
-2. Start the base image's existing /start.sh in the background.
-3. Poll only http://127.0.0.1:8188/system_stats until ready, with a bounded
-   IMAGE_STUDIO_BOOTSTRAP_COMFYUI_TIMEOUT_SECONDS timeout.
-4. Start /opt/image-studio-venv/bin/runpod-sdxl-image-studio from
-   /opt/image-studio.
-5. After Image Studio starts, probe the same fixed ComfyUI endpoint every
-   IMAGE_STUDIO_BOOTSTRAP_COMFYUI_MONITOR_INTERVAL_SECONDS seconds (5 by
-   default). A successful probe resets the failure counter; only
-   IMAGE_STUDIO_BOOTSTRAP_COMFYUI_FAILURE_THRESHOLD consecutive failures (12
-   by default) are treated as a persistent ComfyUI failure.
-6. Supervise both processes. A persistent ComfyUI failure or an unexpected
-   child exit gracefully stops Image Studio and the base process, escalates
-   to the bounded kill fallback when necessary, and exits non-zero. The
-   bootstrap does not auto-restart ComfyUI and is not kept alive with sleep
-   infinity.
-7. On SIGTERM/SIGINT, forward a graceful TERM and wait up to
-   IMAGE_STUDIO_BOOTSTRAP_SHUTDOWN_GRACE_SECONDS before a bounded fallback.
+1. optionalなrclone configをmaterializeして検証する。
+2. base image既存の`/start.sh`をbackgroundで起動する。
+3. 固定endpoint `http://127.0.0.1:8188/system_stats`がreadyになるまで待つ。
+   `IMAGE_STUDIO_BOOTSTRAP_COMFYUI_TIMEOUT_SECONDS`はwall-clock deadlineで計測し、
+   既定900秒を超えて待ちません。timeout=0では即時probeを最大1回だけ行います。
+4. `/opt/image-studio-venv/bin/runpod-sdxl-image-studio`を
+   `/opt/image-studio`から起動する。
+5. Image Studio起動後、各probe完了後に既定5秒を目安として同じComfyUI endpointを
+   再確認する。成功時はfailure countを0へ戻し、
+   `IMAGE_STUDIO_BOOTSTRAP_COMFYUI_FAILURE_THRESHOLD`（既定12）回連続失敗した場合だけ
+   persistent failureとする。失敗したprobeのHTTP timeoutもあるため、厳密に5秒ごととは
+   限定しない。
+6. persistentなComfyUI failureまたはchild processの予期しない終了時は、Image Studio、
+   base processの順にgraceful TERMを送り、設定されたgrace period後に必要ならKILLへ
+   fallbackしてnon-zero終了する。ComfyUIのauto-restartや`sleep infinity`は行わない。
+7. SIGTERM/SIGINTではImage Studioとbase processへgraceful TERMを送り、
+   `IMAGE_STUDIO_BOOTSTRAP_SHUTDOWN_GRACE_SECONDS`までbounded waitする。
 
-The Docker health check probes only the user-facing Image Studio endpoint at
-http://127.0.0.1:7860/ and has a 20-minute startup grace period for fresh Pod
-initialization. A health-check failure does not mutate SQLite or issue a
-RunPod DELETE. Bootstrap logs contain only safe status messages; rclone
-configuration contents, tokens, API keys, prompts, and raw HTTP responses are
-never printed.
+Docker HEALTHCHECKはuser-facingな`http://127.0.0.1:7860/`だけをprobeし、Fresh Pod用の
+startup grace periodは30分です。8188をhealth markerとして公開・追加しません。
+healthcheck failureはSQLiteを変更せず、RunPod DELETEも発行しません。bootstrap logは
+安全なstatusだけを出し、rclone config本文、token、API key、prompt、raw HTTP responseを
+出力しません。
 
-The bootstrap does not run state restore, Alembic migrations, model downloads,
-/prompt, Drive sync, or Auto-Terminate. The existing application startup path
-performs restore verification and Alembic upgrade; Phase 11's model transfer
-worker handles exact on-demand model preparation; Phase 12 handles
-Safe Auto-Terminate after its readiness and final-backup checks.
+bootstrapはstate restore、Alembic migration、model download、`/prompt`、Drive sync、
+Auto-Terminateを実行しません。既存application startup pathがrestore検証とAlembic
+upgradeを担当し、Phase 11のmodel-transfer workerが必要modelを準備し、Phase 12の
+applicationがreadiness確認後にSafe Auto-Terminateを担当します。
 
-## Local and container smoke checks
+## ローカルとコンテナの確認
 
-The GPU-free smoke test verifies Python, package import, Gradio major version,
-rclone availability, repository files, executable scripts, and a temporary
-SQLite upgrade_database plus integrity check. It does not require a GPU,
-ComfyUI, RunPod, Google Drive, or a real rclone remote.
+GPU不要のsmoke testはPython、package import、Gradio major version、rclone availability、
+repository file、executable script、一時SQLiteの`upgrade_database`とintegrity checkを
+検証します。GPU、ComfyUI、RunPod、Google Drive、実rclone remoteは必要ありません。
 
 ~~~bash
 bash -n deploy/runpod/bootstrap.sh
@@ -153,58 +142,49 @@ bash -n deploy/runpod/smoke-test.sh
 pytest tests/unit/test_phase13_runpod_deployment.py
 ~~~
 
-After a successful image build:
+image build成功後は次を実行します。
 
 ~~~bash
 docker run --rm --entrypoint /bin/bash runpod-sdxl-image-studio:phase13-<git-short-sha> /opt/image-studio/deploy/runpod/smoke-test.sh
 ~~~
 
-If Docker is unavailable, report the Docker build and container smoke test as
-not executed. Static checks and local tests do not prove that an image was
-built or that a real RunPod Template works.
+Dockerが利用できない場合、Docker buildとcontainer smoke testは未実施と報告します。
+static checkやlocal testだけではimage buildや実RunPod Templateの動作を証明できません。
 
-## Fresh Pod verification
+## Fresh Pod確認
 
-Deploy Fresh Pod A with IMAGE_STUDIO_AUTO_TERMINATE_ENABLED=false and verify:
+Fresh Pod Aは`IMAGE_STUDIO_AUTO_TERMINATE_ENABLED=false`でdeployし、次を確認します。
 
-1. /start.sh starts the base services and ComfyUI reaches local readiness.
-2. Image Studio is reachable through the RunPod proxy on 7860.
-3. rclone remote validation succeeds without exposing config contents.
-4. Google Drive state restore completes or fails closed with a safe message.
-5. The previous form state is restored and exact required models are prepared.
-6. No startup /prompt is submitted.
-7. A user Generate succeeds.
-8. Image and metadata reach SYNCED, the manifest reaches SYNCED, and the
-   final state backup is clean.
+1. `/start.sh`がbase serviceを起動し、ComfyUIがlocal readinessへ到達する。
+2. Image StudioがRunPod proxyの7860から到達できる。
+3. rclone remote検証がconfig本文を出さずに成功する。
+4. Google Drive state restoreが完了するか、安全なmessageでfail-closedする。
+5. 前回form stateが復元され、必要modelが正確に準備される。
+6. startup `/prompt`が送信されない。
+7. 利用者のGenerateが成功する。
+8. imageとmetadataがSYNCEDになり、manifestとfinal state backupがcleanになる。
 
-Then deploy Fresh Pod B from the same fixed Template tag and verify state,
-form settings, and exact model preparation are restored without a new startup
-generation. Only after A and B pass should auto-terminate be enabled on a
-separate verification Pod:
+同じ固定Template tagでFresh Pod Bをdeployし、state、form settings、必要modelが新しい
+startup generationなしに復元されることを確認します。AとBが成功してから、別の検証Podで
+Auto-Terminateを有効化します。
 
 ~~~dotenv
 IMAGE_STUDIO_AUTO_TERMINATE_ENABLED=true
 ~~~
 
-Verify Generation completion, Drive and manifest synchronization, final state
-backup, grace period, SAFE TO TERMINATE, one self-only DELETE, and the
-existing Phase 12 fail-closed behavior for ambiguous responses. A live Pod
-test is separate from CI and local Mock/Fake tests.
+Generation completion、Drive/manifest synchronization、final state backup、grace period、
+SAFE TO TERMINATE、self-only DELETE一回、ambiguous response時のPhase 12 fail-closedを
+確認します。実Pod確認はCIやlocal Mock/Fake testとは別です。
 
-## Troubleshooting
+## トラブルシューティング
 
-- ComfyUI timeout: inspect base image logs and confirm the fixed local
-  endpoint is available. Do not replace it with an external or user-supplied
-  URL.
-- rclone config failure: recreate the Secret from a local config, confirm the
-  exact Secret name, and verify the drive: remote locally. Never print
-  rclone.conf or use rclone config show in diagnostics.
-- model unavailable: keep the application fail-closed and use the Phase 11
-  model preparation UI. Do not copy models into the image or substitute a
-  different checkpoint automatically.
-- state restore failure: leave the application under its existing fail-closed
-  write protection and inspect authorized application logs. Bootstrap does not
-  download latest.json or reconcile SQLite state.
-- container exits: inspect the safe bootstrap message for which supervised
-  process ended. The bootstrap intentionally does not hide an unexpected exit
-  behind an infinite sleep.
+- ComfyUI timeout: base image logを確認し、固定local endpointが利用できることを確認します。
+  外部URLやuser-supplied URLへ置き換えません。
+- rclone config failure: local configからSecretを作り直し、Secret名と`drive:` remoteを
+  確認します。`rclone.conf`を表示せず、diagnosticで`rclone config show`を使いません。
+- model unavailable: applicationのfail-closed状態を維持し、Phase 11 model preparation UIを
+  使用します。modelをimageへコピーしたり、別checkpointへ自動代替したりしません。
+- state restore failure: 既存のfail-closed write protectionを維持し、許可されたapplication
+  logだけを確認します。bootstrapは`latest.json`のdownloadやSQLite reconciliationをしません。
+- container exit: supervised processの終了理由をsafe bootstrap messageで確認します。
+  bootstrapはunexpected exitをinfinite sleepで隠しません。

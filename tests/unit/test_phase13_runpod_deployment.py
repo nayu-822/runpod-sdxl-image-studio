@@ -59,7 +59,7 @@ def test_dockerfile_is_pinned_and_keeps_the_base_entrypoint() -> None:
     assert "COPY *.safetensors" not in dockerfile
     assert "COPY . " not in dockerfile
     assert "http://127.0.0.1:7860/" in dockerfile
-    assert "--start-period=20m" in dockerfile
+    assert "--start-period=30m" in dockerfile
 
 
 def test_dockerignore_excludes_runtime_state_and_models_but_keeps_examples() -> None:
@@ -120,6 +120,9 @@ def test_bootstrap_and_smoke_scripts_are_syntactically_valid_and_safe() -> None:
 
     bootstrap = _read(BOOTSTRAP)
     assert "http://127.0.0.1:8188/system_stats" in bootstrap
+    assert "bootstrap_now_seconds" in bootstrap
+    assert "deadline_seconds" in bootstrap
+    assert '--max-time "$max_time_seconds"' in bootstrap
     assert "probe_comfyui" in bootstrap
     assert "check_comfyui_liveness" in bootstrap
     assert "IMAGE_STUDIO_BOOTSTRAP_COMFYUI_MONITOR_INTERVAL_SECONDS" in bootstrap
@@ -290,6 +293,8 @@ source "$1"
 export IMAGE_STUDIO_BOOTSTRAP_COMFYUI_TIMEOUT_SECONDS=2
 export IMAGE_STUDIO_BOOTSTRAP_SHUTDOWN_GRACE_SECONDS=0
 BASE_PROCESS_PID=123
+fake_now=100
+bootstrap_now_seconds() { printf '%s\n' "$fake_now"; }
 kill() {
     if [[ "$1" == "-0" && "$2" == "123" ]]; then
         return 0
@@ -301,7 +306,10 @@ kill() {
     return 1
 }
 sleep() { :; }
-probe_comfyui() { return 1; }
+probe_comfyui() {
+    fake_now=$((fake_now + 1))
+    return 1
+}
 if wait_for_comfyui; then
     printf 'app-started\n'
     exit 2
@@ -315,6 +323,94 @@ fi
     assert "-KILL:123" in result.stdout
     assert "app-started" not in result.stdout
     assert "ComfyUI readiness timed out" in result.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="runtime bootstrap supervision is tested on Linux")
+def test_bootstrap_startup_timeout_uses_wall_clock_and_bounds_probe_timeout() -> None:
+    result = _run_bash(
+        """
+set -Eeuo pipefail
+source "$1"
+export IMAGE_STUDIO_BOOTSTRAP_COMFYUI_TIMEOUT_SECONDS=4
+BASE_PROCESS_PID=123
+fake_now=100
+probe_calls=0
+probe_timeout=0
+sleep_calls=0
+bootstrap_now_seconds() { printf '%s\n' "$fake_now"; }
+fatal() {
+    printf 'fatal=%s\n' "$*"
+    return 99
+}
+kill() {
+    if [[ "$1" == "-0" && "$2" == "123" ]]; then
+        return 0
+    fi
+    return 1
+}
+sleep() {
+    sleep_calls=$((sleep_calls + 1))
+    fake_now=$((fake_now + 1))
+}
+probe_comfyui() {
+    probe_calls=$((probe_calls + 1))
+    probe_timeout="$1"
+    fake_now=$((fake_now + 5))
+    return 1
+}
+if wait_for_comfyui; then
+    exit 2
+fi
+printf 'probes=%s timeout=%s sleeps=%s now=%s\n' \
+    "$probe_calls" "$probe_timeout" "$sleep_calls" "$fake_now"
+""",
+        "deploy/runpod/bootstrap.sh",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "probes=1 timeout=4 sleeps=0 now=105" in result.stdout
+    assert "fatal=ComfyUI readiness timed out" in result.stdout
+
+
+@pytest.mark.skipif(os.name == "nt", reason="runtime bootstrap supervision is tested on Linux")
+def test_bootstrap_timeout_zero_allows_one_bounded_readiness_probe() -> None:
+    result = _run_bash(
+        """
+set -Eeuo pipefail
+source "$1"
+export IMAGE_STUDIO_BOOTSTRAP_COMFYUI_TIMEOUT_SECONDS=0
+BASE_PROCESS_PID=123
+fake_now=100
+probe_calls=0
+probe_timeout=0
+bootstrap_now_seconds() { printf '%s\n' "$fake_now"; }
+fatal() {
+    printf 'fatal=%s\n' "$*"
+    return 99
+}
+kill() {
+    if [[ "$1" == "-0" && "$2" == "123" ]]; then
+        return 0
+    fi
+    return 1
+}
+sleep() { exit 2; }
+probe_comfyui() {
+    probe_calls=$((probe_calls + 1))
+    probe_timeout="$1"
+    return 1
+}
+if wait_for_comfyui; then
+    exit 2
+fi
+printf 'probes=%s timeout=%s\n' "$probe_calls" "$probe_timeout"
+""",
+        "deploy/runpod/bootstrap.sh",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "probes=1 timeout=1" in result.stdout
+    assert "fatal=ComfyUI readiness timed out" in result.stdout
 
 
 @pytest.mark.skipif(os.name == "nt", reason="runtime bootstrap supervision is tested on Linux")

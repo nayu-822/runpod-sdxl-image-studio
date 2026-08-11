@@ -145,25 +145,65 @@ start_runpod_base() {
 
 wait_for_comfyui() {
     local timeout_seconds="${IMAGE_STUDIO_BOOTSTRAP_COMFYUI_TIMEOUT_SECONDS:-900}"
+    local start_seconds
+    local deadline_seconds
+    local now_seconds
+    local remaining_seconds
+    local probe_timeout_seconds
+    local startup_probe_attempted=0
 
     [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || fatal "ComfyUI timeout must be an integer"
+    timeout_seconds=$((10#$timeout_seconds))
     command -v curl >/dev/null 2>&1 || fatal "curl is not available"
+    start_seconds="$(bootstrap_now_seconds)"
+    deadline_seconds=$((start_seconds + timeout_seconds))
     log_message "waiting for ComfyUI readiness"
-    for ((second = 0; second <= timeout_seconds; second++)); do
-        if probe_comfyui; then
+    while :; do
+        now_seconds="$(bootstrap_now_seconds)"
+        remaining_seconds=$((deadline_seconds - now_seconds))
+        if ((remaining_seconds <= 0)); then
+            if ((timeout_seconds == 0 && startup_probe_attempted == 0)); then
+                probe_timeout_seconds=1
+            else
+                fatal "ComfyUI readiness timed out"
+            fi
+        else
+            probe_timeout_seconds="$remaining_seconds"
+            if ((probe_timeout_seconds > 5)); then
+                probe_timeout_seconds=5
+            fi
+        fi
+
+        startup_probe_attempted=1
+        if probe_comfyui "$probe_timeout_seconds"; then
             log_message "ComfyUI is ready"
             return 0
         fi
         if ! kill -0 "$BASE_PROCESS_PID" 2>/dev/null; then
             fatal "RunPod base process exited before ComfyUI became ready"
         fi
+        if ((timeout_seconds == 0)); then
+            fatal "ComfyUI readiness timed out"
+        fi
+
+        now_seconds="$(bootstrap_now_seconds)"
+        remaining_seconds=$((deadline_seconds - now_seconds))
+        if ((remaining_seconds <= 0)); then
+            fatal "ComfyUI readiness timed out"
+        fi
         sleep 1
     done
-    fatal "ComfyUI readiness timed out"
+}
+
+bootstrap_now_seconds() {
+    printf '%s\n' "$SECONDS"
 }
 
 probe_comfyui() {
-    curl --fail --silent --max-time 5 --output /dev/null "$COMFYUI_READY_URL"
+    local max_time_seconds="${1:-5}"
+
+    curl --fail --silent --max-time "$max_time_seconds" --output /dev/null \
+        "$COMFYUI_READY_URL"
 }
 
 start_image_studio() {

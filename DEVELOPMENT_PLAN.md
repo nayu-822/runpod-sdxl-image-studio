@@ -498,7 +498,9 @@ RunPod bootstrap/Docker image、RunPod API、自動Terminate、複数Pod、モ�
 - 自動 caption
 - 画像評価・採否
 - LoRA 作成プロジェクトとのモデル共有
-- RunPod API による Pod lifecycle
+- RunPod APIによるPod自動Deploy
+- GPU自動選択
+- 外部orchestration / scheduler
 - 複数ユーザー対応
 
 これらは初期設計へ直接組み込まず、Adapter と workflow template の拡張点だけ確保する。
@@ -580,51 +582,50 @@ retryはsource provenanceと `retry_of_generation_id` を保持した新規Gener
 source selection、UIの排他再有効化、mapping、外部image/latentのworkerとreconciliation、source mutation、retry idempotency、migrationの候補消失を拒否する安全なdowngrade、
 既存Queue経路を検証します。複数worker、Queue並べ替え、自動retry、
 汎用workflow editorは対象外です。
-## Phase 12: Session restore and Safe Auto-Terminate
+## Phase 12: 前回セッション復元と安全なAuto-Terminate
 
-The implementation adds a versioned form-state snapshot distinct from the
-execution snapshot. It is persisted only after successful generation or batch
-enqueue, restored asynchronously at startup, and safely falls back to the latest
-generation snapshot. Phase 11 model preparation is reused for exact checkpoint,
-VAE, LoRA, and optional upscaler restoration; missing models never cause a silent
-substitution and startup does not enqueue a ComfyUI prompt.
+Phase 12では、実行snapshotとは分離したversion付きのフォーム状態snapshotを
+追加しました。生成またはbatch enqueueの成功後だけ保存し、起動時に非同期で
+復元します。復元できない場合は最新のgeneration snapshotへ安全にfallbackし、
+Phase 11のmodel-transfer serviceでcheckpoint、VAE、LoRA、任意のupscalerを
+正確に準備します。不足モデルを暗黙に代替せず、起動時にComfyUI promptを
+enqueueしません。
 
-Pod lifecycle sessions are keyed by the current `RUNPOD_POD_ID`. Auto-terminate
-is opt-in, arms after successful enqueue, enters a grace/draining state, checks
-generation, ComfyUI, model-transfer, Drive, manifest, and state-backup readiness,
-then awaits a clean final backup before the single self-only RunPod DELETE. The
-worker is fail-closed for identity changes, races, ambiguous API responses, and
-dirty state. Migration `0017_phase12_session_lifecycle` creates only the form
-state and pod lifecycle tables and its downgrade removes only those tables.
+Pod lifecycleのsessionは現在の`RUNPOD_POD_ID`単位で管理します。
+Auto-Terminateはopt-inで、enqueue成功後にarmし、grace/draining状態を経て、
+generation、ComfyUI、model-transfer、Drive、manifest、state backupのreadinessを
+確認します。cleanなfinal backupをawaitしてからself-onlyのRunPod DELETEを一度だけ
+実行します。identity変更、競合、ambiguousなAPI応答、dirty stateではfail-closed
+にします。migration `0017_phase12_session_lifecycle`はform stateとPod lifecycle
+tableだけを作成し、downgradeでもそのtableだけを削除します。
 
-## Phase 13: RunPod Docker, bootstrap, and production Template
+## Phase 13: RunPod Docker・Bootstrap・本番Template
 
-Phase 13 packages the existing application for a fresh RunPod deployment.
-The scope is deployment infrastructure only; it does not add RunPod Pod
-creation, multi-Pod orchestration, scheduler integration, Network Volume
-caching, model LRU eviction, on-demand image restore, or a new migration.
+Phase 13では、既存アプリケーションをFresh RunPodへ配置するためのdeployment
+基盤だけを追加しました。RunPod APIによるPod自動Deploy、複数Podのorchestration、
+scheduler、Network Volume cache、model LRU、過去画像のon-demand restore、新しい
+migrationは対象外です。
 
-The repository provides a pinned runpod/comfyui:1.4.4-cuda12.8 base image, an
-isolated /opt/image-studio-venv editable installation, and a
-checksum-verified rclone 1.74.2 binary. deploy/runpod/bootstrap.sh
-materializes the optional rclone Secret atomically with private permissions,
-verifies the configured remote without printing configuration contents,
-starts the base /start.sh, waits for the fixed local ComfyUI /system_stats
-endpoint, and then starts the existing Image Studio console entry point. After
-startup it probes the same endpoint with configurable interval and consecutive
-failure threshold settings; persistent ComfyUI failure stops Image Studio and
-the base process in order and exits non-zero without auto-restart.
+repositoryには固定した`runpod/comfyui:1.4.4-cuda12.8`をbase imageとして使い、
+`/opt/image-studio-venv`へeditable installしたImage Studio、checksum検証済みの
+rclone 1.74.2、deployment scriptを含めます。bootstrapはrclone Secretをtemporary
+fileへ書き、0600を設定してatomic replaceし、内容をlogへ出さずremoteだけを検証します。
+`/start.sh`を起動した後、固定local endpointへwall-clock deadline方式でreadinessを
+確認します。既定timeoutは900秒で、各probeの`--max-time`は残り時間と5秒の小さい方へ
+制限します。timeout=0は即時probeを最大1回だけ行います。
 
-The image intentionally excludes models, generated files, SQLite state,
-credentials, OAuth tokens, cookies, .env, and rclone.conf. State restore,
-Alembic upgrade, model preparation, Drive synchronization, and Phase 12
-Safe Auto-Terminate remain application responsibilities. The production
-Template exposes only 7860/http, uses a traceable non-latest image tag, and
-starts with auto-terminate disabled until a fresh-Pod flow has been verified.
-The deployment README documents Secret creation, image publishing, Template
-settings, first/fresh Pod checks, and troubleshooting.
+Image Studio起動後は、既定5秒のintervalで各probe完了後にComfyUIを再確認します。
+成功時はfailure countを0へ戻し、12回連続失敗した場合だけpersistent failureとして
+Image Studio、base processの順に停止してnon-zero終了します。ComfyUIのauto-restartは
+行いません。
 
-Phase 13 validation covers Dockerfile and .dockerignore policy, bootstrap
-syntax and secret materialization, ComfyUI readiness and process supervision,
-the GPU-free image smoke test, existing Phase 10/11/12 regression tests, and
-Alembic upgrade/downgrade compatibility.
+imageにはmodel、生成画像、SQLite state、credential、OAuth token、cookie、`.env`、
+`rclone.conf`を含めません。State restore、Alembic upgrade、model preparation、
+Drive同期、Phase 12のSafe Auto-Terminateはapplicationの責務です。本番Templateが
+公開するHTTP portは7860だけで、healthcheckのstart periodは30分です。
+deployment READMEにはSecret作成、image publish、Template設定、Fresh Pod確認、
+troubleshootingを記載します。
+
+Phase 13の検証では、Dockerfileと`.dockerignore`のpolicy、bootstrapのsyntaxとSecret
+materialization、ComfyUI readinessとprocess supervision、GPU不要のimage smoke test、
+Phase 10〜12のregression test、Alembic upgrade/downgrade互換性を確認します。
