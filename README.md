@@ -642,8 +642,11 @@ rclone.conf. The Template materializes rclone.conf from the
 image_studio_rclone_config_b64 Secret at startup with mode 0600. Bootstrap
 starts the base image's existing /start.sh, waits only for the fixed local
 ComfyUI endpoint http://127.0.0.1:8188/system_stats, and then starts the
-installed runpod-sdxl-image-studio entry point. State restore, Alembic
-migrations, and model preparation remain in the application startup path.
+installed runpod-sdxl-image-studio entry point. It then probes that fixed
+ComfyUI endpoint every five seconds and fails closed only after twelve
+consecutive failures, stopping Image Studio and the base process in order.
+State restore, Alembic migrations, and model preparation remain in the
+application startup path.
 
 Build and publish manually with a traceable tag; do not use latest. Use
 docker build --platform linux/amd64 with a phase13-<git-short-sha> tag, then

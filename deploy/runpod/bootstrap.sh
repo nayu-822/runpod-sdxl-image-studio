@@ -11,6 +11,7 @@ readonly IMAGE_STUDIO_APP="${IMAGE_STUDIO_VENV}/bin/runpod-sdxl-image-studio"
 BASE_PROCESS_PID=""
 IMAGE_STUDIO_PROCESS_PID=""
 SHUTDOWN_REQUESTED=0
+COMFYUI_FAILURE_COUNT=0
 
 log_message() {
     printf '%s\n' "[image-studio-bootstrap] $*" >&2
@@ -149,7 +150,7 @@ wait_for_comfyui() {
     command -v curl >/dev/null 2>&1 || fatal "curl is not available"
     log_message "waiting for ComfyUI readiness"
     for ((second = 0; second <= timeout_seconds; second++)); do
-        if curl --fail --silent --max-time 5 --output /dev/null "$COMFYUI_READY_URL"; then
+        if probe_comfyui; then
             log_message "ComfyUI is ready"
             return 0
         fi
@@ -159,6 +160,10 @@ wait_for_comfyui() {
         sleep 1
     done
     fatal "ComfyUI readiness timed out"
+}
+
+probe_comfyui() {
+    curl --fail --silent --max-time 5 --output /dev/null "$COMFYUI_READY_URL"
 }
 
 start_image_studio() {
@@ -175,8 +180,36 @@ handle_shutdown_signal() {
     shutdown_process "$BASE_PROCESS_PID" "RunPod base process" || true
 }
 
+validate_comfyui_monitor_configuration() {
+    local monitor_interval="${IMAGE_STUDIO_BOOTSTRAP_COMFYUI_MONITOR_INTERVAL_SECONDS:-5}"
+    local failure_threshold="${IMAGE_STUDIO_BOOTSTRAP_COMFYUI_FAILURE_THRESHOLD:-12}"
+
+    [[ "$monitor_interval" =~ ^[1-9][0-9]*$ ]] \
+        || fatal "ComfyUI monitor interval must be a positive integer"
+    [[ "$failure_threshold" =~ ^[1-9][0-9]*$ ]] \
+        || fatal "ComfyUI failure threshold must be a positive integer"
+}
+
+check_comfyui_liveness() {
+    local failure_threshold="${IMAGE_STUDIO_BOOTSTRAP_COMFYUI_FAILURE_THRESHOLD:-12}"
+
+    if probe_comfyui; then
+        COMFYUI_FAILURE_COUNT=0
+        return 0
+    fi
+
+    COMFYUI_FAILURE_COUNT=$((COMFYUI_FAILURE_COUNT + 1))
+    if ((COMFYUI_FAILURE_COUNT >= failure_threshold)); then
+        return 1
+    fi
+    return 0
+}
+
 monitor_processes() {
     local process_status
+    local monitor_interval="${IMAGE_STUDIO_BOOTSTRAP_COMFYUI_MONITOR_INTERVAL_SECONDS:-5}"
+
+    validate_comfyui_monitor_configuration
 
     while :; do
         if ! kill -0 "$IMAGE_STUDIO_PROCESS_PID" 2>/dev/null; then
@@ -205,7 +238,13 @@ monitor_processes() {
             shutdown_process "$IMAGE_STUDIO_PROCESS_PID" "Image Studio" || true
             return 1
         fi
-        sleep 1
+        if ! check_comfyui_liveness; then
+            log_message "ERROR: ComfyUI failed its liveness probe persistently"
+            shutdown_process "$IMAGE_STUDIO_PROCESS_PID" "Image Studio" || true
+            shutdown_process "$BASE_PROCESS_PID" "RunPod base process" || true
+            return 1
+        fi
+        sleep "$monitor_interval"
     done
 }
 

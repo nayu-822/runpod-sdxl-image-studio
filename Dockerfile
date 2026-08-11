@@ -46,7 +46,7 @@ RUN set -eux; \
 
 EXPOSE 7860
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20m --retries=3 \
     CMD curl --fail --silent --show-error --max-time 4 \
         http://127.0.0.1:7860/ > /dev/null || exit 1
 

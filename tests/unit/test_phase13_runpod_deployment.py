@@ -59,6 +59,7 @@ def test_dockerfile_is_pinned_and_keeps_the_base_entrypoint() -> None:
     assert "COPY *.safetensors" not in dockerfile
     assert "COPY . " not in dockerfile
     assert "http://127.0.0.1:7860/" in dockerfile
+    assert "--start-period=20m" in dockerfile
 
 
 def test_dockerignore_excludes_runtime_state_and_models_but_keeps_examples() -> None:
@@ -95,6 +96,8 @@ def test_template_uses_local_comfyui_and_only_exposes_the_app_port() -> None:
         "IMAGE_STUDIO_RCLONE_CONFIG_B64={{ RUNPOD_SECRET_image_studio_rclone_config_b64 }}",
         "IMAGE_STUDIO_AUTO_TERMINATE_ENABLED=false",
         "IMAGE_STUDIO_BOOTSTRAP_COMFYUI_TIMEOUT_SECONDS=900",
+        "IMAGE_STUDIO_BOOTSTRAP_COMFYUI_MONITOR_INTERVAL_SECONDS=5",
+        "IMAGE_STUDIO_BOOTSTRAP_COMFYUI_FAILURE_THRESHOLD=12",
         "IMAGE_STUDIO_BOOTSTRAP_SHUTDOWN_GRACE_SECONDS=30",
     )
     for line in required_lines:
@@ -117,6 +120,10 @@ def test_bootstrap_and_smoke_scripts_are_syntactically_valid_and_safe() -> None:
 
     bootstrap = _read(BOOTSTRAP)
     assert "http://127.0.0.1:8188/system_stats" in bootstrap
+    assert "probe_comfyui" in bootstrap
+    assert "check_comfyui_liveness" in bootstrap
+    assert "IMAGE_STUDIO_BOOTSTRAP_COMFYUI_MONITOR_INTERVAL_SECONDS" in bootstrap
+    assert "IMAGE_STUDIO_BOOTSTRAP_COMFYUI_FAILURE_THRESHOLD" in bootstrap
     assert "kill -TERM" in bootstrap
     assert "shutdown_process" in bootstrap
     assert "mktemp" in bootstrap
@@ -231,3 +238,208 @@ fi
 
     assert result.returncode != 0
     assert "rclone config" in result.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="runtime bootstrap supervision is tested on Linux")
+def test_bootstrap_retries_comfyui_readiness_before_starting_image_studio() -> None:
+    result = _run_bash(
+        """
+set -Eeuo pipefail
+root="$(mktemp -d)"
+trap 'rm -rf -- "$root"' EXIT
+mkdir -p "$root/venv/bin"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$root/venv/bin/runpod-sdxl-image-studio"
+chmod +x "$root/venv/bin/runpod-sdxl-image-studio"
+export IMAGE_STUDIO_ROOT="$root"
+export IMAGE_STUDIO_VENV="$root/venv"
+source "$1"
+BASE_PROCESS_PID=123
+attempts=0
+kill() {
+    if [[ "$1" == "-0" && "$2" == "123" ]]; then
+        return 0
+    fi
+    return 1
+}
+sleep() { :; }
+probe_comfyui() {
+    attempts=$((attempts + 1))
+    if ((attempts < 3)); then
+        return 1
+    fi
+    return 0
+}
+wait_for_comfyui
+start_image_studio
+wait "$IMAGE_STUDIO_PROCESS_PID"
+printf 'attempts=%s app=started\n' "$attempts"
+""",
+        "deploy/runpod/bootstrap.sh",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "attempts=3 app=started" in result.stdout
+
+
+@pytest.mark.skipif(os.name == "nt", reason="runtime bootstrap supervision is tested on Linux")
+def test_bootstrap_comfyui_timeout_stops_base_before_image_studio_start() -> None:
+    result = _run_bash(
+        """
+set -Eeuo pipefail
+source "$1"
+export IMAGE_STUDIO_BOOTSTRAP_COMFYUI_TIMEOUT_SECONDS=2
+export IMAGE_STUDIO_BOOTSTRAP_SHUTDOWN_GRACE_SECONDS=0
+BASE_PROCESS_PID=123
+kill() {
+    if [[ "$1" == "-0" && "$2" == "123" ]]; then
+        return 0
+    fi
+    if [[ "$1" == "-TERM" || "$1" == "-KILL" ]]; then
+        printf '%s:%s\n' "$1" "$2"
+        return 0
+    fi
+    return 1
+}
+sleep() { :; }
+probe_comfyui() { return 1; }
+if wait_for_comfyui; then
+    printf 'app-started\n'
+    exit 2
+fi
+""",
+        "deploy/runpod/bootstrap.sh",
+    )
+
+    assert result.returncode != 0
+    assert "-TERM:123" in result.stdout
+    assert "-KILL:123" in result.stdout
+    assert "app-started" not in result.stdout
+    assert "ComfyUI readiness timed out" in result.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="runtime bootstrap supervision is tested on Linux")
+def test_temporary_comfyui_probe_failure_is_tolerated_and_success_resets_count() -> None:
+    result = _run_bash(
+        """
+set -Eeuo pipefail
+source "$1"
+export IMAGE_STUDIO_BOOTSTRAP_COMFYUI_FAILURE_THRESHOLD=3
+attempts=0
+probe_comfyui() {
+    attempts=$((attempts + 1))
+    if ((attempts == 1)); then
+        return 1
+    fi
+    return 0
+}
+check_comfyui_liveness
+[[ "$COMFYUI_FAILURE_COUNT" == "1" ]]
+check_comfyui_liveness
+printf 'attempts=%s failures=%s\n' "$attempts" "$COMFYUI_FAILURE_COUNT"
+""",
+        "deploy/runpod/bootstrap.sh",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "attempts=2 failures=0" in result.stdout
+
+
+@pytest.mark.skipif(os.name == "nt", reason="runtime bootstrap supervision is tested on Linux")
+def test_persistent_comfyui_probe_failure_stops_image_studio_then_base() -> None:
+    result = _run_bash(
+        """
+set -Eeuo pipefail
+source "$1"
+export IMAGE_STUDIO_BOOTSTRAP_COMFYUI_MONITOR_INTERVAL_SECONDS=1
+export IMAGE_STUDIO_BOOTSTRAP_COMFYUI_FAILURE_THRESHOLD=2
+export IMAGE_STUDIO_BOOTSTRAP_SHUTDOWN_GRACE_SECONDS=0
+IMAGE_STUDIO_PROCESS_PID=401
+BASE_PROCESS_PID=402
+app_alive=1
+base_alive=1
+probe_calls=0
+events=""
+kill() {
+    if [[ "$1" == "-0" ]]; then
+        if [[ "$2" == "401" ]]; then
+            ((app_alive == 1))
+            return
+        fi
+        if [[ "$2" == "402" ]]; then
+            ((base_alive == 1))
+            return
+        fi
+        return 1
+    fi
+    events="${events}${1}:${2};"
+    if [[ "$2" == "401" ]]; then app_alive=0; fi
+    if [[ "$2" == "402" ]]; then base_alive=0; fi
+    return 0
+}
+sleep() { :; }
+probe_comfyui() {
+    probe_calls=$((probe_calls + 1))
+    return 1
+}
+if monitor_processes; then
+    exit 2
+fi
+printf 'probes=%s events=%s\n' "$probe_calls" "$events"
+""",
+        "deploy/runpod/bootstrap.sh",
+    )
+
+    assert result.returncode != 0
+    assert "probes=2 events=-TERM:401;-KILL:401;-TERM:402;-KILL:402;" in result.stdout
+    assert "ComfyUI failed its liveness probe persistently" in result.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="runtime bootstrap supervision is tested on Linux")
+@pytest.mark.parametrize("dead_process", ["image", "base"])
+def test_unexpected_child_exit_stops_the_sibling_and_returns_nonzero(dead_process: str) -> None:
+    result = _run_bash(
+        """
+set -Eeuo pipefail
+source "$1"
+export IMAGE_STUDIO_BOOTSTRAP_COMFYUI_MONITOR_INTERVAL_SECONDS=1
+export IMAGE_STUDIO_BOOTSTRAP_COMFYUI_FAILURE_THRESHOLD=2
+export IMAGE_STUDIO_BOOTSTRAP_SHUTDOWN_GRACE_SECONDS=0
+IMAGE_STUDIO_PROCESS_PID=501
+BASE_PROCESS_PID=502
+app_alive=1
+base_alive=1
+events=""
+if [[ "$2" == "image" ]]; then app_alive=0; else base_alive=0; fi
+kill() {
+    if [[ "$1" == "-0" ]]; then
+        if [[ "$2" == "501" ]]; then
+            ((app_alive == 1))
+            return
+        fi
+        if [[ "$2" == "502" ]]; then
+            ((base_alive == 1))
+            return
+        fi
+        return 1
+    fi
+    events="${events}${1}:${2};"
+    return 0
+}
+wait() { return 17; }
+sleep() { :; }
+probe_comfyui() { return 0; }
+if monitor_processes; then
+    exit 2
+fi
+printf 'events=%s\n' "$events"
+""",
+        "deploy/runpod/bootstrap.sh",
+        dead_process,
+    )
+
+    assert result.returncode != 0
+    assert "exited unexpectedly" in result.stderr
+    if dead_process == "image":
+        assert "events=-TERM:502;-KILL:502;" in result.stdout
+    else:
+        assert "events=-TERM:501;-KILL:501;" in result.stdout

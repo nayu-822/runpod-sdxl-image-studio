@@ -114,14 +114,25 @@ The bootstrap order is deliberately narrow:
    IMAGE_STUDIO_BOOTSTRAP_COMFYUI_TIMEOUT_SECONDS timeout.
 4. Start /opt/image-studio-venv/bin/runpod-sdxl-image-studio from
    /opt/image-studio.
-5. Supervise both processes. An unexpected exit stops the other process and
-   exits non-zero; the container is not kept alive with sleep infinity.
-6. On SIGTERM/SIGINT, forward a graceful TERM and wait up to
+5. After Image Studio starts, probe the same fixed ComfyUI endpoint every
+   IMAGE_STUDIO_BOOTSTRAP_COMFYUI_MONITOR_INTERVAL_SECONDS seconds (5 by
+   default). A successful probe resets the failure counter; only
+   IMAGE_STUDIO_BOOTSTRAP_COMFYUI_FAILURE_THRESHOLD consecutive failures (12
+   by default) are treated as a persistent ComfyUI failure.
+6. Supervise both processes. A persistent ComfyUI failure or an unexpected
+   child exit gracefully stops Image Studio and the base process, escalates
+   to the bounded kill fallback when necessary, and exits non-zero. The
+   bootstrap does not auto-restart ComfyUI and is not kept alive with sleep
+   infinity.
+7. On SIGTERM/SIGINT, forward a graceful TERM and wait up to
    IMAGE_STUDIO_BOOTSTRAP_SHUTDOWN_GRACE_SECONDS before a bounded fallback.
 
 The Docker health check probes only the user-facing Image Studio endpoint at
-http://127.0.0.1:7860/. A health-check failure does not mutate SQLite or issue
-a RunPod DELETE.
+http://127.0.0.1:7860/ and has a 20-minute startup grace period for fresh Pod
+initialization. A health-check failure does not mutate SQLite or issue a
+RunPod DELETE. Bootstrap logs contain only safe status messages; rclone
+configuration contents, tokens, API keys, prompts, and raw HTTP responses are
+never printed.
 
 The bootstrap does not run state restore, Alembic migrations, model downloads,
 /prompt, Drive sync, or Auto-Terminate. The existing application startup path
