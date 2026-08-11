@@ -580,6 +580,35 @@ retryはsource provenanceと `retry_of_generation_id` を保持した新規Gener
 source selection、UIの排他再有効化、mapping、外部image/latentのworkerとreconciliation、source mutation、retry idempotency、migrationの候補消失を拒否する安全なdowngrade、
 既存Queue経路を検証します。複数worker、Queue並べ替え、自動retry、
 汎用workflow editorは対象外です。
+## Phase 13: RunPod Docker, bootstrap, and production Template
+
+Phase 13 packages the existing application for a fresh RunPod deployment.
+The scope is deployment infrastructure only; it does not add RunPod Pod
+creation, multi-Pod orchestration, scheduler integration, Network Volume
+caching, model LRU eviction, on-demand image restore, or a new migration.
+
+The repository provides a pinned runpod/comfyui:1.4.4-cuda12.8 base image, an
+isolated /opt/image-studio-venv editable installation, and a
+checksum-verified rclone 1.74.2 binary. deploy/runpod/bootstrap.sh
+materializes the optional rclone Secret atomically with private permissions,
+verifies the configured remote without printing configuration contents,
+starts the base /start.sh, waits for the fixed local ComfyUI /system_stats
+endpoint, and then starts the existing Image Studio console entry point.
+
+The image intentionally excludes models, generated files, SQLite state,
+credentials, OAuth tokens, cookies, .env, and rclone.conf. State restore,
+Alembic upgrade, model preparation, Drive synchronization, and Phase 12
+Safe Auto-Terminate remain application responsibilities. The production
+Template exposes only 7860/http, uses a traceable non-latest image tag, and
+starts with auto-terminate disabled until a fresh-Pod flow has been verified.
+The deployment README documents Secret creation, image publishing, Template
+settings, first/fresh Pod checks, and troubleshooting.
+
+Phase 13 validation covers Dockerfile and .dockerignore policy, bootstrap
+syntax and secret materialization, ComfyUI readiness and process supervision,
+the GPU-free image smoke test, existing Phase 10/11/12 regression tests, and
+Alembic upgrade/downgrade compatibility.
+
 ## Phase 12: Session restore and Safe Auto-Terminate
 
 The implementation adds a versioned form-state snapshot distinct from the

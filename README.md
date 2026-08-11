@@ -626,3 +626,52 @@ IMAGE_STUDIO_AUTO_TERMINATE_ENABLED=false
 IMAGE_STUDIO_AUTO_TERMINATE_GRACE_SECONDS=15
 IMAGE_STUDIO_AUTO_TERMINATE_CHECK_INTERVAL_SECONDS=2
 ```
+
+## RunPod production deployment (Phase 13)
+
+Phase 13 packages the existing ComfyUI application and Image Studio runtime
+in a pinned, reproducible image. The image uses
+runpod/comfyui:1.4.4-cuda12.8 as its base, installs Image Studio into the
+isolated /opt/image-studio-venv, and pins rclone to 1.74.2 with a verified
+SHA256SUMS download. See deploy/runpod/README.md for the complete RunPod
+Template and fresh-Pod procedure.
+
+The production image does not contain checkpoints, LoRA, VAE, upscaler files,
+generated images, SQLite state, OAuth tokens, API keys, cookies, .env, or
+rclone.conf. The Template materializes rclone.conf from the
+image_studio_rclone_config_b64 Secret at startup with mode 0600. Bootstrap
+starts the base image's existing /start.sh, waits only for the fixed local
+ComfyUI endpoint http://127.0.0.1:8188/system_stats, and then starts the
+installed runpod-sdxl-image-studio entry point. State restore, Alembic
+migrations, and model preparation remain in the application startup path.
+
+Build and publish manually with a traceable tag; do not use latest. Use
+docker build --platform linux/amd64 with a phase13-<git-short-sha> tag, then
+docker tag and docker push the same fixed tag to the selected registry.
+
+The recommended production Template exposes only 7860/http and keeps Public
+Template disabled. Use 50 GB container disk, no Network Volume, and zero
+Volume Disk for the stateless deployment described here. Set the Template
+image to the fixed published tag and copy the environment from
+deploy/runpod/template.env.example. RunPod supplies RUNPOD_POD_ID and
+RUNPOD_API_KEY automatically; do not add them to the Template.
+
+Create the image_studio_rclone_config_b64 Secret from a local base64-encoded
+rclone.conf without printing its value. Bootstrap rejects empty or invalid
+data, symlink paths, and write failures, and atomically installs the decoded
+file with mode 0600. Never paste the decoded configuration into the
+repository, image, logs, or README.
+
+For a fresh-Pod check, first deploy with
+IMAGE_STUDIO_AUTO_TERMINATE_ENABLED=false. Verify /start.sh, ComfyUI local
+readiness, Image Studio on 7860, Drive connectivity, state restore, exact
+model preparation, one generation, image and metadata sync, manifest sync,
+and a clean final state backup. After that flow is confirmed, enable
+auto-terminate on a second Pod and verify the existing Phase 12 grace,
+readiness, final-backup, and fail-closed termination behavior. A second fresh
+Pod must restore state and settings without submitting a new /prompt.
+
+The Docker build and live RunPod checks are separate from the normal local
+test suite. On a machine without Docker, report the build and Docker smoke
+test as not executed rather than treating static checks as a successful image
+build.
