@@ -794,7 +794,7 @@ async def test_adapter_delivery_ambiguity_enters_hard_freeze_without_duplicate_d
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request.method)
         if request.method == "DELETE":
-            raise httpx.ReadError("connection lost", request=request)
+            return httpx.Response(503)
         return httpx.Response(200, json={"desiredStatus": "RUNNING"})
 
     async with httpx.AsyncClient(

@@ -60,7 +60,7 @@ async def test_terminate_self_hides_unauthorized_response(status: int) -> None:
     ("get_response", "expected"),
     [
         (httpx.Response(200, json={"desiredStatus": "TERMINATED"}), "terminated"),
-        (httpx.Response(200, json={"desiredStatus": "RUNNING"}), "confirmed"),
+        (httpx.Response(200, json={"desiredStatus": "RUNNING"}), "ambiguous"),
         (httpx.Response(200, json={"desiredStatus": "EXITED"}), "ambiguous"),
     ],
 )
@@ -85,11 +85,7 @@ async def test_terminate_self_confirms_non_success_responses(
             with pytest.raises(RunPodTerminateError) as raised:
                 await adapter.terminate_self()
             assert raised.value.ambiguous is (expected == "ambiguous")
-            assert raised.value.code == (
-                "runpod_terminate_ambiguous"
-                if expected == "ambiguous"
-                else "runpod_terminate_unavailable"
-            )
+            assert raised.value.code == "runpod_terminate_ambiguous"
             assert "hidden" not in str(raised.value)
 
 
@@ -112,6 +108,35 @@ async def test_get_404_confirms_termination_after_delete_failure() -> None:
 
     assert result.status is RunPodTerminateStatus.TERMINATED
     assert requests == ["DELETE", "GET"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "delete_status",
+    [200, 201, 301, 400, 404, 409, 418, 429, 500, 503],
+)
+async def test_unconfirmed_delete_status_is_ambiguous_when_pod_is_still_running(
+    delete_status: int,
+) -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        if request.method == "DELETE":
+            return httpx.Response(delete_status)
+        return httpx.Response(200, json={"desiredStatus": "RUNNING"})
+
+    async with _client(handler) as client:
+        adapter = RunPodLifecycleAdapter(
+            client=client,
+            env={"RUNPOD_POD_ID": "pod-123", "RUNPOD_API_KEY": "secret"},
+        )
+        with pytest.raises(RunPodTerminateError) as raised:
+            await adapter.terminate_self()
+
+    assert raised.value.code == "runpod_terminate_ambiguous"
+    assert raised.value.ambiguous
+    assert calls == ["DELETE", "GET"]
 
 
 @pytest.mark.asyncio
@@ -282,6 +307,7 @@ async def test_connection_failure_is_unavailable_without_raw_error() -> None:
         with pytest.raises(RunPodTerminateError) as raised:
             await adapter.terminate_self()
     assert raised.value.code == "runpod_terminate_unavailable"
+    assert raised.value.ambiguous is False
     assert "secret connection detail" not in str(raised.value)
     assert "secret" not in str(raised.value)
 

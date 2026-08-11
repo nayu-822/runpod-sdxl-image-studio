@@ -105,10 +105,7 @@ class RunPodLifecycleAdapter:
                     client,
                     path,
                     headers,
-                    code="runpod_terminate_ambiguous",
-                    message="RunPod termination response was ambiguous",
                     cause=exc,
-                    delivery_ambiguous=True,
                 )
             except httpx.ConnectError as exc:
                 # A connect failure is known to occur before a request can be
@@ -123,10 +120,7 @@ class RunPodLifecycleAdapter:
                     client,
                     path,
                     headers,
-                    code="runpod_terminate_unavailable",
-                    message="RunPod termination service was unavailable",
                     cause=exc,
-                    delivery_ambiguous=True,
                 )
             if response.status_code == 204:
                 return RunPodTerminateResult(RunPodTerminateStatus.TERMINATED)
@@ -140,26 +134,17 @@ class RunPodLifecycleAdapter:
                     client,
                     path,
                     headers,
-                    code="runpod_terminate_not_found",
-                    message="RunPod self pod was not found",
-                    delivery_ambiguous=False,
                 )
             if 500 <= response.status_code <= 599:
                 return await self._resolve_delete_failure(
                     client,
                     path,
                     headers,
-                    code="runpod_terminate_unavailable",
-                    message="RunPod termination service returned an unavailable response",
-                    delivery_ambiguous=False,
                 )
             return await self._resolve_delete_failure(
                 client,
                 path,
                 headers,
-                code="runpod_terminate_malformed_response",
-                message="RunPod termination returned an unexpected response",
-                delivery_ambiguous=False,
             )
         finally:
             if owns_client:
@@ -171,30 +156,21 @@ class RunPodLifecycleAdapter:
         path: str,
         headers: dict[str, str],
         *,
-        code: str,
-        message: str,
         cause: BaseException | None = None,
-        delivery_ambiguous: bool,
     ) -> RunPodTerminateResult:
         confirmation = await self._confirm_after_delete_failure(client, path, headers)
         if confirmation is RunPodTerminateConfirmation.TERMINATED:
             return RunPodTerminateResult(RunPodTerminateStatus.TERMINATED)
-        if confirmation is RunPodTerminateConfirmation.CONFIRMED_RUNNING and not delivery_ambiguous:
-            error = RunPodTerminateError(
-                "runpod_terminate_confirmed_failure"
-                if code == "runpod_terminate_ambiguous"
-                else code,
-                "RunPod termination failed while the self pod still exists"
-                if code == "runpod_terminate_ambiguous"
-                else message,
-                ambiguous=False,
-            )
-        else:
-            error = RunPodTerminateError(
-                "runpod_terminate_ambiguous",
-                "RunPod termination response was ambiguous",
-                ambiguous=True,
-            )
+        # A non-success DELETE response does not prove that the request was
+        # rejected before reaching RunPod.  Even a RUNNING confirmation must
+        # therefore remain fail-closed unless the DELETE outcome itself was a
+        # known pre-delivery failure (ConnectError is handled above) or an
+        # explicit authorization rejection (401/403 is handled above).
+        error = RunPodTerminateError(
+            "runpod_terminate_ambiguous",
+            "RunPod termination response was ambiguous",
+            ambiguous=True,
+        )
         if cause is not None:
             raise error from cause
         raise error
