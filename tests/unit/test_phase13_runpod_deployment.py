@@ -33,14 +33,18 @@ def _run_bash(
     merged_environment = os.environ.copy()
     if env is not None:
         merged_environment.update(env)
-    return subprocess.run(
-        [_bash(), "-c", script, "phase13-test", *arguments],
-        cwd=REPOSITORY_ROOT,
-        env=merged_environment,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        return subprocess.run(
+            [_bash(), "-c", script, "phase13-test", *arguments],
+            cwd=REPOSITORY_ROOT,
+            env=merged_environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AssertionError("Phase 13 bash test exceeded its 10-second timeout") from exc
 
 
 def test_dockerfile_is_pinned_and_keeps_the_base_entrypoint() -> None:
@@ -332,18 +336,23 @@ def test_bootstrap_startup_timeout_uses_wall_clock_and_bounds_probe_timeout() ->
 set -Eeuo pipefail
 source "$1"
 export IMAGE_STUDIO_BOOTSTRAP_COMFYUI_TIMEOUT_SECONDS=4
+export IMAGE_STUDIO_BOOTSTRAP_SHUTDOWN_GRACE_SECONDS=0
 BASE_PROCESS_PID=123
 fake_now=100
 probe_calls=0
 probe_timeout=0
 sleep_calls=0
 bootstrap_now_seconds() { printf '%s\n' "$fake_now"; }
-fatal() {
-    printf 'fatal=%s\n' "$*"
-    return 99
+report_counts() {
+    printf 'probes=%s timeout=%s sleeps=%s now=%s\n' \
+        "$probe_calls" "$probe_timeout" "$sleep_calls" "$fake_now"
 }
+trap report_counts EXIT
 kill() {
     if [[ "$1" == "-0" && "$2" == "123" ]]; then
+        return 0
+    fi
+    if [[ "$1" == "-TERM" || "$1" == "-KILL" ]]; then
         return 0
     fi
     return 1
@@ -355,21 +364,19 @@ sleep() {
 probe_comfyui() {
     probe_calls=$((probe_calls + 1))
     probe_timeout="$1"
+    printf 'probe_timeout=%s\n' "$probe_timeout"
     fake_now=$((fake_now + 5))
     return 1
 }
-if wait_for_comfyui; then
-    exit 2
-fi
-printf 'probes=%s timeout=%s sleeps=%s now=%s\n' \
-    "$probe_calls" "$probe_timeout" "$sleep_calls" "$fake_now"
+wait_for_comfyui
 """,
         "deploy/runpod/bootstrap.sh",
     )
 
-    assert result.returncode == 0, result.stderr
+    assert result.returncode != 0
+    assert "probe_timeout=4" in result.stdout
     assert "probes=1 timeout=4 sleeps=0 now=105" in result.stdout
-    assert "fatal=ComfyUI readiness timed out" in result.stdout
+    assert "ComfyUI readiness timed out" in result.stderr
 
 
 @pytest.mark.skipif(os.name == "nt", reason="runtime bootstrap supervision is tested on Linux")
@@ -379,38 +386,44 @@ def test_bootstrap_timeout_zero_allows_one_bounded_readiness_probe() -> None:
 set -Eeuo pipefail
 source "$1"
 export IMAGE_STUDIO_BOOTSTRAP_COMFYUI_TIMEOUT_SECONDS=0
+export IMAGE_STUDIO_BOOTSTRAP_SHUTDOWN_GRACE_SECONDS=0
 BASE_PROCESS_PID=123
 fake_now=100
 probe_calls=0
 probe_timeout=0
 bootstrap_now_seconds() { printf '%s\n' "$fake_now"; }
-fatal() {
-    printf 'fatal=%s\n' "$*"
-    return 99
+report_counts() {
+    printf 'probes=%s timeout=%s sleeps=%s\n' \
+        "$probe_calls" "$probe_timeout" "$sleep_calls"
 }
+trap report_counts EXIT
 kill() {
     if [[ "$1" == "-0" && "$2" == "123" ]]; then
         return 0
     fi
+    if [[ "$1" == "-TERM" || "$1" == "-KILL" ]]; then
+        return 0
+    fi
     return 1
 }
-sleep() { exit 2; }
+sleep_calls=0
+sleep() { sleep_calls=$((sleep_calls + 1)); }
 probe_comfyui() {
     probe_calls=$((probe_calls + 1))
     probe_timeout="$1"
+    printf 'probe_timeout=%s\n' "$probe_timeout"
     return 1
 }
-if wait_for_comfyui; then
-    exit 2
-fi
-printf 'probes=%s timeout=%s\n' "$probe_calls" "$probe_timeout"
+wait_for_comfyui
 """,
         "deploy/runpod/bootstrap.sh",
     )
 
-    assert result.returncode == 0, result.stderr
+    assert result.returncode != 0
+    assert "probe_timeout=1" in result.stdout
     assert "probes=1 timeout=1" in result.stdout
-    assert "fatal=ComfyUI readiness timed out" in result.stdout
+    assert "sleeps=0" in result.stdout
+    assert "ComfyUI readiness timed out" in result.stderr
 
 
 @pytest.mark.skipif(os.name == "nt", reason="runtime bootstrap supervision is tested on Linux")
