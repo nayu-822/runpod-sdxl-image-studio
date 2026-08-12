@@ -57,6 +57,14 @@ def _has_visible_text(page: object, text: str) -> bool:
 
 
 def _click_tab(page: object, label: str) -> bool:
+    page.wait_for_function(  # type: ignore[attr-defined]
+        """
+        label => Array.from(document.querySelectorAll(
+            '.tab-wrapper button, [role="tablist"] button, [role="tab"]'
+        )).some(element => element.textContent.trim() === label)
+        """,
+        arg=label,
+    )
     tablist = page.locator("[role='tablist']")  # type: ignore[attr-defined]
     tab = page.get_by_role("tab", name=label, exact=True)  # type: ignore[attr-defined]
     if _click_visible(page, tab):
@@ -67,19 +75,24 @@ def _click_tab(page: object, label: str) -> bool:
     # do not infer its trigger from an empty button label.
     tab_navigation = tablist.locator("xpath=..")  # type: ignore[attr-defined]
     overflow = tab_navigation.locator(".overflow-menu")  # type: ignore[attr-defined]
-    if overflow.count():
-        trigger = overflow.locator(":scope > button")  # type: ignore[attr-defined]
-        if _click_visible(page, trigger):
-            dropdown = overflow.locator(".overflow-dropdown:not(.hide)")  # type: ignore[attr-defined]
-            dropdown.wait_for(state="visible")  # type: ignore[attr-defined]
-            menu_item = dropdown.get_by_role(  # type: ignore[attr-defined]
-                "button", name=label, exact=True
-            )
-            if _click_visible(page, menu_item):
-                overflow.locator(".overflow-dropdown.hide").wait_for(  # type: ignore[attr-defined]
-                    state="hidden"
-                )
-                return True
+    if not overflow.count():
+        overflow = tab_navigation.locator("[class*='overflow-menu']")  # type: ignore[attr-defined]
+    trigger = (
+        overflow.locator(":scope > button")
+        if overflow.count()
+        else tab_navigation.locator("button:has(svg)").first  # type: ignore[attr-defined]
+    )
+    if _click_visible(page, trigger):
+        dropdown = tab_navigation.locator(  # type: ignore[attr-defined]
+            ".overflow-dropdown:not(.hide), [class*='overflow-dropdown']:not(.hide)"
+        )
+        dropdown.wait_for(state="visible")  # type: ignore[attr-defined]
+        menu_item = dropdown.get_by_role(  # type: ignore[attr-defined]
+            "button", name=label, exact=True
+        )
+        if _click_visible(page, menu_item):
+            dropdown.wait_for(state="hidden")  # type: ignore[attr-defined]
+            return True
 
     text_item = page.get_by_text(label, exact=True)  # type: ignore[attr-defined]
     assert _click_visible(page, text_item), f"tab not found: {label}"
