@@ -1,6 +1,6 @@
 FROM runpod/comfyui:1.4.4-cuda12.8
 
-ARG RCLONE_VERSION=1.74.2
+ARG IMAGE_STUDIO_RCLONE_VERSION=1.74.2
 
 ENV IMAGE_STUDIO_ROOT=/opt/image-studio \
     IMAGE_STUDIO_VENV=/opt/image-studio-venv \
@@ -31,16 +31,16 @@ RUN "$IMAGE_STUDIO_VENV/bin/pip" install --no-cache-dir -e "$IMAGE_STUDIO_ROOT" 
 RUN set -eux; \
     mkdir -p /tmp/rclone; \
     curl --fail --silent --show-error --location --retry 3 \
-        --output "/tmp/rclone/rclone-v${RCLONE_VERSION}-linux-amd64.zip" \
-        "https://downloads.rclone.org/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}-linux-amd64.zip"; \
+        --output "/tmp/rclone/rclone-v${IMAGE_STUDIO_RCLONE_VERSION}-linux-amd64.zip" \
+        "https://downloads.rclone.org/v${IMAGE_STUDIO_RCLONE_VERSION}/rclone-v${IMAGE_STUDIO_RCLONE_VERSION}-linux-amd64.zip"; \
     curl --fail --silent --show-error --location --retry 3 \
         --output /tmp/rclone/SHA256SUMS \
-        "https://downloads.rclone.org/v${RCLONE_VERSION}/SHA256SUMS"; \
+        "https://downloads.rclone.org/v${IMAGE_STUDIO_RCLONE_VERSION}/SHA256SUMS"; \
     cd /tmp/rclone; \
-    grep "  rclone-v${RCLONE_VERSION}-linux-amd64.zip$" SHA256SUMS > checksum; \
+    grep "  rclone-v${IMAGE_STUDIO_RCLONE_VERSION}-linux-amd64.zip$" SHA256SUMS > checksum; \
     sha256sum --check --status checksum; \
     cd /opt/image-studio; \
-    python3 -c 'import pathlib, sys, zipfile; archive = pathlib.Path(sys.argv[1]); target = pathlib.Path("/usr/local/bin/rclone"); bundle = zipfile.ZipFile(archive); names = [name for name in bundle.namelist() if name.endswith("/rclone") or name == "rclone"]; assert len(names) == 1 and not pathlib.PurePosixPath(names[0]).is_absolute(), "unexpected rclone archive layout"; target.write_bytes(bundle.read(names[0])); bundle.close(); target.chmod(0o755)' "/tmp/rclone/rclone-v${RCLONE_VERSION}-linux-amd64.zip"; \
+    python3 -c 'import pathlib, sys, zipfile; archive = pathlib.Path(sys.argv[1]); target = pathlib.Path("/usr/local/bin/rclone"); bundle = zipfile.ZipFile(archive); names = [name for name in bundle.namelist() if name.endswith("/rclone") or name == "rclone"]; assert len(names) == 1 and not pathlib.PurePosixPath(names[0]).is_absolute(), "unexpected rclone archive layout"; target.write_bytes(bundle.read(names[0])); bundle.close(); target.chmod(0o755)' "/tmp/rclone/rclone-v${IMAGE_STUDIO_RCLONE_VERSION}-linux-amd64.zip"; \
     rclone version; \
     rm -rf /tmp/rclone
 

@@ -51,6 +51,9 @@ def test_dockerfile_is_pinned_and_keeps_the_base_entrypoint() -> None:
     dockerfile = _read(DOCKERFILE)
 
     assert "FROM runpod/comfyui:1.4.4-cuda12.8" in dockerfile
+    assert "ARG IMAGE_STUDIO_RCLONE_VERSION=1.74.2" in dockerfile
+    assert "ARG RCLONE_VERSION" not in dockerfile
+    assert "${RCLONE_VERSION}" not in dockerfile
     assert "runpod/comfyui:latest" not in dockerfile
     assert "ENTRYPOINT" not in dockerfile
     assert 'CMD ["/opt/image-studio/deploy/runpod/bootstrap.sh"]' in dockerfile
