@@ -58,7 +58,7 @@ def _has_visible_text(page: object, text: str) -> bool:
 
 def _click_tab(page: object, label: str) -> bool:
     tablist = page.locator("[role='tablist']")  # type: ignore[attr-defined]
-    tab = tablist.get_by_role("tab", name=label, exact=True)  # type: ignore[attr-defined]
+    tab = page.get_by_role("tab", name=label, exact=True)  # type: ignore[attr-defined]
     if _click_visible(page, tab):
         return False
 
