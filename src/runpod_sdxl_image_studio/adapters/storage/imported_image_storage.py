@@ -272,12 +272,7 @@ def _prepare_safe_directory(data_dir: Path, relative: Path) -> tuple[Path, Path]
         for component in relative.parts:
             candidate = current / component
             if candidate.is_symlink():
-                resolved = candidate.resolve(strict=True)
-                resolved.relative_to(data_root)
-                if not resolved.is_dir():
-                    raise OSError("storage parent is not a directory")
-                current = resolved
-                continue
+                raise OSError("storage parent must not be a symlink")
             if candidate.exists():
                 if not candidate.is_dir():
                     raise OSError("storage parent is not a directory")

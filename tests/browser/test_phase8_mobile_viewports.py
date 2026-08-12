@@ -21,6 +21,7 @@ VIEWPORTS = (
     (1280, 800),
 )
 TAB_CONTROLS = {
+    "生成": ("Positive prompt", "生成をキューへ追加", "実使用Seed（コピー）"),
     "システム": (
         "System Health",
         "Refresh system status",
@@ -32,10 +33,9 @@ TAB_CONTROLS = {
         "Auto-Terminate状態",
         "今すぐ状態をバックアップ",
     ),
-    "生成": ("Positive prompt", "生成をキューへ追加", "実使用Seed（コピー）"),
-    "履歴": ("履歴を検索", "実使用seed（選択してコピー）"),
     "キュー": ("キューを更新", "選択ジョブをキャンセル"),
     "LoRA管理": ("ComfyUI一覧と同期", "検索"),
+    "履歴": ("履歴を検索", "実使用seed（選択してコピー）"),
     "アップスケール": ("親Generation ID", "アップスケールをキューへ追加"),
     "プリセット": ("Preset検索", "現在設定から保存"),
     "外部metadata": ("metadataを解析", "画像（PNG / WebP）"),
@@ -57,34 +57,40 @@ def _has_visible_text(page: object, text: str) -> bool:
 
 
 def _click_tab(page: object, label: str) -> bool:
-    tab = page.get_by_role("tab", name=label, exact=True)  # type: ignore[attr-defined]
+    tablist = page.locator("[role='tablist']")  # type: ignore[attr-defined]
+    tab = tablist.get_by_role("tab", name=label, exact=True)  # type: ignore[attr-defined]
     if _click_visible(page, tab):
         return False
 
     # Gradio collapses the tail of the tab bar into a compact menu at narrow widths.
-    tab_navigation = page.locator("[role='tablist']").locator("xpath=..")  # type: ignore[attr-defined]
-    buttons = tab_navigation.locator("button")  # type: ignore[attr-defined]
-    menu_opened = False
-    for index in range(buttons.count()):
-        candidate = buttons.nth(index)
-        if candidate.is_visible() and not candidate.inner_text().strip():
-            candidate.click()
-            page.wait_for_timeout(100)  # type: ignore[attr-defined]
-            menu_opened = True
-            break
-    menu_item = page.get_by_role("button", name=label, exact=True)  # type: ignore[attr-defined]
-    if _click_visible(page, menu_item):
-        return menu_opened
+    # The overflow menu has a stable semantic container in the current Gradio DOM;
+    # do not infer its trigger from an empty button label.
+    tab_navigation = tablist.locator("xpath=..")  # type: ignore[attr-defined]
+    overflow = tab_navigation.locator(".overflow-menu")  # type: ignore[attr-defined]
+    if overflow.count():
+        trigger = overflow.locator(":scope > button")  # type: ignore[attr-defined]
+        if _click_visible(page, trigger):
+            dropdown = overflow.locator(".overflow-dropdown:not(.hide)")  # type: ignore[attr-defined]
+            dropdown.wait_for(state="visible")  # type: ignore[attr-defined]
+            menu_item = dropdown.get_by_role(  # type: ignore[attr-defined]
+                "button", name=label, exact=True
+            )
+            if _click_visible(page, menu_item):
+                overflow.locator(".overflow-dropdown.hide").wait_for(  # type: ignore[attr-defined]
+                    state="hidden"
+                )
+                return True
 
     text_item = page.get_by_text(label, exact=True)  # type: ignore[attr-defined]
     assert _click_visible(page, text_item), f"tab not found: {label}"
-    return menu_opened
+    return False
 
 
 def _click_visible(page: object, locator: object) -> bool:
     for index in range(locator.count()):  # type: ignore[attr-defined]
         candidate = locator.nth(index)  # type: ignore[attr-defined]
         if candidate.is_visible():
+            candidate.wait_for(state="visible")  # type: ignore[attr-defined]
             candidate.click()
             page.wait_for_timeout(100)  # type: ignore[attr-defined]
             return True

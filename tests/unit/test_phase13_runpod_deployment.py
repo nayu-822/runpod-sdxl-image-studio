@@ -198,7 +198,8 @@ fi
 
     assert result.returncode != 0
     assert "rclone config secret" in result.stderr
-    assert secret not in result.stderr
+    if secret:
+        assert secret not in result.stderr
 
 
 @pytest.mark.skipif(os.name == "nt", reason="runtime bash materialization is tested on Linux")
@@ -493,10 +494,10 @@ probe_comfyui() {
     probe_calls=$((probe_calls + 1))
     return 1
 }
-if monitor_processes; then
-    exit 2
-fi
+status=0
+monitor_processes || status=$?
 printf 'probes=%s events=%s\n' "$probe_calls" "$events"
+exit "$status"
 """,
         "deploy/runpod/bootstrap.sh",
     )
@@ -540,10 +541,10 @@ kill() {
 wait() { return 17; }
 sleep() { :; }
 probe_comfyui() { return 0; }
-if monitor_processes; then
-    exit 2
-fi
+status=0
+monitor_processes || status=$?
 printf 'events=%s\n' "$events"
+exit "$status"
 """,
         "deploy/runpod/bootstrap.sh",
         dead_process,

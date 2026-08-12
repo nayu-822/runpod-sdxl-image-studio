@@ -400,7 +400,7 @@ def test_invalid_png_and_sidecar_keep_import_invalid_and_image_upscale_available
         service.build_generation_settings(preview.id)
 
 
-def test_import_storage_allows_symlink_that_resolves_inside_data_root(tmp_path: Path) -> None:
+def test_import_storage_rejects_symlink_that_resolves_inside_data_root(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     storage = ImportedImageStorage(settings)
     internal = tmp_path / "internal-images"
@@ -408,10 +408,11 @@ def test_import_storage_allows_symlink_that_resolves_inside_data_root(tmp_path: 
     (tmp_path / "imports" / "2025-01-02").mkdir(parents=True)
     _make_directory_symlink(tmp_path / "imports" / "2025-01-02" / "images", internal)
 
-    imported = storage.store(_png(), "internal.png", created_at=datetime(2025, 1, 2, tzinfo=UTC))
+    with pytest.raises(ImportedImageStorageError) as error:
+        storage.store(_png(), "internal.png", created_at=datetime(2025, 1, 2, tzinfo=UTC))
 
-    assert (internal / f"{imported.id}.png").exists()
-    assert storage.verify(imported).id == imported.id
+    assert error.value.code == "metadata_import_storage_failed"
+    assert not list(internal.glob("*.png"))
 
 
 @pytest.mark.parametrize(
