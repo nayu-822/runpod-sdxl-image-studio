@@ -77,7 +77,11 @@ rejectします。temporary fileへ書いて0600を設定し、atomic replaceし
 ## Template設定
 
 `template.env.example`をRunPod Template environmentへコピーし、Secret placeholderだけを
-RunPod Secret機構で置き換えます。production Templateの推奨値は次のとおりです。
+RunPod Secret機構で置き換えます。DockerのEntrypointは、イメージ側のDockerfileで
+`ENTRYPOINT []`としてbase imageの`/start.sh`を解除します。これはTemplateの設定を
+変更するという意味ではありません。Template側ではEntrypointとStart Commandを上書きせず、
+イメージのCMDでbootstrapを起動し、bootstrapが`/start.sh`をbackground起動します。
+production Templateの推奨値は次のとおりです。
 
 | 設定 | 値 |
 | --- | --- |
@@ -89,7 +93,7 @@ RunPod Secret機構で置き換えます。production Templateの推奨値は次
 | Network volume | none |
 | HTTP port | 7860/http only |
 | Public Template | off |
-| Docker Entrypoint | unchanged |
+| Docker Entrypoint | unchanged; Templateで上書きしない（image側は`ENTRYPOINT []`） |
 | Docker Start Command | unchanged; image CMDがbootstrapを起動 |
 
 productionでは8188/http、8080/http、8888/httpを公開しません。ComfyUIにはImage

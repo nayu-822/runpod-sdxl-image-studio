@@ -633,9 +633,11 @@ imageへまとめます。baseは`runpod/comfyui:1.4.4-cuda12.8`、Image Studio�
 RunPod TemplateとFresh Pod手順は`deploy/runpod/README.md`に記載します。
 
 production imageにはcheckpoint、LoRA、VAE、upscaler、生成画像、SQLite state、OAuth
-token、API key、cookie、`.env`、`rclone.conf`を含めません。Templateは起動時に
+token、API key、cookie、`.env`、`rclone.conf`を含めません。Dockerfileはbase imageから
+継承する`ENTRYPOINT ["/start.sh"]`を`ENTRYPOINT []`で解除し、CMDにbootstrapを設定します。
+RunPod Template側ではEntrypointとStart Commandを上書きしません。Templateは起動時に
 `image_studio_rclone_config_b64` Secretからrclone.confを0600でmaterializeします。
-bootstrapは既存の`/start.sh`を起動し、固定local endpoint
+bootstrapは自身をPID 1として既存の`/start.sh`をbackground起動し、固定local endpoint
 `http://127.0.0.1:8188/system_stats`のreadinessをwall-clock deadlineで待ってから
 Image Studioを起動します。既定900秒の間、probeの`--max-time`は残り時間と5秒の
 小さい方へ制限し、timeout=0では即時probeを最大1回だけ行います。

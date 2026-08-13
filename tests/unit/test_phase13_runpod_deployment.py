@@ -47,7 +47,7 @@ def _run_bash(
         raise AssertionError("Phase 13 bash test exceeded its 10-second timeout") from exc
 
 
-def test_dockerfile_is_pinned_and_keeps_the_base_entrypoint() -> None:
+def test_dockerfile_clears_base_entrypoint_and_starts_bootstrap() -> None:
     dockerfile = _read(DOCKERFILE)
 
     assert "FROM runpod/comfyui:1.4.4-cuda12.8" in dockerfile
@@ -55,8 +55,17 @@ def test_dockerfile_is_pinned_and_keeps_the_base_entrypoint() -> None:
     assert "ARG RCLONE_VERSION" not in dockerfile
     assert "${RCLONE_VERSION}" not in dockerfile
     assert "runpod/comfyui:latest" not in dockerfile
-    assert "ENTRYPOINT" not in dockerfile
-    assert 'CMD ["/opt/image-studio/deploy/runpod/bootstrap.sh"]' in dockerfile
+    entrypoint = "ENTRYPOINT []"
+    command = 'CMD ["/opt/image-studio/deploy/runpod/bootstrap.sh"]'
+    instructions = [
+        line.strip()
+        for line in dockerfile.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert instructions.count(entrypoint) == 1
+    assert instructions.count(command) == 1
+    assert instructions.index(entrypoint) < instructions.index(command)
+    assert 'ENTRYPOINT ["/start.sh"]' not in instructions
     assert 'python3.12 -m venv "$IMAGE_STUDIO_VENV"' in dockerfile
     assert 'pip" install --no-cache-dir -e "$IMAGE_STUDIO_ROOT"' in dockerfile
     assert "SHA256SUMS" in dockerfile

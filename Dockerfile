@@ -50,6 +50,8 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30m --retries=3 \
     CMD curl --fail --silent --show-error --max-time 4 \
         http://127.0.0.1:7860/ > /dev/null || exit 1
 
-# The base image's entrypoint is intentionally left untouched.  The base
-# /start.sh is launched by bootstrap before the application is started.
+# base imageはENTRYPOINT ["/start.sh"]を持つ。これを継承するとbootstrapが
+# /start.shの引数として扱われるため、派生imageではENTRYPOINTを解除する。
+# bootstrapをPID 1で起動し、bootstrap自身がbaseの/start.shを子processとして起動する。
+ENTRYPOINT []
 CMD ["/opt/image-studio/deploy/runpod/bootstrap.sh"]

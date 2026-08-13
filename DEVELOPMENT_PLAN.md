@@ -608,7 +608,9 @@ migrationは対象外です。
 
 repositoryには固定した`runpod/comfyui:1.4.4-cuda12.8`をbase imageとして使い、
 `/opt/image-studio-venv`へeditable installしたImage Studio、checksum検証済みの
-rclone 1.74.2、deployment scriptを含めます。bootstrapはrclone Secretをtemporary
+rclone 1.74.2、deployment scriptを含めます。base imageが持つ`ENTRYPOINT ["/start.sh"]`は
+Dockerfileの`ENTRYPOINT []`で解除し、イメージのCMDからbootstrapをPID 1として起動します。
+bootstrap自身が`/start.sh`をbackground起動し、rclone Secretをtemporary
 fileへ書き、0600を設定してatomic replaceし、内容をlogへ出さずremoteだけを検証します。
 `/start.sh`を起動した後、固定local endpointへwall-clock deadline方式でreadinessを
 確認します。既定timeoutは900秒で、各probeの`--max-time`は残り時間と5秒の小さい方へ
