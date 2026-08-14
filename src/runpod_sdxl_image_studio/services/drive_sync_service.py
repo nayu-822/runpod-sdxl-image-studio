@@ -38,11 +38,13 @@ from runpod_sdxl_image_studio.domain.drive_sync import (
     DriveManifestJob,
     DriveManifestState,
     DriveRemotePaths,
+    DriveSyncArtifact,
     DriveSyncErrorCode,
     DriveSyncJob,
     DriveSyncProgress,
     DriveSyncRecord,
     DriveSyncStatus,
+    build_remote_image_path,
     build_remote_paths,
     utc,
     validate_remote_relative_path,
@@ -144,7 +146,7 @@ class DriveSyncService:
         }:
             return existing
         artifacts = self._artifacts_with_repair(generation_id)
-        image, metadata = _select_required_artifacts(artifacts)
+        images, metadata = _select_required_artifacts(artifacts)
         paths = build_remote_paths(
             generation.id,
             generation.kind.value,
@@ -153,7 +155,7 @@ class DriveSyncService:
         )
         record, job = self._build_record_and_job(
             generation,
-            image,
+            images,
             metadata,
             paths,
             existing=existing,
@@ -217,9 +219,10 @@ class DriveSyncService:
             return existing, active_job
 
         artifacts = self._artifacts_with_repair(generation_id)
-        image, metadata = _select_required_artifacts(artifacts)
+        images, metadata = _select_required_artifacts(artifacts)
         if resync:
-            _verify_image_source(image, self._settings)
+            for image in images:
+                _verify_image_source(image, self._settings)
             if metadata is not None:
                 _verify_metadata_source(metadata, self._settings, generation.id)
         paths = build_remote_paths(
@@ -230,7 +233,7 @@ class DriveSyncService:
         )
         updated_record, job = self._build_record_and_job(
             generation,
-            image,
+            images,
             metadata,
             paths,
             existing=existing,
@@ -379,31 +382,48 @@ class DriveSyncService:
                     "drive_generation_not_completed",
                     "generation is not completed",
                 )
-            image, metadata = _select_required_artifacts(artifacts)
+            images, metadata = _select_required_artifacts(artifacts)
             if metadata is None or record.metadata_artifact_id is None:
                 raise DriveSyncServiceError(
                     DriveSyncErrorCode.METADATA_MISSING.value,
                     "metadata sidecar is not available",
                 )
-            if image.id != job.image_artifact_id or image.id != record.image_artifact_id:
+            sync_items = tuple(sorted(record.artifacts, key=lambda item: item.display_order))
+            if len(sync_items) != len(images) or not sync_items:
                 raise DriveSyncServiceError(
                     DriveSyncErrorCode.SOURCE_CHANGED.value,
-                    "image artifact identity changed",
+                    "Drive image artifact plan changed",
                 )
-            if (
-                metadata.id != job.metadata_artifact_id
-                or metadata.id != record.metadata_artifact_id
-            ):
+            image_by_id = {image.id: image for image in images}
+            image_paths: list[tuple[DriveSyncArtifact, Path]] = []
+            for item in sync_items:
+                image = image_by_id.get(item.image_artifact_id)
+                if image is None:
+                    raise DriveSyncServiceError(
+                        DriveSyncErrorCode.SOURCE_CHANGED.value,
+                        "image artifact identity changed",
+                    )
+                image_path = _verify_image_source(image, self._settings)
+                if image.sha256 != item.image_sha256 or image.size_bytes != item.image_size_bytes:
+                    raise DriveSyncServiceError(
+                        DriveSyncErrorCode.SOURCE_CHANGED.value,
+                        "image artifact snapshot changed",
+                    )
+                validate_remote_relative_path(item.remote_image_path)
+                image_paths.append((item, image_path))
+            if metadata.id != record.metadata_artifact_id:
                 raise DriveSyncServiceError(
                     DriveSyncErrorCode.SOURCE_CHANGED.value,
                     "metadata artifact identity changed",
                 )
-            image_path = _verify_image_source(image, self._settings)
             metadata_path = _verify_metadata_source(metadata, self._settings, generation.id)
-            if image.sha256 != job.image_sha256 or image.size_bytes != job.image_size_bytes:
+            if (
+                metadata.sha256 != record.metadata_sha256
+                or metadata.size_bytes != record.metadata_size_bytes
+            ):
                 raise DriveSyncServiceError(
                     DriveSyncErrorCode.SOURCE_CHANGED.value,
-                    "image artifact snapshot changed",
+                    "metadata artifact snapshot changed",
                 )
             if (
                 metadata.sha256 != job.metadata_sha256
@@ -413,9 +433,17 @@ class DriveSyncService:
                     DriveSyncErrorCode.SOURCE_CHANGED.value,
                     "metadata artifact snapshot changed",
                 )
-            validate_remote_relative_path(record.remote_image_path)
+            if (
+                job.artifacts
+                and any(item.remote_image_path for item in job.artifacts)
+                and tuple(job.artifacts) != sync_items
+            ):
+                raise DriveSyncServiceError(
+                    DriveSyncErrorCode.SOURCE_CHANGED.value,
+                    "Drive job artifact plan changed",
+                )
             validate_remote_relative_path(record.remote_metadata_path)
-            total_bytes = image.size_bytes + metadata.size_bytes
+            total_bytes = sum(image.size_bytes for image in images) + metadata.size_bytes
             destination = DriveDestination(record.remote_name, record.remote_base_path)
         except DriveSyncServiceError as exc:
             return self._failed(job, worker_id, exc)
@@ -435,31 +463,46 @@ class DriveSyncService:
                 ),
             )
 
-        await self._update_progress(job, worker_id, 0, total_bytes, "image")
+        completed_bytes = sum(item.image_size_bytes for item in sync_items if item.image_synced)
+        metadata_synced = all(item.metadata_synced for item in sync_items)
+        if metadata_synced:
+            completed_bytes += metadata.size_bytes
+        await self._update_progress(job, worker_id, completed_bytes, total_bytes, "image")
         try:
-            await self._copy_with_progress(
-                job,
-                worker_id,
-                image_path,
-                destination,
-                record.remote_image_path,
-                image.size_bytes,
-                total_bytes,
-                completed_before=0,
-                artifact_name="image",
-            )
-            await self._update_progress(job, worker_id, image.size_bytes, total_bytes, "metadata")
-            await self._copy_with_progress(
-                job,
-                worker_id,
-                metadata_path,
-                destination,
-                record.remote_metadata_path,
-                metadata.size_bytes,
-                total_bytes,
-                completed_before=image.size_bytes,
-                artifact_name="metadata",
-            )
+            for item, image_path in image_paths:
+                if item.image_synced:
+                    continue
+                await self._copy_with_progress(
+                    job,
+                    worker_id,
+                    image_path,
+                    destination,
+                    item.remote_image_path,
+                    item.image_size_bytes,
+                    total_bytes,
+                    completed_before=completed_bytes,
+                    artifact_name=f"image[{item.display_order}]",
+                )
+                self._mark_artifact_synced(job, worker_id, item.display_order, "image")
+                completed_bytes += item.image_size_bytes
+            if not metadata_synced:
+                await self._update_progress(
+                    job, worker_id, completed_bytes, total_bytes, "metadata"
+                )
+                await self._copy_with_progress(
+                    job,
+                    worker_id,
+                    metadata_path,
+                    destination,
+                    record.remote_metadata_path,
+                    metadata.size_bytes,
+                    total_bytes,
+                    completed_before=completed_bytes,
+                    artifact_name="metadata",
+                )
+                for item in sync_items:
+                    self._mark_artifact_synced(job, worker_id, item.display_order, "metadata")
+                completed_bytes += metadata.size_bytes
             await self._update_progress(job, worker_id, total_bytes, total_bytes, None)
         except Exception as exc:  # noqa: BLE001 - remote failures never delete local files
             code = getattr(exc, "code", DriveSyncErrorCode.TRANSFER_FAILED.value)
@@ -803,27 +846,74 @@ class DriveSyncService:
     def _build_record_and_job(
         self,
         generation: Generation,
-        image: GenerationArtifact,
+        images: tuple[GenerationArtifact, ...],
         metadata: GenerationArtifact | None,
         paths: DriveRemotePaths,
         *,
         existing: DriveSyncRecord | None,
     ) -> tuple[DriveSyncRecord, DriveSyncJob]:
+        if not images:
+            raise DriveSyncServiceError(
+                DriveSyncErrorCode.SOURCE_MISSING.value,
+                "primary image artifacts are missing",
+            )
+        ordered_images = tuple(sorted(images, key=lambda item: item.display_order))
+        if tuple(item.display_order for item in ordered_images) != tuple(
+            range(len(ordered_images))
+        ):
+            raise DriveSyncServiceError(
+                DriveSyncErrorCode.SOURCE_CHANGED.value,
+                "image artifact display order is invalid",
+            )
         now = datetime.now(UTC)
         record_id = existing.id if existing is not None else self._id_factory()
+        previous = {
+            item.image_artifact_id: item
+            for item in (existing.artifacts if existing is not None else ())
+        }
+        sync_artifacts = tuple(
+            DriveSyncArtifact(
+                display_order=image.display_order,
+                image_artifact_id=image.id,
+                remote_image_path=build_remote_image_path(
+                    paths, image.display_order, len(ordered_images)
+                ),
+                image_sha256=image.sha256,
+                image_size_bytes=image.size_bytes,
+                metadata_artifact_id=metadata.id if metadata is not None else None,
+                remote_metadata_path=paths.metadata_path if metadata is not None else None,
+                metadata_sha256=metadata.sha256 if metadata is not None else None,
+                metadata_size_bytes=metadata.size_bytes if metadata is not None else None,
+                image_synced=_can_resume_artifact(
+                    previous.get(image.id),
+                    image,
+                    build_remote_image_path(paths, image.display_order, len(ordered_images)),
+                    kind="image",
+                ),
+                metadata_synced=(
+                    metadata is not None
+                    and _can_resume_metadata(previous.get(image.id), metadata, paths.metadata_path)
+                ),
+            )
+            for image in ordered_images
+        )
+        first = ordered_images[0]
+        total_bytes = sum(image.size_bytes for image in ordered_images) + (
+            metadata.size_bytes if metadata is not None else 0
+        )
         record = DriveSyncRecord(
             id=record_id,
             generation_id=generation.id,
             status=DriveSyncStatus.PENDING,
             remote_name=self._settings.rclone_remote,
             remote_base_path=self._settings.rclone_base_path,
-            remote_image_path=paths.image_path,
+            remote_image_path=sync_artifacts[0].remote_image_path,
             remote_metadata_path=paths.metadata_path,
-            image_artifact_id=image.id,
+            image_artifact_id=first.id,
             metadata_artifact_id=metadata.id if metadata is not None else None,
-            image_sha256=image.sha256,
+            image_sha256=first.sha256,
             metadata_sha256=metadata.sha256 if metadata is not None else None,
-            image_size_bytes=image.size_bytes,
+            image_size_bytes=first.size_bytes,
             metadata_size_bytes=metadata.size_bytes if metadata is not None else None,
             attempt_count=existing.attempt_count if existing is not None else 0,
             last_attempt_at=existing.last_attempt_at if existing is not None else None,
@@ -832,6 +922,7 @@ class DriveSyncService:
             error_summary=None,
             created_at=existing.created_at if existing is not None else now,
             updated_at=now,
+            artifacts=sync_artifacts,
         )
         return record, DriveSyncJob(
             id=self._id_factory(),
@@ -840,7 +931,7 @@ class DriveSyncService:
             status=DriveSyncStatus.PENDING,
             queue_sequence=0,
             progress_bytes=0,
-            total_bytes=image.size_bytes + (metadata.size_bytes if metadata is not None else 0),
+            total_bytes=total_bytes,
             progress_percentage=0.0,
             current_artifact=None,
             worker_id=None,
@@ -853,14 +944,15 @@ class DriveSyncService:
             error_summary=None,
             retryable=True,
             log_path=f"logs/drive_sync/{generation.id}.log",
-            image_artifact_id=image.id,
+            image_artifact_id=first.id,
             metadata_artifact_id=metadata.id if metadata is not None else None,
-            image_sha256=image.sha256,
+            image_sha256=first.sha256,
             metadata_sha256=metadata.sha256 if metadata is not None else None,
-            image_size_bytes=image.size_bytes,
+            image_size_bytes=first.size_bytes,
             metadata_size_bytes=metadata.size_bytes if metadata is not None else None,
             created_at=now,
             updated_at=now,
+            artifacts=sync_artifacts,
         )
 
     def _mark_enqueued_failed(self, job: DriveSyncJob, code: str, summary: str) -> DriveSyncRecord:
@@ -885,6 +977,20 @@ class DriveSyncService:
                 exc_info=True,
             )
             return None
+
+    def _mark_artifact_synced(
+        self, job: DriveSyncJob, worker_id: str, display_order: int, artifact_kind: str
+    ) -> None:
+        marker = getattr(self._repository, "mark_artifact_synced", None)
+        if not callable(marker):
+            # Keep lightweight legacy fakes usable; the production repository always
+            # implements the durable per-artifact checkpoint.
+            return
+        if not marker(job.id, worker_id, display_order, artifact_kind):
+            raise DriveSyncServiceError(
+                DriveSyncErrorCode.PERSISTENCE_FAILED.value,
+                "Drive artifact progress could not be saved",
+            )
 
     async def _copy_with_progress(
         self,
@@ -988,14 +1094,24 @@ class DriveSyncService:
 
 def _select_required_artifacts(
     artifacts: tuple[GenerationArtifact, ...],
-) -> tuple[GenerationArtifact, GenerationArtifact | None]:
-    image = _find_artifact(artifacts, ArtifactType.IMAGE)
-    if image is None:
+) -> tuple[tuple[GenerationArtifact, ...], GenerationArtifact | None]:
+    images = tuple(
+        sorted(
+            (artifact for artifact in artifacts if artifact.artifact_type is ArtifactType.IMAGE),
+            key=lambda artifact: artifact.display_order,
+        )
+    )
+    if not images:
         raise DriveSyncServiceError(
             DriveSyncErrorCode.SOURCE_MISSING.value,
-            "primary image artifact is missing",
+            "primary image artifacts are missing",
         )
-    return image, _find_artifact(artifacts, ArtifactType.METADATA)
+    if tuple(item.display_order for item in images) != tuple(range(len(images))):
+        raise DriveSyncServiceError(
+            DriveSyncErrorCode.SOURCE_CHANGED.value,
+            "image artifact display order is invalid",
+        )
+    return images, _find_artifact(artifacts, ArtifactType.METADATA)
 
 
 def _find_artifact(
@@ -1004,6 +1120,39 @@ def _find_artifact(
     return next(
         (artifact for artifact in artifacts if artifact.artifact_type is artifact_type),
         None,
+    )
+
+
+def _can_resume_artifact(
+    previous: DriveSyncArtifact | None,
+    image: GenerationArtifact,
+    remote_path: str,
+    *,
+    kind: str,
+) -> bool:
+    return bool(
+        kind == "image"
+        and previous is not None
+        and previous.image_synced
+        and previous.image_artifact_id == image.id
+        and previous.remote_image_path == remote_path
+        and previous.image_sha256 == image.sha256
+        and previous.image_size_bytes == image.size_bytes
+    )
+
+
+def _can_resume_metadata(
+    previous: DriveSyncArtifact | None,
+    metadata: GenerationArtifact,
+    remote_path: str,
+) -> bool:
+    return bool(
+        previous is not None
+        and previous.metadata_synced
+        and previous.metadata_artifact_id == metadata.id
+        and previous.remote_metadata_path == remote_path
+        and previous.metadata_sha256 == metadata.sha256
+        and previous.metadata_size_bytes == metadata.size_bytes
     )
 
 
@@ -1192,6 +1341,21 @@ def _safe_manifest_directory(data_dir: Path, local_date: str) -> Path:
 
 
 def _manifest_line(record: DriveManifestRecord, local_date: str) -> dict[str, object]:
+    artifacts = record.artifacts or (
+        DriveSyncArtifact(
+            display_order=0,
+            image_artifact_id=UUID(int=0),
+            remote_image_path=record.remote_image_path,
+            image_sha256=record.image_sha256,
+            image_size_bytes=record.image_size_bytes,
+            metadata_artifact_id=None,
+            remote_metadata_path=record.remote_metadata_path,
+            metadata_sha256=record.metadata_sha256,
+            metadata_size_bytes=record.metadata_size_bytes,
+            image_synced=True,
+            metadata_synced=True,
+        ),
+    )
     return {
         "local_date": local_date,
         "generation_id": str(record.generation_id),
@@ -1206,6 +1370,18 @@ def _manifest_line(record: DriveManifestRecord, local_date: str) -> dict[str, ob
         "image_size_bytes": record.image_size_bytes,
         "metadata_size_bytes": record.metadata_size_bytes,
         "synced_at": utc(record.synced_at).isoformat(),
+        "images": [
+            {
+                "display_order": item.display_order,
+                "remote_image_path": item.remote_image_path,
+                "image_sha256": item.image_sha256,
+                "image_size_bytes": item.image_size_bytes,
+                "remote_metadata_path": item.remote_metadata_path,
+                "metadata_sha256": item.metadata_sha256,
+                "metadata_size_bytes": item.metadata_size_bytes,
+            }
+            for item in artifacts
+        ],
     }
 
 

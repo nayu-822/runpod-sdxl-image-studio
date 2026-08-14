@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -43,6 +43,11 @@ class GenerationSettingsSnapshot(BaseModel):
     hires_fix: bool = False
     hires_scale: float = Field(default=1.5, ge=1.0, le=4.0)
     hires_denoise: float = Field(default=0.4, ge=0.0, le=1.0)
+    hires_resize_method: Literal["lanczos", "nearest-exact", "bilinear", "bicubic"] = "lanczos"
+    hires_steps: int = Field(default=20, ge=1, le=150)
+    hires_cfg_scale: float = Field(default=5.5, ge=0.0, le=30.0)
+    hires_sampler_name: str = Field(default="euler", min_length=1)
+    hires_scheduler_name: str = Field(default="normal", min_length=1)
     final_upscale: bool = False
     final_upscale_model: str | None = None
     client_local_date: str | None = None
@@ -71,6 +76,11 @@ class GenerationSettingsSnapshot(BaseModel):
             hires_fix=settings.hires_fix,
             hires_scale=settings.hires_scale,
             hires_denoise=settings.hires_denoise,
+            hires_resize_method=settings.hires_resize_method,
+            hires_steps=settings.hires_steps,
+            hires_cfg_scale=settings.hires_cfg_scale,
+            hires_sampler_name=settings.hires_sampler_name,
+            hires_scheduler_name=settings.hires_scheduler_name,
             final_upscale=settings.final_upscale,
             final_upscale_model=settings.final_upscale_model,
             client_local_date=settings.client_local_date,
@@ -123,6 +133,11 @@ class GenerationSettingsSnapshot(BaseModel):
                 hires_fix=self.hires_fix,
                 hires_scale=self.hires_scale,
                 hires_denoise=self.hires_denoise,
+                hires_resize_method=self.hires_resize_method,
+                hires_steps=self.hires_steps,
+                hires_cfg_scale=self.hires_cfg_scale,
+                hires_sampler_name=self.hires_sampler_name,
+                hires_scheduler_name=self.hires_scheduler_name,
                 final_upscale=self.final_upscale,
                 final_upscale_model=self.final_upscale_model,
                 client_local_date=self.client_local_date,

@@ -55,6 +55,16 @@ class GenerationFormStateSnapshot(BaseModel):
     height: int = Field(gt=0)
     steps: int = Field(ge=1, le=150)
     cfg_scale: float = Field(ge=0.0, le=30.0)
+    clip_skip: int = Field(default=1, ge=1, le=12)
+    hires_fix: bool = False
+    hires_scale: float = Field(default=1.5, ge=1.0, le=4.0)
+    hires_resize_method: str = Field(default="lanczos", min_length=1)
+    hires_steps: int = Field(default=20, ge=1, le=150)
+    hires_cfg_scale: float = Field(default=5.5, ge=0.0, le=30.0)
+    hires_sampler_name: str = Field(default="euler", min_length=1)
+    hires_scheduler_name: str = Field(default="normal", min_length=1)
+    hires_denoise: float = Field(default=0.4, ge=0.0, le=1.0)
+    final_upscale: bool = False
     sampler_name: str = Field(min_length=1, max_length=200)
     scheduler_name: str = Field(min_length=1, max_length=200)
     checkpoint_name: str = Field(min_length=1, max_length=500)
@@ -101,6 +111,16 @@ class GenerationFormStateSnapshot(BaseModel):
         vae_name: str | None,
         upscaler_name: str | None = None,
         loras: tuple[LoraSetting, ...] | list[LoraSetting] = (),
+        clip_skip: int = 1,
+        hires_fix: bool = False,
+        hires_scale: float = 1.5,
+        hires_resize_method: str = "lanczos",
+        hires_steps: int = 20,
+        hires_cfg_scale: float = 5.5,
+        hires_sampler_name: str = "euler",
+        hires_scheduler_name: str = "normal",
+        hires_denoise: float = 0.4,
+        final_upscale: bool = False,
         updated_at: datetime | None = None,
     ) -> GenerationFormStateSnapshot:
         return cls(
@@ -112,6 +132,16 @@ class GenerationFormStateSnapshot(BaseModel):
             height=height,
             steps=steps,
             cfg_scale=cfg_scale,
+            clip_skip=clip_skip,
+            hires_fix=hires_fix,
+            hires_scale=hires_scale,
+            hires_resize_method=hires_resize_method,
+            hires_steps=hires_steps,
+            hires_cfg_scale=hires_cfg_scale,
+            hires_sampler_name=hires_sampler_name,
+            hires_scheduler_name=hires_scheduler_name,
+            hires_denoise=hires_denoise,
+            final_upscale=final_upscale,
             sampler_name=sampler_name,
             scheduler_name=scheduler_name,
             checkpoint_name=checkpoint_name,
@@ -148,6 +178,16 @@ class GenerationFormStateSnapshot(BaseModel):
             height=snapshot.height,
             steps=snapshot.steps,
             cfg_scale=snapshot.cfg_scale,
+            clip_skip=snapshot.clip_skip,
+            hires_fix=snapshot.hires_fix,
+            hires_scale=snapshot.hires_scale,
+            hires_resize_method=snapshot.hires_resize_method,
+            hires_steps=snapshot.hires_steps,
+            hires_cfg_scale=snapshot.hires_cfg_scale,
+            hires_sampler_name=snapshot.hires_sampler_name,
+            hires_scheduler_name=snapshot.hires_scheduler_name,
+            hires_denoise=snapshot.hires_denoise,
+            final_upscale=snapshot.final_upscale,
             sampler_name=snapshot.sampler_name,
             scheduler_name=snapshot.scheduler_name,
             checkpoint_name=snapshot.checkpoint_name,

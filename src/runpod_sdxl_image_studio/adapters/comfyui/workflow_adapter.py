@@ -188,37 +188,50 @@ def _apply_clip_skip(workflow: dict[str, object], clip_skip: int) -> None:
 
 
 def _apply_hires_fix(workflow: dict[str, object], settings: GenerationSettings) -> None:
-    if "hires_latent" in workflow or "hires_sampler" in workflow:
+    reserved = ("hires_scale", "hires_encode", "hires_sampler", "hires_decode")
+    if any(node_id in workflow for node_id in reserved):
         raise WorkflowTemplateError("reserved Hires.fix node id is already in use")
     model = _get_input(workflow, KSampler_NODE_ID, "model")
     positive = _get_input(workflow, KSampler_NODE_ID, "positive")
     negative = _get_input(workflow, KSampler_NODE_ID, "negative")
-    workflow["hires_latent"] = {
-        "class_type": "LatentUpscale",
+    workflow["hires_scale"] = {
+        "class_type": "ImageScaleBy",
         "inputs": {
-            "upscale_method": "nearest-exact",
-            "width": int(settings.width * settings.hires_scale),
-            "height": int(settings.height * settings.hires_scale),
-            "crop": "disabled",
-            "samples": [KSampler_NODE_ID, 0],
+            "upscale_method": settings.hires_resize_method,
+            "scale_by": settings.hires_scale,
+            "image": [VAE_DECODE_NODE_ID, 0],
+        },
+    }
+    workflow["hires_encode"] = {
+        "class_type": "VAEEncode",
+        "inputs": {
+            "pixels": ["hires_scale", 0],
+            "vae": _get_input(workflow, VAE_DECODE_NODE_ID, "vae"),
         },
     }
     workflow["hires_sampler"] = {
         "class_type": "KSampler",
         "inputs": {
             "seed": settings.seed,
-            "steps": settings.steps,
-            "cfg": settings.cfg_scale,
-            "sampler_name": settings.sampler_name,
-            "scheduler": settings.scheduler_name,
+            "steps": settings.hires_steps,
+            "cfg": settings.hires_cfg_scale,
+            "sampler_name": settings.hires_sampler_name,
+            "scheduler": settings.hires_scheduler_name,
             "denoise": settings.hires_denoise,
             "model": model,
             "positive": positive,
             "negative": negative,
-            "latent_image": ["hires_latent", 0],
+            "latent_image": ["hires_encode", 0],
         },
     }
-    _set_binding(workflow, (VAE_DECODE_NODE_ID, "inputs", "samples"), ["hires_sampler", 0])
+    workflow["hires_decode"] = {
+        "class_type": "VAEDecode",
+        "inputs": {
+            "samples": ["hires_sampler", 0],
+            "vae": _get_input(workflow, VAE_DECODE_NODE_ID, "vae"),
+        },
+    }
+    _set_binding(workflow, ("9", "inputs", "images"), ["hires_decode", 0])
 
 
 def _apply_final_upscale(workflow: dict[str, object], model_name: str | None) -> None:
@@ -232,7 +245,7 @@ def _apply_final_upscale(workflow: dict[str, object], model_name: str | None) ->
         "class_type": "ImageUpscaleWithModel",
         "inputs": {
             "upscale_model": ["final_upscale_loader", 0],
-            "image": [VAE_DECODE_NODE_ID, 0],
+            "image": ["hires_decode" if "hires_decode" in workflow else VAE_DECODE_NODE_ID, 0],
         },
     }
     _set_binding(workflow, ("9", "inputs", "images"), ["final_upscale", 0])

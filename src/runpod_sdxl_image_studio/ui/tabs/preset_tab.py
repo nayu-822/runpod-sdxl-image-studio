@@ -769,6 +769,17 @@ def _apply_outputs(
         settings.cfg_scale,
         gr.Dropdown(value=settings.sampler_name),
         gr.Dropdown(value=settings.scheduler_name),
+        gr.Dropdown(value=settings.final_upscale_model),
+        settings.clip_skip,
+        settings.hires_fix,
+        settings.hires_scale,
+        settings.hires_resize_method,
+        settings.hires_steps,
+        settings.hires_cfg_scale,
+        settings.hires_sampler_name,
+        settings.hires_scheduler_name,
+        settings.hires_denoise,
+        settings.final_upscale,
         *lora_updates,
         gr.skip(),
         gr.skip(),
@@ -794,7 +805,7 @@ def _preserve_apply(
         )
     return (
         message,
-        *(gr.skip() for _ in range(12)),
+        *(gr.skip() for _ in range(23)),
         *lora_outputs,
         gr.skip(),
         gr.skip(),
@@ -820,7 +831,7 @@ def preset_apply_output_count(max_loras: int) -> int:
     """Preset適用イベントの正常系・異常系で共有する出力数。"""
 
     lora_output_count = 2 + component_output_count_for_rows(max_loras)
-    return 1 + 12 + lora_output_count + 2
+    return 1 + 23 + lora_output_count + 2
 
 
 def _management_outputs(

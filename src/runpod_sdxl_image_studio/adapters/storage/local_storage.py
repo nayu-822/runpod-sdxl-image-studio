@@ -66,7 +66,7 @@ class LocalStorageAdapter:
         local_datetime = created_at.astimezone(self._timezone)
         local_date = _validated_client_date(client_local_date) or local_datetime.date().isoformat()
         folder = "upscaled" if kind is GenerationKind.UPSCALE else "generated"
-        target_dir = self._data_dir / "generations" / local_date / folder
+        target_dir = self._data_dir / "generations" / local_date
         _ensure_safe_storage_directory(target_dir, self._data_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
         if client_local_date is not None:
@@ -76,6 +76,9 @@ class LocalStorageAdapter:
                 height,
                 target_dir,
             )
+        target_dir = target_dir / folder
+        _ensure_safe_storage_directory(target_dir, self._data_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
         timestamp = local_datetime.strftime("%Y%m%d_%H%M%S")
         final_path = target_dir / f"{timestamp}_{generation_id.hex[:8]}.png"
         if final_path.exists():

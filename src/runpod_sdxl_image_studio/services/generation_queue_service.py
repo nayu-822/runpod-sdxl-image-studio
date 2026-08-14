@@ -161,6 +161,14 @@ class GenerationQueueService:
         except (GenerationDispatchQueueRepositoryError, ValueError) as exc:
             raise GenerationQueueServiceError(_enqueue_error_message(exc, "バッチ")) from exc
 
+    def run_with_enqueue_admission(
+        self, action: Callable[[], _AdmissionResult]
+    ) -> _AdmissionResult:
+        """Run an atomic enqueue transaction under the normal lifecycle hooks."""
+
+        self._ensure_work_allowed()
+        return self._run_with_admission(action)
+
     def list_jobs(
         self,
         *,

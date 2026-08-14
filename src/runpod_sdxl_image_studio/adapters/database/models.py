@@ -493,6 +493,7 @@ class DriveSyncRecordModel(Base):
     metadata_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     image_size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     metadata_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    artifacts_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -545,6 +546,7 @@ class DriveSyncJobModel(Base):
     metadata_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     image_size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     metadata_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    artifacts_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 

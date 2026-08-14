@@ -527,6 +527,73 @@ class GenerationDispatchQueueRepository(GenerationDispatchQueueRepositoryProtoco
         except (IntegrityError, SQLAlchemyError, ValueError) as exc:
             raise GenerationDispatchQueueRepositoryError("batch could not be enqueued") from exc
 
+    def enqueue_batch_in_session(
+        self,
+        session: Session,
+        snapshots: Sequence[GenerationSettingsSnapshot],
+        *,
+        name: str,
+        seed_strategy: BatchSeedStrategy,
+        start_seed: int | None,
+        seed_step: int,
+        pending_limit: int | None = None,
+        enqueued_at: datetime | None = None,
+    ) -> tuple[GenerationBatch, tuple[GenerationQueueItem, ...]]:
+        """Insert a batch using an already-open transaction.
+
+        Interactive runs use this coordinator path so the run row, batch,
+        generations, jobs, and queue entries commit or roll back together.
+        """
+
+        if not snapshots:
+            raise GenerationDispatchQueueRepositoryError("batch must contain at least one item")
+        if not name.strip() or len(name.strip()) > 200:
+            raise GenerationDispatchQueueRepositoryError("batch name is invalid")
+        if seed_step <= 0 or (start_seed is not None and start_seed < 0):
+            raise GenerationDispatchQueueRepositoryError("batch seed settings are invalid")
+        timestamp = _utc(enqueued_at or datetime.now(UTC))
+        batch_id = uuid4()
+        _check_pending_capacity(session, pending_limit, len(snapshots))
+        batch_row = GenerationBatchModel(
+            id=str(batch_id),
+            name=name.strip(),
+            item_count=len(snapshots),
+            seed_strategy=seed_strategy.value,
+            start_seed=start_seed,
+            seed_step=seed_step,
+            retry_of_batch_id=None,
+            created_at=timestamp,
+            updated_at=timestamp,
+        )
+        session.add(batch_row)
+        session.flush()
+        items: list[GenerationQueueItem] = []
+        for index, snapshot in enumerate(snapshots):
+            generation_row, job_row = _insert_generation_and_job(
+                session,
+                snapshot,
+                generation_id=uuid4(),
+                job_id=uuid4(),
+                kind=GenerationKind.STANDARD,
+                parent_generation_id=None,
+                retry_of_generation_id=None,
+                retry_attempt=0,
+                timestamp=timestamp,
+            )
+            entry = GenerationQueueEntryModel(
+                generation_id=generation_row.id,
+                job_id=job_row.id,
+                batch_id=str(batch_id),
+                batch_index=index,
+                submission_state=SubmissionState.READY.value,
+                enqueued_at=timestamp,
+                updated_at=timestamp,
+            )
+            session.add(entry)
+            session.flush()
+            items.append(_queue_item(session, entry, generation_row, job_row))
+        return _batch_domain(batch_row), tuple(items)
+
     def claim_next(
         self, worker_id: str, *, lease_seconds: float, now: datetime | None = None
     ) -> GenerationQueueItem | None:

@@ -16,6 +16,7 @@ from runpod_sdxl_image_studio.adapters.comfyui.workflow_adapter import WorkflowA
 from runpod_sdxl_image_studio.adapters.storage.exceptions import StorageError
 from runpod_sdxl_image_studio.adapters.storage.local_storage import LocalStorageAdapter
 from runpod_sdxl_image_studio.config import Settings
+from runpod_sdxl_image_studio.domain.generation import GenerationKind
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
 from runpod_sdxl_image_studio.domain.lora import LoraSetting
@@ -52,6 +53,11 @@ def test_phase_a_workflow_binds_batch_and_optional_nodes() -> None:
         clip_skip=2,
         hires_fix=True,
         hires_scale=1.5,
+        hires_resize_method="lanczos",
+        hires_steps=17,
+        hires_cfg_scale=6.25,
+        hires_sampler_name="heun",
+        hires_scheduler_name="karras",
         hires_denoise=0.35,
         final_upscale=True,
         final_upscale_model="4x-UltraSharp.pth",
@@ -67,7 +73,14 @@ def test_phase_a_workflow_binds_batch_and_optional_nodes() -> None:
     assert workflow["5"]["inputs"]["batch_size"] == 3  # type: ignore[index]
     assert workflow["lora_001"]["inputs"]["model"] == ["lora_000", 0]  # type: ignore[index]
     assert workflow["6"]["inputs"]["clip"] == ["clip_skip", 0]  # type: ignore[index]
+    assert workflow["hires_scale"]["inputs"]["upscale_method"] == "lanczos"  # type: ignore[index]
+    assert workflow["hires_scale"]["inputs"]["scale_by"] == 1.5  # type: ignore[index]
+    assert workflow["hires_sampler"]["inputs"]["steps"] == 17  # type: ignore[index]
+    assert workflow["hires_sampler"]["inputs"]["cfg"] == 6.25  # type: ignore[index]
+    assert workflow["hires_sampler"]["inputs"]["sampler_name"] == "heun"  # type: ignore[index]
+    assert workflow["hires_sampler"]["inputs"]["scheduler"] == "karras"  # type: ignore[index]
     assert workflow["hires_sampler"]["inputs"]["denoise"] == 0.35  # type: ignore[index]
+    assert workflow["hires_decode"]["inputs"]["samples"] == ["hires_sampler", 0]  # type: ignore[index]
     assert workflow["final_upscale_loader"]["inputs"]["model_name"] == "4x-UltraSharp.pth"  # type: ignore[index]
     assert workflow["9"]["inputs"]["images"] == ["final_upscale", 0]  # type: ignore[index]
 
@@ -85,6 +98,13 @@ def test_phase_a_snapshot_round_trip_preserves_new_generation_options() -> None:
         batch_size=4,
         clip_skip=3,
         hires_fix=True,
+        hires_scale=1.75,
+        hires_resize_method="bicubic",
+        hires_steps=19,
+        hires_cfg_scale=7.25,
+        hires_sampler_name="heun",
+        hires_scheduler_name="karras",
+        hires_denoise=0.3,
         final_upscale=True,
         final_upscale_model="4x-UltraSharp.pth",
         client_local_date="2026-08-13",
@@ -96,6 +116,13 @@ def test_phase_a_snapshot_round_trip_preserves_new_generation_options() -> None:
     assert restored.batch_size == 4
     assert restored.clip_skip == 3
     assert restored.hires_fix is True
+    assert restored.hires_scale == 1.75
+    assert restored.hires_resize_method == "bicubic"
+    assert restored.hires_steps == 19
+    assert restored.hires_cfg_scale == 7.25
+    assert restored.hires_sampler_name == "heun"
+    assert restored.hires_scheduler_name == "karras"
+    assert restored.hires_denoise == 0.3
     assert restored.final_upscale is True
     assert restored.final_upscale_model == "4x-UltraSharp.pth"
     assert restored.client_local_date == "2026-08-13"
@@ -122,14 +149,34 @@ def test_phase_a_local_storage_uses_client_date_and_six_digit_exclusive_sequence
 
     paths = sorted(item.path for item in stored)
     assert [path.name for path in paths] == [f"{index:06d}.png" for index in range(1, 9)]
-    assert all(
-        path.parent == tmp_path / "generations" / "2026-08-13" / "generated" for path in paths
-    )
+    assert all(path.parent == tmp_path / "generations" / "2026-08-13" for path in paths)
     assert len({item.sha256 for item in stored}) == 1
     assert all(path.read_bytes() for path in paths)
 
     with pytest.raises(StorageError):
         storage.store_image(_png(), UUID(int=100), created_at, client_local_date="2026-02-30")
+
+
+def test_phase_a_client_date_sequence_is_shared_by_generated_and_upscaled_images(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(_env_file=None, data_dir=tmp_path)
+    storage = LocalStorageAdapter(settings)
+    created_at = datetime(2026, 8, 14, 23, 59, tzinfo=UTC)
+
+    generated = storage.store_image(
+        _png(), UUID(int=101), created_at, client_local_date="2026-08-13"
+    )
+    upscaled = storage.store_image(
+        _png(),
+        UUID(int=102),
+        created_at,
+        kind=GenerationKind.UPSCALE,
+        client_local_date="2026-08-13",
+    )
+
+    assert generated.path == tmp_path / "generations" / "2026-08-13" / "000001.png"
+    assert upscaled.path == tmp_path / "generations" / "2026-08-13" / "000002.png"
 
 
 def test_phase_a_generation_tab_exposes_batch_size_and_interactive_run_controls() -> None:

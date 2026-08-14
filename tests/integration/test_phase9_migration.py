@@ -70,41 +70,47 @@ def test_phase9_migration_is_reversible_without_changing_existing_rows(tmp_path:
                 "created_at": timestamp,
             },
         )
-        session.add(
-            DriveSyncRecordModel(
-                id=str(drive_record_id),
-                generation_id=str(generation_id),
-                status="failed",
-                remote_name="gdrive",
-                remote_base_path="RunPod/Images",
-                remote_image_path="RunPod/Images/existing.png",
-                remote_metadata_path="RunPod/Images/existing.json",
-                image_artifact_id=str(artifact_id),
-                image_sha256="a" * 64,
-                image_size_bytes=3,
-                error_code="drive_copy_failed",
-                error_summary="test failure",
-                created_at=timestamp,
-                updated_at=timestamp,
-            )
+        session.execute(
+            text(
+                "INSERT INTO drive_sync_records "
+                "(id, generation_id, status, remote_name, remote_base_path, "
+                "remote_image_path, remote_metadata_path, image_artifact_id, "
+                "image_sha256, image_size_bytes, error_code, error_summary, "
+                "created_at, updated_at) VALUES "
+                "(:id, :generation_id, 'failed', 'gdrive', 'RunPod/Images', "
+                "'RunPod/Images/existing.png', 'RunPod/Images/existing.json', "
+                ":artifact_id, :sha256, 3, 'drive_copy_failed', 'test failure', "
+                ":created_at, :updated_at)"
+            ),
+            {
+                "id": str(drive_record_id),
+                "generation_id": str(generation_id),
+                "artifact_id": str(artifact_id),
+                "sha256": "a" * 64,
+                "created_at": timestamp,
+                "updated_at": timestamp,
+            },
         )
         session.flush()
-        session.add(
-            DriveSyncJobModel(
-                id=str(drive_job_id),
-                sync_record_id=str(drive_record_id),
-                generation_id=str(generation_id),
-                queue_sequence=1,
-                status="failed",
-                error_code="drive_copy_failed",
-                error_summary="test failure",
-                retryable=True,
-                image_artifact_id=str(artifact_id),
-                image_sha256="a" * 64,
-                image_size_bytes=3,
-                created_at=timestamp,
-                updated_at=timestamp,
-            )
+        session.execute(
+            text(
+                "INSERT INTO drive_sync_jobs "
+                "(id, sync_record_id, generation_id, queue_sequence, status, "
+                "error_code, error_summary, image_artifact_id, image_sha256, "
+                "image_size_bytes, created_at, updated_at) VALUES "
+                "(:id, :record_id, :generation_id, 1, 'failed', "
+                "'drive_copy_failed', 'test failure', :artifact_id, :sha256, "
+                "3, :created_at, :updated_at)"
+            ),
+            {
+                "id": str(drive_job_id),
+                "record_id": str(drive_record_id),
+                "generation_id": str(generation_id),
+                "artifact_id": str(artifact_id),
+                "sha256": "a" * 64,
+                "created_at": timestamp,
+                "updated_at": timestamp,
+            },
         )
         session.commit()
 

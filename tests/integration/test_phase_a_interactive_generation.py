@@ -10,11 +10,18 @@ from uuid import UUID, uuid4
 
 import pytest
 from PIL import Image
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, func, select
 
 from runpod_sdxl_image_studio.adapters.comfyui.workflow_adapter import WorkflowAdapter
-from runpod_sdxl_image_studio.adapters.database.engine import create_session_factory
-from runpod_sdxl_image_studio.adapters.database.models import Base
+from runpod_sdxl_image_studio.adapters.database.engine import create_session_factory, session_scope
+from runpod_sdxl_image_studio.adapters.database.models import (
+    Base,
+    GenerationBatchModel,
+    GenerationJobModel,
+    GenerationModel,
+    GenerationQueueEntryModel,
+    InteractiveGenerationRunModel,
+)
 from runpod_sdxl_image_studio.adapters.database.repositories import (
     generation_dispatch_queue_repository as dispatch_module,
 )
@@ -300,6 +307,42 @@ def test_phase_a_interactive_batch_runs_fifo_and_persists_two_images_per_generat
         assert [artifact.display_order for artifact in images] == [0, 1]
         assert len(images) == 2
     assert len(restored.result_image_paths) == 2
+    engine.dispose()  # type: ignore[union-attr]
+
+
+def test_phase_a_interactive_start_rolls_back_run_and_queue_on_batch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, factory = _database()
+    settings = Settings(_env_file=None, max_batch_count=4, queue_max_pending_jobs=20)
+    dispatch = dispatch_module.GenerationDispatchQueueRepository(factory)  # type: ignore[arg-type]
+    queue = GenerationQueueService(dispatch, settings)
+    runs = InteractiveRunRepository(factory)  # type: ignore[arg-type]
+    service = InteractiveGenerationService(runs, queue, settings)
+
+    def fail_batch(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise dispatch_module.GenerationDispatchQueueRepositoryError("injected batch failure")
+
+    monkeypatch.setattr(
+        dispatch_module.GenerationDispatchQueueRepository,
+        "enqueue_batch_in_session",
+        fail_batch,
+    )
+    with pytest.raises(InteractiveGenerationError):
+        service.start(
+            _settings(seed=321),
+            batch_count=3,
+            batch_size=2,
+            client_local_date="2026-08-13",
+        )
+
+    with session_scope(factory) as session:
+        assert session.scalar(select(func.count()).select_from(InteractiveGenerationRunModel)) == 0
+        assert session.scalar(select(func.count()).select_from(GenerationBatchModel)) == 0
+        assert session.scalar(select(func.count()).select_from(GenerationModel)) == 0
+        assert session.scalar(select(func.count()).select_from(GenerationJobModel)) == 0
+        assert session.scalar(select(func.count()).select_from(GenerationQueueEntryModel)) == 0
     engine.dispose()  # type: ignore[union-attr]
 
 

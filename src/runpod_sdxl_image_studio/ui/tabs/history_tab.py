@@ -549,7 +549,7 @@ def make_restore_handler(
         if not selected:
             return (
                 ("履歴を選択してください。",)
-                + (gr.skip(),) * (12 + component_output_count(max_loras))
+                + (gr.skip(),) * (23 + component_output_count(max_loras))
                 + (None, False)
             )
         try:
@@ -602,6 +602,17 @@ def make_restore_handler(
                 settings.cfg_scale,
                 gr.Dropdown(value=settings.sampler_name),
                 gr.Dropdown(value=settings.scheduler_name),
+                gr.Dropdown(value=settings.final_upscale_model),
+                settings.clip_skip,
+                settings.hires_fix,
+                settings.hires_scale,
+                settings.hires_resize_method,
+                settings.hires_steps,
+                settings.hires_cfg_scale,
+                settings.hires_sampler_name,
+                settings.hires_scheduler_name,
+                settings.hires_denoise,
+                settings.final_upscale,
                 *lora_updates,
                 str(restored.parent_generation_id),
                 not blocking,
@@ -609,7 +620,7 @@ def make_restore_handler(
         except (GenerationHistoryError, ValueError):
             return (
                 ("設定を復元できませんでした。",)
-                + (gr.skip(),) * (12 + component_output_count(max_loras))
+                + (gr.skip(),) * (23 + component_output_count(max_loras))
                 + (None, False)
             )
 

@@ -295,9 +295,104 @@ def test_drive_sync_success_copies_image_metadata_and_manifest(tmp_path: Path) -
     assert manifest.exists()
     assert str(generation_id) in manifest.read_text(encoding="utf-8")
     assert "prompt" not in manifest.read_text(encoding="utf-8")
+
+
+def test_drive_sync_transfers_all_ordered_images_and_manifest_entries(tmp_path: Path) -> None:
+    service, repository, generation_id, image_path, _, adapter = _fixture(tmp_path)
+    created_at = datetime(2026, 8, 7, 15, 30, tzinfo=UTC)
+    second_bytes = _png()
+    second_path = image_path.with_name("second.png")
+    second_path.write_bytes(second_bytes)
+    service._artifact_repository.add(  # type: ignore[attr-defined]
+        GenerationArtifact(
+            id=uuid4(),
+            generation_id=generation_id,
+            artifact_type=ArtifactType.IMAGE,
+            local_path="generations/2026-08-08/generated/second.png",
+            sha256=hashlib.sha256(second_bytes).hexdigest(),
+            size_bytes=len(second_bytes),
+            width=64,
+            height=64,
+            mime_type="image/png",
+            created_at=created_at,
+            display_order=1,
+        )
+    )
+
+    record = service.enqueue_generation(generation_id)
+    assert record is not None
+    assert [item.display_order for item in record.artifacts] == [0, 1]
+    assert len({item.remote_image_path for item in record.artifacts}) == 2
+    job = repository.claim_next("worker-1", 120)
+    assert job is not None
+    synced = asyncio.run(service.process_job(job, "worker-1"))
+    assert synced is not None and synced.status is DriveSyncStatus.SYNCED
+    assert all(item.image_synced and item.metadata_synced for item in synced.artifacts)
+    image_calls = [call for call in adapter.calls if call[2].endswith(".png")]
+    assert len(image_calls) == 2
+    assert {call[2] for call in image_calls} == {
+        item.remote_image_path for item in synced.artifacts
+    }
+
+    manifest_job = repository.claim_next_manifest("worker-1", 120)
+    assert manifest_job is not None
+    assert asyncio.run(service.process_manifest_job(manifest_job, "worker-1")) is not None
+    manifest = json.loads(
+        (tmp_path / ".drive-sync-manifests" / "2026-08-08" / "manifest.jsonl").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert [item["display_order"] for item in manifest["images"]] == [0, 1]
+
+
+def test_drive_sync_retry_resumes_after_partial_multi_image_failure(tmp_path: Path) -> None:
+    service, repository, generation_id, image_path, _, adapter = _fixture(tmp_path)
+    created_at = datetime(2026, 8, 7, 15, 30, tzinfo=UTC)
+    second_bytes = _png()
+    second_path = image_path.with_name("second.png")
+    second_path.write_bytes(second_bytes)
+    service._artifact_repository.add(  # type: ignore[attr-defined]
+        GenerationArtifact(
+            id=uuid4(),
+            generation_id=generation_id,
+            artifact_type=ArtifactType.IMAGE,
+            local_path="generations/2026-08-08/generated/second.png",
+            sha256=hashlib.sha256(second_bytes).hexdigest(),
+            size_bytes=len(second_bytes),
+            width=64,
+            height=64,
+            mime_type="image/png",
+            created_at=created_at,
+            display_order=1,
+        )
+    )
+    pending = service.enqueue_generation(generation_id)
+    assert pending is not None
+    adapter.fail_relative_path = pending.artifacts[1].remote_image_path
+    first_job = repository.claim_next("worker-1", 120)
+    assert first_job is not None
+    failed = asyncio.run(service.process_job(first_job, "worker-1"))
+    assert failed is not None and failed.status is DriveSyncStatus.FAILED
+    assert failed.artifacts[0].image_synced is True
+    assert failed.artifacts[1].image_synced is False
+    calls_before_retry = len(adapter.calls)
+
+    adapter.fail_relative_path = None
+    retried, retry_job = service.retry_generation(generation_id)
+    assert retried.status is DriveSyncStatus.PENDING
+    assert retry_job is not None
+    claimed_retry = repository.claim_next("worker-1", 120)
+    assert claimed_retry is not None
+    completed = asyncio.run(service.process_job(claimed_retry, "worker-1"))
+    assert completed is not None and completed.status is DriveSyncStatus.SYNCED
+    retry_calls = adapter.calls[calls_before_retry:]
+    assert pending.artifacts[0].remote_image_path not in {call[2] for call in retry_calls}
+    assert all(item.image_synced and item.metadata_synced for item in completed.artifacts)
     after_capacity = service.capacity()
     assert after_capacity.unsynced_bytes == 0
-    assert after_capacity.synced_cache_bytes == record.image_size_bytes + record.metadata_size_bytes
+    assert after_capacity.synced_cache_bytes == sum(
+        item.image_size_bytes for item in completed.artifacts
+    ) + (completed.artifacts[0].metadata_size_bytes or 0)
     assert len(service.cache_candidates()) == 1
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Protocol
 from uuid import UUID, uuid4
@@ -13,6 +14,16 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from runpod_sdxl_image_studio.adapters.database.engine import session_scope
 from runpod_sdxl_image_studio.adapters.database.models import InteractiveGenerationRunModel
+from runpod_sdxl_image_studio.adapters.database.repositories.generation_dispatch_queue_repository import (  # noqa: E501
+    GenerationDispatchQueueRepository,
+    GenerationDispatchQueueRepositoryError,
+    _begin_immediate_if_sqlite,
+)
+from runpod_sdxl_image_studio.domain.generation_queue import (
+    BatchSeedStrategy,
+    GenerationBatch,
+    GenerationQueueItem,
+)
 from runpod_sdxl_image_studio.domain.generation_snapshot import (
     GenerationSettingsSnapshot,
     SnapshotError,
@@ -38,6 +49,22 @@ class InteractiveRunRepositoryProtocol(Protocol):
         run_id: UUID | None = None,
         created_at: datetime | None = None,
     ) -> InteractiveGenerationRun: ...
+
+    def create_active_with_batch(
+        self,
+        snapshots: Sequence[GenerationSettingsSnapshot],
+        *,
+        batch_count: int,
+        batch_size: int,
+        client_local_date: str,
+        name: str,
+        seed_strategy: BatchSeedStrategy,
+        start_seed: int | None,
+        seed_step: int,
+        pending_limit: int | None,
+        run_id: UUID | None = None,
+        created_at: datetime | None = None,
+    ) -> tuple[InteractiveGenerationRun, GenerationBatch, tuple[GenerationQueueItem, ...]]: ...
 
     def get_active(self) -> InteractiveGenerationRun | None: ...
 
@@ -116,6 +143,84 @@ class InteractiveRunRepository(InteractiveRunRepositoryProtocol):
             ) from exc
         except (SQLAlchemyError, SnapshotError, ValueError) as exc:
             raise InteractiveRunRepositoryError("interactive run could not be created") from exc
+
+    def create_active_with_batch(
+        self,
+        snapshots: Sequence[GenerationSettingsSnapshot],
+        *,
+        batch_count: int,
+        batch_size: int,
+        client_local_date: str,
+        name: str,
+        seed_strategy: BatchSeedStrategy,
+        start_seed: int | None,
+        seed_step: int,
+        pending_limit: int | None,
+        run_id: UUID | None = None,
+        created_at: datetime | None = None,
+    ) -> tuple[InteractiveGenerationRun, GenerationBatch, tuple[GenerationQueueItem, ...]]:
+        """Create an interactive run and its complete queue projection atomically."""
+
+        if len(snapshots) != batch_count:
+            raise InteractiveRunRepositoryError(
+                "interactive generation count does not match snapshots"
+            )
+        if not 1 <= batch_count <= 100 or not 1 <= batch_size <= 4:
+            raise InteractiveRunRepositoryError("interactive batch values are invalid")
+        timestamp = _utc(created_at or datetime.now(UTC))
+        identifier = run_id or uuid4()
+        queue_repository = GenerationDispatchQueueRepository(self._session_factory)
+        try:
+            with session_scope(self._session_factory) as session:
+                _begin_immediate_if_sqlite(session)
+                row = InteractiveGenerationRunModel(
+                    id=str(identifier),
+                    status=InteractiveRunStatus.ACTIVE.value,
+                    batch_count=batch_count,
+                    batch_size=batch_size,
+                    settings_snapshot_json=snapshots[0].to_json(),
+                    snapshot_schema_version=snapshots[0].schema_version,
+                    client_local_date=client_local_date,
+                    generation_ids_json="[]",
+                    completed_generation_ids_json="[]",
+                    created_at=timestamp,
+                    updated_at=timestamp,
+                )
+                session.add(row)
+                session.flush()
+                batch, items = queue_repository.enqueue_batch_in_session(
+                    session,
+                    snapshots,
+                    name=name,
+                    seed_strategy=seed_strategy,
+                    start_seed=start_seed,
+                    seed_step=seed_step,
+                    pending_limit=pending_limit,
+                    enqueued_at=timestamp,
+                )
+                generation_ids = tuple(item.generation.id for item in items)
+                row.generation_ids_json = json.dumps(
+                    [str(value) for value in generation_ids], separators=(",", ":")
+                )
+                row.current_generation_id = str(generation_ids[0])
+                row.updated_at = timestamp
+                session.flush()
+                return _to_domain(row), batch, items
+        except InteractiveRunRepositoryError:
+            raise
+        except IntegrityError as exc:
+            raise InteractiveRunRepositoryError(
+                "another interactive run is already active"
+            ) from exc
+        except (
+            GenerationDispatchQueueRepositoryError,
+            SQLAlchemyError,
+            SnapshotError,
+            ValueError,
+        ) as exc:
+            raise InteractiveRunRepositoryError(
+                "interactive run and batch could not be created"
+            ) from exc
 
     def get_active(self) -> InteractiveGenerationRun | None:
         try:

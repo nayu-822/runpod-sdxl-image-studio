@@ -195,6 +195,16 @@ async def test_startup_handler_applies_exact_form_and_visible_lora_rows_after_re
         height=1216,
         steps=30,
         cfg_scale=6.5,
+        clip_skip=2,
+        hires_fix=True,
+        hires_scale=1.75,
+        hires_resize_method="bicubic",
+        hires_steps=19,
+        hires_cfg_scale=7.25,
+        hires_sampler_name="heun",
+        hires_scheduler_name="karras",
+        hires_denoise=0.3,
+        final_upscale=True,
         sampler_name="euler",
         scheduler_name="normal",
         checkpoint_name="checkpoints/A.safetensors",
@@ -255,6 +265,17 @@ async def test_startup_handler_applies_exact_form_and_visible_lora_rows_after_re
     assert result[second_row + 3].value == 0.5
     assert result[2 + capability_count] == "restored positive"
     assert result[3 + capability_count] == "restored negative"
+    form_start = 2 + capability_count
+    assert result[form_start + 8] == 2
+    assert result[form_start + 9] is True
+    assert result[form_start + 10] == 1.75
+    assert result[form_start + 11] == "bicubic"
+    assert result[form_start + 12] == 19
+    assert result[form_start + 13] == 7.25
+    assert result[form_start + 14] == "heun"
+    assert result[form_start + 15] == "karras"
+    assert result[form_start + 16] == 0.3
+    assert result[form_start + 17] is True
     assert result[-1] is True
 
     # The runtime snapshot is process-common, while the applied bit belongs

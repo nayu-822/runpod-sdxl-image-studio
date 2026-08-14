@@ -239,6 +239,17 @@ def make_metadata_generation_apply_handler(
                 settings.cfg_scale,
                 gr.Dropdown(value=settings.sampler_name),
                 gr.Dropdown(value=settings.scheduler_name),
+                gr.Dropdown(value=settings.final_upscale_model),
+                settings.clip_skip,
+                settings.hires_fix,
+                settings.hires_scale,
+                settings.hires_resize_method,
+                settings.hires_steps,
+                settings.hires_cfg_scale,
+                settings.hires_sampler_name,
+                settings.hires_scheduler_name,
+                settings.hires_denoise,
+                settings.final_upscale,
                 lora_state,
                 *render_state_updates(lora_state, lora_choices, max_loras),
                 None,
@@ -400,7 +411,7 @@ def _import_internal_error_outputs() -> tuple[object, ...]:
 def _restore_error_outputs(max_loras: int) -> tuple[object, ...]:
     return (
         "metadataから生成条件を復元できませんでした。",
-        *([gr.skip()] * (12 + component_output_count(max_loras))),
+        *([gr.skip()] * (23 + component_output_count(max_loras))),
         None,
         False,
     )

@@ -72,6 +72,31 @@ class DriveRemotePaths:
 
 
 @dataclass(frozen=True)
+class DriveSyncArtifact:
+    """Durable transfer plan and per-image progress for one Generation."""
+
+    display_order: int
+    image_artifact_id: UUID
+    remote_image_path: str
+    image_sha256: str
+    image_size_bytes: int
+    metadata_artifact_id: UUID | None
+    remote_metadata_path: str | None
+    metadata_sha256: str | None
+    metadata_size_bytes: int | None
+    image_synced: bool = False
+    metadata_synced: bool = False
+
+    def __post_init__(self) -> None:
+        if self.display_order < 0:
+            raise ValueError("display order must not be negative")
+        if self.image_size_bytes < 0:
+            raise ValueError("image size must not be negative")
+        if self.metadata_size_bytes is not None and self.metadata_size_bytes < 0:
+            raise ValueError("metadata size must not be negative")
+
+
+@dataclass(frozen=True)
 class SyncRecord:
     id: UUID
     generation_id: UUID
@@ -93,6 +118,7 @@ class SyncRecord:
     error_summary: str | None
     created_at: datetime
     updated_at: datetime
+    artifacts: tuple[DriveSyncArtifact, ...] = ()
 
 
 DriveSyncRecord = SyncRecord
@@ -127,6 +153,7 @@ class DriveSyncJob:
     metadata_size_bytes: int | None
     created_at: datetime
     updated_at: datetime
+    artifacts: tuple[DriveSyncArtifact, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -249,6 +276,18 @@ def build_remote_paths(
     )
 
 
+def build_remote_image_path(paths: DriveRemotePaths, display_order: int, image_count: int) -> str:
+    """Return a collision-free image path while preserving old single-image paths."""
+
+    if display_order < 0 or image_count < 1 or display_order >= image_count:
+        raise ValueError("remote image path indexes are invalid")
+    if image_count == 1:
+        return paths.image_path
+    suffix = f"_{display_order + 1:06d}"
+    stem, extension = paths.image_path.rsplit(".", 1)
+    return f"{stem}{suffix}.{extension}"
+
+
 def validate_remote_relative_path(value: str) -> str:
     normalized = value.replace("\\", "/")
     path = PurePosixPath(normalized)
@@ -275,6 +314,7 @@ __all__ = [
     "DriveManifestState",
     "DriveConnectionStatus",
     "DriveRemotePaths",
+    "DriveSyncArtifact",
     "DriveSyncErrorCode",
     "DriveSyncJob",
     "DriveSyncProgress",
@@ -282,6 +322,7 @@ __all__ = [
     "DriveSyncStatus",
     "SyncRecord",
     "build_remote_paths",
+    "build_remote_image_path",
     "validate_remote_base_path",
     "validate_remote_name",
     "validate_remote_relative_path",

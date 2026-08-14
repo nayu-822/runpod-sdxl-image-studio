@@ -1576,12 +1576,23 @@ def _validate_generation(
         raise WorkflowError("LoRA loading is unavailable in ComfyUI")
     if settings.clip_skip > 1 and "CLIPSetLastLayer" not in node_classes:
         raise WorkflowError("CLIP skip is unavailable in ComfyUI")
-    if settings.hires_fix and "LatentUpscale" not in node_classes:
+    if settings.hires_fix and (
+        "ImageScaleBy" not in node_classes
+        or "VAEEncode" not in node_classes
+        or "VAEDecode" not in node_classes
+    ):
         raise WorkflowError("Hires.fix is unavailable in ComfyUI")
     if settings.hires_fix and settings.width * settings.hires_scale > limits.max_width:
         raise WorkflowError("Hires.fix width exceeds the configured limit")
     if settings.hires_fix and settings.height * settings.hires_scale > limits.max_height:
         raise WorkflowError("Hires.fix height exceeds the configured limit")
+    hires_pixels = settings.width * settings.hires_scale * settings.height * settings.hires_scale
+    if settings.hires_fix and hires_pixels > limits.max_pixels:
+        raise WorkflowError("Hires.fix image area exceeds the configured limit")
+    if settings.hires_fix and settings.hires_sampler_name not in samplers:
+        raise WorkflowError("Selected Hires.fix sampler is unavailable")
+    if settings.hires_fix and settings.hires_scheduler_name not in schedulers:
+        raise WorkflowError("Selected Hires.fix scheduler is unavailable")
     if settings.final_upscale:
         if "UpscaleModelLoader" not in node_classes or "ImageUpscaleWithModel" not in node_classes:
             raise WorkflowError("Final upscaling is unavailable in ComfyUI")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import ntpath
 import posixpath
 import re
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -31,6 +32,11 @@ class GenerationSettings(BaseModel):
     hires_fix: bool = False
     hires_scale: float = Field(default=1.5, ge=1.0, le=4.0)
     hires_denoise: float = Field(default=0.4, ge=0.0, le=1.0)
+    hires_resize_method: Literal["lanczos", "nearest-exact", "bilinear", "bicubic"] = "lanczos"
+    hires_steps: int = Field(default=20, ge=1, le=150)
+    hires_cfg_scale: float = Field(default=5.5, ge=0.0, le=30.0)
+    hires_sampler_name: str = Field(default="euler", min_length=1)
+    hires_scheduler_name: str = Field(default="normal", min_length=1)
     final_upscale: bool = False
     final_upscale_model: str | None = None
     client_local_date: str | None = None
@@ -42,7 +48,13 @@ class GenerationSettings(BaseModel):
     workflow_template_id: str = Field(default="sdxl_txt2img", min_length=1)
     workflow_template_version: str = Field(default="2.0", min_length=1)
 
-    @field_validator("sampler_name", "scheduler_name", "checkpoint_name")
+    @field_validator(
+        "sampler_name",
+        "scheduler_name",
+        "checkpoint_name",
+        "hires_sampler_name",
+        "hires_scheduler_name",
+    )
     @classmethod
     def reject_blank_model_values(cls, value: str) -> str:
         if not value.strip():

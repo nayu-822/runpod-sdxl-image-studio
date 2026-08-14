@@ -118,6 +118,13 @@ class GenerationTabComponents:
     cfg_scale: gr.Number
     clip_skip: gr.Number
     hires_fix: gr.Checkbox
+    hires_scale: gr.Number
+    hires_resize_method: gr.Dropdown
+    hires_steps: gr.Number
+    hires_cfg_scale: gr.Number
+    hires_sampler: gr.Textbox
+    hires_scheduler: gr.Textbox
+    hires_denoise: gr.Number
     final_upscale: gr.Checkbox
     generate_button: gr.Button
     batch_count: gr.Number
@@ -373,6 +380,21 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
             clip_skip = gr.Number(value=1, precision=0, minimum=1, maximum=12, label="CLIP skip")
         with gr.Row(elem_classes=["size-dimensions"]):
             hires_fix = gr.Checkbox(value=False, label="Hires.fix")
+            hires_scale = gr.Number(value=1.5, minimum=1.0, maximum=4.0, label="Hires倍率")
+            hires_resize_method = gr.Dropdown(
+                ["lanczos", "nearest-exact", "bilinear", "bicubic"],
+                value="lanczos",
+                label="Hires resize",
+            )
+            hires_denoise = gr.Number(value=0.4, minimum=0.0, maximum=1.0, label="Hires denoise")
+        with gr.Row(elem_classes=["size-dimensions"]):
+            hires_steps = gr.Number(
+                value=20, precision=0, minimum=1, maximum=150, label="Hires Steps"
+            )
+            hires_cfg_scale = gr.Number(value=5.5, label="Hires CFG")
+            hires_sampler = gr.Textbox(value="euler", label="Hires sampler")
+            hires_scheduler = gr.Textbox(value="normal", label="Hires scheduler")
+        with gr.Row(elem_classes=["size-dimensions"]):
             final_upscale = gr.Checkbox(value=False, label="Final 4x upscale")
         with gr.Row(elem_classes=["size-dimensions"]):
             sampler = gr.Dropdown([], label="Sampler", interactive=False)
@@ -440,6 +462,13 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
         cfg_scale=cfg_scale,
         clip_skip=clip_skip,
         hires_fix=hires_fix,
+        hires_scale=hires_scale,
+        hires_resize_method=hires_resize_method,
+        hires_steps=hires_steps,
+        hires_cfg_scale=hires_cfg_scale,
+        hires_sampler=hires_sampler,
+        hires_scheduler=hires_scheduler,
+        hires_denoise=hires_denoise,
         final_upscale=final_upscale,
         generate_button=generate_button,
         batch_count=batch_count,
@@ -716,7 +745,7 @@ def make_startup_restore_handler(
     """Apply the desired form only after background model preparation is terminal."""
 
     capability_count = len(capability_refresh_outputs(generation))
-    form_tail_count = 9
+    form_tail_count = 19
 
     async def handler(
         checkpoint: str | None,
@@ -805,6 +834,16 @@ def make_startup_restore_handler(
             snapshot.height,
             snapshot.steps,
             snapshot.cfg_scale,
+            snapshot.clip_skip,
+            snapshot.hires_fix,
+            snapshot.hires_scale,
+            snapshot.hires_resize_method,
+            snapshot.hires_steps,
+            snapshot.hires_cfg_scale,
+            snapshot.hires_sampler_name,
+            snapshot.hires_scheduler_name,
+            snapshot.hires_denoise,
+            snapshot.final_upscale,
             snapshot.model_dump(mode="json"),
             True,
         )
@@ -836,6 +875,17 @@ def make_generate_handler(
         restored_from_generation_id: str | None = None,
         regeneration_valid: bool = False,
         regeneration_requested: bool = False,
+        clip_skip: float | int = 1,
+        hires_fix: bool = False,
+        hires_scale: float | int = 1.5,
+        hires_resize_method: str = "lanczos",
+        hires_steps: float | int = 20,
+        hires_cfg_scale: float | int = 5.5,
+        hires_sampler: str | None = "euler",
+        hires_scheduler: str | None = "normal",
+        hires_denoise: float | int = 0.4,
+        final_upscale: bool = False,
+        upscaler: str | None = None,
         progress: gr.Progress = _DEFAULT_PROGRESS,
     ) -> tuple[object, ...]:
         del size_preset
@@ -863,6 +913,17 @@ def make_generate_handler(
                 seed=-1 if seed_mode == "Random" else int(seed),
                 steps=int(steps),
                 cfg_scale=float(cfg_scale),
+                clip_skip=int(clip_skip),
+                hires_fix=bool(hires_fix),
+                hires_scale=float(hires_scale),
+                hires_resize_method=hires_resize_method,
+                hires_steps=int(hires_steps),
+                hires_cfg_scale=float(hires_cfg_scale),
+                hires_sampler_name=hires_sampler or "euler",
+                hires_scheduler_name=hires_scheduler or "normal",
+                hires_denoise=float(hires_denoise),
+                final_upscale=bool(final_upscale),
+                final_upscale_model=upscaler if final_upscale else None,
             )
         except (TypeError, ValueError, ValidationError):
             return (
@@ -979,6 +1040,16 @@ def make_enqueue_handler(
         regeneration_valid: bool = False,
         regeneration_requested: bool = False,
         upscaler: str | None = None,
+        clip_skip: float | int = 1,
+        hires_fix: bool = False,
+        hires_scale: float | int = 1.5,
+        hires_resize_method: str = "lanczos",
+        hires_steps: float | int = 20,
+        hires_cfg_scale: float | int = 5.5,
+        hires_sampler: str | None = "euler",
+        hires_scheduler: str | None = "normal",
+        hires_denoise: float | int = 0.4,
+        final_upscale: bool = False,
     ) -> tuple[object, object, object, object, object, object]:
         del size_preset
 
@@ -1007,6 +1078,17 @@ def make_enqueue_handler(
                 seed=-1 if seed_mode == "Random" else int(seed),
                 steps=int(steps),
                 cfg_scale=float(cfg_scale),
+                clip_skip=int(clip_skip),
+                hires_fix=bool(hires_fix),
+                hires_scale=float(hires_scale),
+                hires_resize_method=hires_resize_method,
+                hires_steps=int(hires_steps),
+                hires_cfg_scale=float(hires_cfg_scale),
+                hires_sampler_name=hires_sampler or "euler",
+                hires_scheduler_name=hires_scheduler or "normal",
+                hires_denoise=float(hires_denoise),
+                final_upscale=bool(final_upscale),
+                final_upscale_model=upscaler if final_upscale else None,
             )
         except (TypeError, ValueError, ValidationError):
             return failure("入力値を確認してください。")
@@ -1072,6 +1154,16 @@ def make_enqueue_handler(
                         vae_name=vae,
                         upscaler_name=upscaler,
                         loras=loras,
+                        clip_skip=int(clip_skip),
+                        hires_fix=bool(hires_fix),
+                        hires_scale=float(hires_scale),
+                        hires_resize_method=hires_resize_method,
+                        hires_steps=int(hires_steps),
+                        hires_cfg_scale=float(hires_cfg_scale),
+                        hires_sampler_name=hires_sampler or "euler",
+                        hires_scheduler_name=hires_scheduler or "normal",
+                        hires_denoise=float(hires_denoise),
+                        final_upscale=bool(final_upscale),
                     )
                 )
             except Exception:  # noqa: BLE001 - enqueue success must remain durable
@@ -1116,6 +1208,16 @@ def make_batch_enqueue_handler(
         seed_step: float | int,
         name: str,
         upscaler: str | None = None,
+        clip_skip: float | int = 1,
+        hires_fix: bool = False,
+        hires_scale: float | int = 1.5,
+        hires_resize_method: str = "lanczos",
+        hires_steps: float | int = 20,
+        hires_cfg_scale: float | int = 5.5,
+        hires_sampler: str | None = "euler",
+        hires_scheduler: str | None = "normal",
+        hires_denoise: float | int = 0.4,
+        final_upscale: bool = False,
     ) -> tuple[object, ...]:
         try:
             settings = GenerationSettings(
@@ -1131,6 +1233,17 @@ def make_batch_enqueue_handler(
                 seed=-1 if seed_mode == "Random" else int(seed),
                 steps=int(steps),
                 cfg_scale=float(cfg_scale),
+                clip_skip=int(clip_skip),
+                hires_fix=bool(hires_fix),
+                hires_scale=float(hires_scale),
+                hires_resize_method=hires_resize_method,
+                hires_steps=int(hires_steps),
+                hires_cfg_scale=float(hires_cfg_scale),
+                hires_sampler_name=hires_sampler or "euler",
+                hires_scheduler_name=hires_scheduler or "normal",
+                hires_denoise=float(hires_denoise),
+                final_upscale=bool(final_upscale),
+                final_upscale_model=upscaler if final_upscale else None,
             )
             preflight_message = ""
             if preflight_service is not None:
@@ -1184,6 +1297,16 @@ def make_batch_enqueue_handler(
                         vae_name=vae,
                         upscaler_name=upscaler,
                         loras=lora_settings_from_state(lora_state, max_loras=max_loras),
+                        clip_skip=int(clip_skip),
+                        hires_fix=bool(hires_fix),
+                        hires_scale=float(hires_scale),
+                        hires_resize_method=hires_resize_method,
+                        hires_steps=int(hires_steps),
+                        hires_cfg_scale=float(hires_cfg_scale),
+                        hires_sampler_name=hires_sampler or "euler",
+                        hires_scheduler_name=hires_scheduler or "normal",
+                        hires_denoise=float(hires_denoise),
+                        final_upscale=bool(final_upscale),
                     )
                 )
             except Exception:  # noqa: BLE001 - queue success must remain durable
@@ -1226,6 +1349,13 @@ def make_interactive_start_handler(
         upscaler: str | None,
         clip_skip: float | int,
         hires_fix: bool,
+        hires_scale: float | int,
+        hires_resize_method: str,
+        hires_steps: float | int,
+        hires_cfg_scale: float | int,
+        hires_sampler: str | None,
+        hires_scheduler: str | None,
+        hires_denoise: float | int,
         final_upscale: bool,
         client_local_date: str | None,
     ) -> tuple[object, ...]:
@@ -1246,6 +1376,13 @@ def make_interactive_start_handler(
                 cfg_scale=float(cfg_scale),
                 clip_skip=int(clip_skip),
                 hires_fix=bool(hires_fix),
+                hires_scale=float(hires_scale),
+                hires_resize_method=hires_resize_method,
+                hires_steps=int(hires_steps),
+                hires_cfg_scale=float(hires_cfg_scale),
+                hires_sampler_name=hires_sampler or "euler",
+                hires_scheduler_name=hires_scheduler or "normal",
+                hires_denoise=float(hires_denoise),
                 final_upscale=bool(final_upscale),
                 final_upscale_model=upscaler if final_upscale else None,
             )

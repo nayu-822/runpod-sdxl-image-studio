@@ -681,14 +681,24 @@ Generation、Job、複数画像ArtifactをSQLite transactionで確定します�
 
 対話的実行は`interactive_generation_runs`へ保存され、同時にactiveにできるrunは
 1件だけです。開始、進捗復元、キャンセル、再起動後のactiveまたは最新completed
-batchの復元をアプリケーションサービス経由で行います。既に送信済みのpromptを
-再送信せず、キャンセル時は既存のqueue reconciliationを利用します。
+batchの復元をアプリケーションサービス経由で行います。run、batch、Generation、
+Job、Queue entry、runへのGeneration紐付けは1回のSQLite transactionで確定し、
+途中失敗時は全てrollbackします。既に送信済みのpromptを再送信せず、キャンセル時は
+既存のqueue reconciliationを利用します。
 
 txt2img workflowでは複数LoRA、CLIP skip、Hires.fix、任意の最終4x upscale、
-ComfyUIのbatch sizeを固定templateの範囲内で扱います。クライアントのAsia/Tokyo
-日付を受け取った場合は`generations/YYYY-MM-DD/{generated,upscaled}`配下で
-6桁連番をexclusive createし、同時実行時の同名上書きを防止します。日付が不正な
-場合は保存せず失敗させます。
+ComfyUIのbatch sizeを固定templateの範囲内で扱います。Hires.fixは
+`KSampler -> VAEDecode -> ImageScaleBy(lanczos) -> VAEEncode -> Hires KSampler ->
+VAEDecode`のグラフで、scale、resize method、steps、CFG、sampler、scheduler、
+denoiseをsnapshotへ保存します。ブラウザのローカル日付は対話的開始クリック
+ごとにブラウザから取得し、`generations/YYYY-MM-DD/000001.png`の6桁連番を
+generated/upscaled共通でexclusive createします。日付が不正、保存先外、または同名
+の場合は保存せず失敗させます。通常のサーバー日付保存では従来どおりgenerated/
+upscaledを分離します。
+
+Drive同期は1 Generationの全ての`IMAGE` Artifactを`display_order`順に転送し、
+画像とmetadataが全て完了した後だけsyncedへ確定します。個別転送の進捗とmanifestの
+画像一覧はSQLiteへ保存し、途中失敗時は成功済み画像を再転送せずに再開できます。
 
 Phase Aの自動検証はFake、SQLite、Alembic、Playwrightのbrowser testを使用し、
 実GPU、実ComfyUI、実RunPod、実Google Driveへの接続を必要としません。

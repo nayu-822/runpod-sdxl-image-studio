@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from typing import Protocol
 from uuid import UUID, uuid4
@@ -27,6 +28,7 @@ from runpod_sdxl_image_studio.domain.drive_sync import (
     DriveDestination,
     DriveManifestJob,
     DriveManifestState,
+    DriveSyncArtifact,
     DriveSyncErrorCode,
     DriveSyncJob,
     DriveSyncProgress,
@@ -67,6 +69,7 @@ class DriveManifestRecord:
     synced_at: datetime
     remote_name: str
     remote_base_path: str
+    artifacts: tuple[DriveSyncArtifact, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -112,6 +115,14 @@ class DriveSyncRepositoryProtocol(Protocol):
     def mark_process_finished(self, job_id: UUID, worker_id: str) -> bool: ...
 
     def mark_synced(self, job_id: UUID, worker_id: str, synced_at: datetime) -> DriveSyncRecord: ...
+
+    def mark_artifact_synced(
+        self,
+        job_id: UUID,
+        worker_id: str,
+        display_order: int,
+        artifact_kind: str,
+    ) -> bool: ...
 
     def mark_failed(
         self,
@@ -377,6 +388,47 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
         except (SQLAlchemyError, ValueError) as exc:
             raise DriveSyncRepositoryError("drive sync progress could not be saved") from exc
 
+    def mark_artifact_synced(
+        self,
+        job_id: UUID,
+        worker_id: str,
+        display_order: int,
+        artifact_kind: str,
+    ) -> bool:
+        """Persist one completed image/metadata transfer without closing the job."""
+
+        if artifact_kind not in {"image", "metadata"} or display_order < 0:
+            raise DriveSyncRepositoryError("drive sync artifact progress is invalid")
+        try:
+            with session_scope(self._session_factory) as session:
+                job = session.get(DriveSyncJobModel, str(job_id))
+                if (
+                    job is None
+                    or job.status != DriveSyncStatus.SYNCING.value
+                    or job.worker_id != worker_id
+                ):
+                    return False
+                record = session.get(DriveSyncRecordModel, job.sync_record_id)
+                if record is None:
+                    raise DriveSyncRepositoryError("drive sync record was not found")
+                job_items = _sync_artifacts_from_row(job, status=job.status)
+                record_items = _sync_artifacts_from_row(record, status=record.status)
+                job_items = _set_artifact_progress(job_items, display_order, artifact_kind)
+                record_items = _set_artifact_progress(record_items, display_order, artifact_kind)
+                job.artifacts_json = _artifacts_json(job_items)
+                record.artifacts_json = _artifacts_json(record_items)
+                now = datetime.now(UTC)
+                job.updated_at = now
+                record.updated_at = now
+                session.flush()
+                return True
+        except DriveSyncRepositoryError:
+            raise
+        except (SQLAlchemyError, ValueError, TypeError) as exc:
+            raise DriveSyncRepositoryError(
+                "drive sync artifact progress could not be saved"
+            ) from exc
+
     def mark_process_started(self, job_id: UUID, worker_id: str, pid: int) -> bool:
         try:
             with session_scope(self._session_factory) as session:
@@ -419,6 +471,13 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
                     if record.status == DriveSyncStatus.SYNCED.value:
                         return _record_domain(record)
                     raise DriveSyncRepositoryError("drive sync job is no longer active")
+                items = _sync_artifacts_from_row(row, status=row.status)
+                if not items or not all(
+                    item.image_synced and item.metadata_synced for item in items
+                ):
+                    raise DriveSyncRepositoryError(
+                        "all Drive image and metadata artifacts must be synced first"
+                    )
                 row.status = DriveSyncStatus.SYNCED.value
                 row.progress_bytes = row.total_bytes
                 row.progress_percentage = 100.0
@@ -431,11 +490,13 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
                 row.error_code = None
                 row.error_summary = None
                 row.retryable = False
+                row.artifacts_json = _artifacts_json(items)
                 row.updated_at = timestamp
                 record.status = DriveSyncStatus.SYNCED.value
                 record.synced_at = timestamp
                 record.error_code = None
                 record.error_summary = None
+                record.artifacts_json = _artifacts_json(items)
                 record.updated_at = timestamp
                 session.flush()
                 return _record_domain(record)
@@ -1069,6 +1130,7 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
                         or record.synced_at is None
                     ):
                         continue
+                    artifacts = _sync_artifacts_from_row(record, status=record.status)
                     result.append(
                         DriveManifestRecord(
                             generation_id=UUID(record.generation_id),
@@ -1083,6 +1145,7 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
                             synced_at=_utc(record.synced_at),
                             remote_name=record.remote_name,
                             remote_base_path=record.remote_base_path,
+                            artifacts=artifacts,
                         )
                     )
                 return tuple(result)
@@ -1116,7 +1179,10 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
                     entry = grouped[str(generation_id)]
                     entry.setdefault("status", status)
                     if artifact_type in {ArtifactType.IMAGE.value, ArtifactType.METADATA.value}:
-                        entry.setdefault(artifact_type, int(size))
+                        previous = entry.get(artifact_type)
+                        entry[artifact_type] = (previous if isinstance(previous, int) else 0) + int(
+                            size
+                        )
                 unsynced = 0
                 synced = 0
                 for entry in grouped.values():
@@ -1169,7 +1235,7 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
                     key = str(generation_id)
                     grouped.setdefault(key, (UUID(key), kind, _utc(created_at)))
                     if artifact_type in {ArtifactType.IMAGE.value, ArtifactType.METADATA.value}:
-                        sizes[key].setdefault(artifact_type, int(size))
+                        sizes[key][artifact_type] = sizes[key].get(artifact_type, 0) + int(size)
                 result = [
                     DriveCacheCandidate(
                         generation_id,
@@ -1252,6 +1318,7 @@ def _record_model(record: DriveSyncRecord) -> DriveSyncRecordModel:
         metadata_sha256=record.metadata_sha256,
         image_size_bytes=record.image_size_bytes,
         metadata_size_bytes=record.metadata_size_bytes,
+        artifacts_json=_artifacts_json(record.artifacts),
         attempt_count=record.attempt_count,
         last_attempt_at=record.last_attempt_at,
         synced_at=record.synced_at,
@@ -1278,6 +1345,7 @@ def _copy_record_values(
     row.metadata_sha256 = record.metadata_sha256
     row.image_size_bytes = record.image_size_bytes
     row.metadata_size_bytes = record.metadata_size_bytes
+    row.artifacts_json = _artifacts_json(record.artifacts)
     row.updated_at = datetime.now(UTC)
 
 
@@ -1311,6 +1379,7 @@ def _job_model(job: DriveSyncJob, record_id: str, session: Session) -> DriveSync
         metadata_sha256=job.metadata_sha256,
         image_size_bytes=job.image_size_bytes,
         metadata_size_bytes=job.metadata_size_bytes,
+        artifacts_json=_artifacts_json(job.artifacts),
         created_at=utc(job.created_at),
         updated_at=utc(job.updated_at),
     )
@@ -1367,6 +1436,7 @@ def _record_domain(row: DriveSyncRecordModel) -> DriveSyncRecord:
         error_summary=row.error_summary,
         created_at=utc(row.created_at),
         updated_at=utc(row.updated_at),
+        artifacts=_sync_artifacts_from_row(row, status=row.status),
     )
 
 
@@ -1399,7 +1469,132 @@ def _job_domain(row: DriveSyncJobModel) -> DriveSyncJob:
         metadata_size_bytes=row.metadata_size_bytes,
         created_at=utc(row.created_at),
         updated_at=utc(row.updated_at),
+        artifacts=_sync_artifacts_from_row(row, status=row.status),
     )
+
+
+def _artifacts_json(artifacts: tuple[DriveSyncArtifact, ...]) -> str | None:
+    if not artifacts:
+        return None
+    return json.dumps(
+        [
+            {
+                "display_order": item.display_order,
+                "image_artifact_id": str(item.image_artifact_id),
+                "remote_image_path": item.remote_image_path,
+                "image_sha256": item.image_sha256,
+                "image_size_bytes": item.image_size_bytes,
+                "metadata_artifact_id": (
+                    str(item.metadata_artifact_id)
+                    if item.metadata_artifact_id is not None
+                    else None
+                ),
+                "remote_metadata_path": item.remote_metadata_path,
+                "metadata_sha256": item.metadata_sha256,
+                "metadata_size_bytes": item.metadata_size_bytes,
+                "image_synced": item.image_synced,
+                "metadata_synced": item.metadata_synced,
+            }
+            for item in artifacts
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _sync_artifacts_from_row(row: object, *, status: str) -> tuple[DriveSyncArtifact, ...]:
+    payload = getattr(row, "artifacts_json", None)
+    if payload:
+        values = json.loads(payload)
+        if not isinstance(values, list) or not values:
+            raise ValueError("stored Drive artifact plan is invalid")
+        result = tuple(_sync_artifact_from_mapping(value) for value in values)
+        if tuple(item.display_order for item in result) != tuple(range(len(result))):
+            raise ValueError("stored Drive artifact order is invalid")
+        return result
+
+    image_id = getattr(row, "image_artifact_id", None)
+    if not isinstance(image_id, str):
+        return ()
+    metadata_id = getattr(row, "metadata_artifact_id", None)
+    raw_metadata_size = getattr(row, "metadata_size_bytes", None)
+    return (
+        DriveSyncArtifact(
+            display_order=0,
+            image_artifact_id=UUID(image_id),
+            remote_image_path=str(getattr(row, "remote_image_path", "")),
+            image_sha256=str(getattr(row, "image_sha256", "")),
+            image_size_bytes=int(getattr(row, "image_size_bytes", 0)),
+            metadata_artifact_id=UUID(metadata_id) if metadata_id else None,
+            remote_metadata_path=(
+                str(getattr(row, "remote_metadata_path", ""))
+                if getattr(row, "remote_metadata_path", None)
+                else None
+            ),
+            metadata_sha256=(
+                str(getattr(row, "metadata_sha256", ""))
+                if getattr(row, "metadata_sha256", None)
+                else None
+            ),
+            metadata_size_bytes=(raw_metadata_size if isinstance(raw_metadata_size, int) else None),
+            image_synced=status == DriveSyncStatus.SYNCED.value,
+            metadata_synced=(status == DriveSyncStatus.SYNCED.value and metadata_id is not None),
+        ),
+    )
+
+
+def _sync_artifact_from_mapping(value: object) -> DriveSyncArtifact:
+    if not isinstance(value, dict):
+        raise ValueError("stored Drive artifact is invalid")
+    try:
+        return DriveSyncArtifact(
+            display_order=int(value["display_order"]),
+            image_artifact_id=UUID(str(value["image_artifact_id"])),
+            remote_image_path=str(value["remote_image_path"]),
+            image_sha256=str(value["image_sha256"]),
+            image_size_bytes=int(value["image_size_bytes"]),
+            metadata_artifact_id=(
+                UUID(str(value["metadata_artifact_id"]))
+                if value.get("metadata_artifact_id")
+                else None
+            ),
+            remote_metadata_path=(
+                str(value["remote_metadata_path"]) if value.get("remote_metadata_path") else None
+            ),
+            metadata_sha256=(
+                str(value["metadata_sha256"]) if value.get("metadata_sha256") else None
+            ),
+            metadata_size_bytes=(
+                int(value["metadata_size_bytes"])
+                if value.get("metadata_size_bytes") is not None
+                else None
+            ),
+            image_synced=bool(value.get("image_synced", False)),
+            metadata_synced=bool(value.get("metadata_synced", False)),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("stored Drive artifact is invalid") from exc
+
+
+def _set_artifact_progress(
+    artifacts: tuple[DriveSyncArtifact, ...], display_order: int, artifact_kind: str
+) -> tuple[DriveSyncArtifact, ...]:
+    for item in artifacts:
+        if item.display_order == display_order:
+            return tuple(
+                (
+                    replace(candidate, image_synced=True)
+                    if artifact_kind == "image" and candidate.display_order == display_order
+                    else (
+                        replace(candidate, metadata_synced=True)
+                        if artifact_kind == "metadata" and candidate.display_order == display_order
+                        else candidate
+                    )
+                )
+                for candidate in artifacts
+            )
+    raise DriveSyncRepositoryError("drive sync artifact was not found")
 
 
 def _manifest_job_domain(row: DriveManifestJobModel) -> DriveManifestJob:

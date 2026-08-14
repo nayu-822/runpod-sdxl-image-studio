@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import secrets
 from collections.abc import Callable
-from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
@@ -85,20 +84,11 @@ class InteractiveGenerationService:
                     "client_local_date": client_local_date,
                 }
             )
-            snapshot_settings = run_settings
-            if snapshot_settings.seed == RANDOM_SEED:
-                snapshot_settings = snapshot_settings.model_copy(
-                    update={"seed": secrets.randbelow(MAX_SEED + 1)}
-                )
-            snapshot = GenerationSettingsSnapshot.from_settings(snapshot_settings)
-            run = self._repository.create_active(
-                snapshot,
-                batch_count=batch_count,
-                batch_size=batch_size,
-                client_local_date=client_local_date,
-            )
         except (InteractiveRunRepositoryError, ValueError) as exc:
             raise InteractiveGenerationError(str(exc)) from exc
+        normalized_client_local_date = run_settings.client_local_date
+        if normalized_client_local_date is None:
+            raise InteractiveGenerationError("client local date is required")
 
         strategy = (
             BatchSeedStrategy.RANDOM
@@ -106,30 +96,35 @@ class InteractiveGenerationService:
             else BatchSeedStrategy.SEQUENTIAL
         )
         try:
-            queued = self._queue_service.enqueue_batch(
-                run_settings,
-                count=batch_count,
-                seed_strategy=strategy,
-                start_seed=None if strategy is BatchSeedStrategy.RANDOM else settings.seed,
-                seed_step=1,
-                name=name or "Interactive run",
+            seeds = (
+                tuple(secrets.randbelow(MAX_SEED + 1) for _ in range(batch_count))
+                if strategy is BatchSeedStrategy.RANDOM
+                else tuple(settings.seed + index for index in range(batch_count))
             )
-            generation_ids = tuple(item.generation.id for item in queued.items)
-            self._repository.attach_generations(run.id, generation_ids)
+            snapshots = tuple(
+                GenerationSettingsSnapshot.from_settings(
+                    run_settings.model_copy(update={"seed": seed})
+                )
+                for seed in seeds
+            )
+            run, _, _ = self._queue_service.run_with_enqueue_admission(
+                lambda: self._repository.create_active_with_batch(
+                    snapshots,
+                    batch_count=batch_count,
+                    batch_size=batch_size,
+                    client_local_date=normalized_client_local_date,
+                    name=name or "Interactive run",
+                    seed_strategy=strategy,
+                    start_seed=None if strategy is BatchSeedStrategy.RANDOM else settings.seed,
+                    seed_step=1,
+                    pending_limit=self._settings.queue_max_pending_jobs,
+                )
+            )
         except (
             GenerationQueueServiceError,
+            InteractiveRunRepositoryError,
             ValueError,
         ) as exc:
-            with suppress(InteractiveRunRepositoryError):
-                self._repository.update_progress(
-                    run.id,
-                    completed_generation_ids=(),
-                    current_generation_id=None,
-                    status=InteractiveRunStatus.FAILED,
-                    error_code="interactive_enqueue_failed",
-                    error_summary="interactive generations could not be queued",
-                    completed_at=datetime.now(UTC),
-                )
             raise InteractiveGenerationError("interactive generations could not be queued") from exc
         self._notify_state_change()
         return self.refresh(run.id) or self._view(run, (), None)

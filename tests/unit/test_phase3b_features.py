@@ -216,7 +216,7 @@ def test_preset_repository_service_crud_apply_and_ui_handlers() -> None:
         None,
         None,
     )
-    assert len(applied) == 17 + 7 * 2
+    assert len(applied) == preset_apply_output_count(2)
     assert applied[3] == "current, positive"
     engine.dispose()
 
@@ -364,7 +364,7 @@ def test_preset_apply_success_and_all_error_paths_keep_exact_output_count() -> N
 
     for max_loras in (1, 2, 8, 12):
         handler = make_preset_apply_handler(service, max_loras)
-        expected = 17 + 7 * max_loras
+        expected = preset_apply_output_count(max_loras)
         assert preset_apply_output_count(max_loras) == expected
         assert len(call(handler, str(generation.id))) == expected
         assert len(call(handler, None)) == expected
@@ -381,7 +381,7 @@ def test_preset_apply_success_and_all_error_paths_keep_exact_output_count() -> N
 
     broken_service = PresetService(BrokenRepository())  # type: ignore[arg-type]
     broken_handler = make_preset_apply_handler(broken_service, 1)
-    assert len(call(broken_handler, str(generation.id))) == 24
+    assert len(call(broken_handler, str(generation.id))) == preset_apply_output_count(1)
     engine.dispose()
 
 
