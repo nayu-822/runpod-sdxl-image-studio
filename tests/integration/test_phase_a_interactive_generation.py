@@ -42,6 +42,8 @@ from runpod_sdxl_image_studio.domain.generation import GenerationKind, Generatio
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
 from runpod_sdxl_image_studio.domain.interactive_run import InteractiveRunStatus
+from runpod_sdxl_image_studio.domain.job import GenerationJob
+from runpod_sdxl_image_studio.jobs.generation_queue_worker import GenerationQueueWorker
 from runpod_sdxl_image_studio.services.generation_persistence import (
     GenerationPersistenceRepositories,
 )
@@ -184,6 +186,120 @@ def test_phase_a_completion_persists_multiple_ordered_images_atomically(tmp_path
         )
         == 2
     )
+    engine.dispose()  # type: ignore[union-attr]
+
+
+def test_phase_a_interactive_batch_runs_fifo_and_persists_two_images_per_generation(
+    tmp_path: Path,
+) -> None:
+    engine, factory = _database()
+    settings = Settings(_env_file=None, data_dir=tmp_path, queue_max_pending_jobs=20)
+    dispatch = dispatch_module.GenerationDispatchQueueRepository(factory)  # type: ignore[arg-type]
+    queue = GenerationQueueService(dispatch, settings)
+    runs = InteractiveRunRepository(factory)  # type: ignore[arg-type]
+    artifact_repository = GenerationArtifactRepository(factory)  # type: ignore[arg-type]
+    interactive = InteractiveGenerationService(
+        runs,
+        queue,
+        settings,
+        artifact_repository=artifact_repository,
+    )
+    generation_settings = _settings(batch_size=2, client_local_date="2026-08-13")
+    storage = LocalStorageAdapter(settings)
+    start = GenerationStartRepository(factory)  # type: ignore[arg-type]
+    generation_repository = GenerationRepository(factory)  # type: ignore[arg-type]
+    job_repository = GenerationJobRepository(factory)  # type: ignore[arg-type]
+    completion = GenerationCompletionRepository(factory)  # type: ignore[arg-type]
+    persistence = GenerationPersistenceRepositories(
+        generation=generation_repository,
+        job=job_repository,
+        artifact=artifact_repository,
+        start=start,
+        queue=GenerationQueueRepository(factory),  # type: ignore[arg-type]
+        progress=GenerationProgressRepository(factory),  # type: ignore[arg-type]
+        completion=completion,
+        failure=GenerationFailureRepository(factory),  # type: ignore[arg-type]
+    )
+    generation_service = GenerationService(
+        object(),  # type: ignore[arg-type]
+        WorkflowAdapter(load_txt2img_template().as_mapping()),
+        object(),  # type: ignore[arg-type]
+        storage,
+        lambda: None,  # type: ignore[arg-type]
+        settings,
+        persistence=persistence,
+    )
+    run = interactive.start(
+        generation_settings,
+        batch_count=3,
+        batch_size=2,
+        client_local_date="2026-08-13",
+    )
+    execution_order: list[UUID] = []
+
+    class FakeExecution:
+        async def execute_persisted(
+            self, generation_id: UUID, job_id: UUID, *args: object, **kwargs: object
+        ) -> None:
+            del args, kwargs
+            execution_order.append(generation_id)
+            persisted_generation = generation_repository.get_by_id(generation_id)
+            persisted_job = job_repository.get_by_generation(generation_id)
+            assert persisted_generation is not None
+            assert persisted_job is not None and persisted_job.id == job_id
+            job = GenerationJob(
+                generation_id=generation_id,
+                status=GenerationStatus.RUNNING,
+                id=job_id,
+                prompt_id=f"prompt-{len(execution_order)}",
+                created_at=persisted_generation.created_at,
+            )
+            first = storage.store_image(
+                _png("blue"),
+                generation_id,
+                persisted_generation.created_at,
+                client_local_date="2026-08-13",
+            )
+            second = storage.store_image(
+                _png("green"),
+                generation_id,
+                persisted_generation.created_at,
+                client_local_date="2026-08-13",
+            )
+            job.stored_image = first
+            job.stored_images = (first, second)
+            generation_service._complete_job(  # type: ignore[attr-defined]
+                job,
+                persisted_generation.settings_snapshot.to_generation_settings(),
+                persisted_generation.created_at,
+                persisted_generation.kind,
+                persisted_generation.parent_generation_id,
+            )
+
+    worker = GenerationQueueWorker(
+        dispatch,
+        FakeExecution(),
+        settings,
+        worker_id="phase-a-worker",
+    )
+    assert asyncio.run(worker.run_once()) is True
+    assert asyncio.run(worker.run_once()) is True
+    assert asyncio.run(worker.run_once()) is True
+    assert asyncio.run(worker.run_once()) is False
+    assert execution_order == list(run.run.generation_ids)
+
+    restored = interactive.refresh(run.run.id)
+    assert restored is not None
+    assert restored.run.status is InteractiveRunStatus.COMPLETED
+    assert restored.completed_count == 3
+    for generation_id in run.run.generation_ids:
+        artifacts = artifact_repository.list_by_generation(generation_id)
+        images = tuple(
+            artifact for artifact in artifacts if artifact.artifact_type.value == "image"
+        )
+        assert [artifact.display_order for artifact in images] == [0, 1]
+        assert len(images) == 2
+    assert len(restored.result_image_paths) == 2
     engine.dispose()  # type: ignore[union-attr]
 
 
