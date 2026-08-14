@@ -11,7 +11,11 @@ from runpod_sdxl_image_studio.adapters.comfyui.exceptions import (
     WorkflowTemplateError,
     WorkflowValidationError,
 )
-from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
+from runpod_sdxl_image_studio.domain.generation_settings import (
+    CURRENT_WORKFLOW_TEMPLATE_VERSION,
+    LEGACY_WORKFLOW_TEMPLATE_VERSION,
+    GenerationSettings,
+)
 
 SAFE_FILENAME_PREFIX = "runpod_sdxl_image_studio"
 CHECKPOINT_NODE_ID = "4"
@@ -118,7 +122,14 @@ def build_txt2img_workflow(
     _apply_lora_chain(workflow, settings)
     _apply_clip_skip(workflow, settings.clip_skip)
     if settings.hires_fix:
-        _apply_hires_fix(workflow, settings)
+        if settings.workflow_template_version == LEGACY_WORKFLOW_TEMPLATE_VERSION:
+            _apply_legacy_hires_fix(workflow, settings)
+        elif settings.workflow_template_version == CURRENT_WORKFLOW_TEMPLATE_VERSION:
+            _apply_hires_fix(workflow, settings)
+        else:
+            raise WorkflowTemplateError(
+                "Hires.fix is unavailable for the requested workflow version"
+            )
     if settings.final_upscale:
         _apply_final_upscale(workflow, settings.final_upscale_model)
 
@@ -188,6 +199,8 @@ def _apply_clip_skip(workflow: dict[str, object], clip_skip: int) -> None:
 
 
 def _apply_hires_fix(workflow: dict[str, object], settings: GenerationSettings) -> None:
+    """Apply the 2.1 pixel-space Hires.fix graph."""
+
     reserved = ("hires_scale", "hires_encode", "hires_sampler", "hires_decode")
     if any(node_id in workflow for node_id in reserved):
         raise WorkflowTemplateError("reserved Hires.fix node id is already in use")
@@ -232,6 +245,43 @@ def _apply_hires_fix(workflow: dict[str, object], settings: GenerationSettings) 
         },
     }
     _set_binding(workflow, ("9", "inputs", "images"), ["hires_decode", 0])
+
+
+def _apply_legacy_hires_fix(workflow: dict[str, object], settings: GenerationSettings) -> None:
+    """Preserve the 2.0 latent-space Hires.fix graph for old snapshots."""
+
+    reserved = ("hires_latent", "hires_sampler")
+    if any(node_id in workflow for node_id in reserved):
+        raise WorkflowTemplateError("reserved Hires.fix node id is already in use")
+    model = _get_input(workflow, KSampler_NODE_ID, "model")
+    positive = _get_input(workflow, KSampler_NODE_ID, "positive")
+    negative = _get_input(workflow, KSampler_NODE_ID, "negative")
+    workflow["hires_latent"] = {
+        "class_type": "LatentUpscale",
+        "inputs": {
+            "upscale_method": "nearest-exact",
+            "width": int(settings.width * settings.hires_scale),
+            "height": int(settings.height * settings.hires_scale),
+            "crop": "disabled",
+            "samples": [KSampler_NODE_ID, 0],
+        },
+    }
+    workflow["hires_sampler"] = {
+        "class_type": "KSampler",
+        "inputs": {
+            "seed": settings.seed,
+            "steps": settings.steps,
+            "cfg": settings.cfg_scale,
+            "sampler_name": settings.sampler_name,
+            "scheduler": settings.scheduler_name,
+            "denoise": settings.hires_denoise,
+            "model": model,
+            "positive": positive,
+            "negative": negative,
+            "latent_image": ["hires_latent", 0],
+        },
+    }
+    _set_binding(workflow, (VAE_DECODE_NODE_ID, "inputs", "samples"), ["hires_sampler", 0])
 
 
 def _apply_final_upscale(workflow: dict[str, object], model_name: str | None) -> None:

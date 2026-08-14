@@ -263,6 +263,7 @@ from runpod_sdxl_image_studio.ui.tabs.system_tab import (
     make_state_backup_handler,
     make_system_health_handler,
     size_preset_values,
+    startup_restore_outputs,
 )
 from runpod_sdxl_image_studio.ui.tabs.upscale_tab import (
     begin_upscale_enqueue,
@@ -807,21 +808,7 @@ def build_app(
                 set_phase6_capabilities,
             ),
             inputs=[*capability_inputs, generation.startup_restore_applied],
-            outputs=[
-                generation.startup_restore_timer,
-                system.capability_message,
-                *capability_outputs,
-                generation.positive_prompt,
-                generation.negative_prompt,
-                generation.seed_mode,
-                generation.seed,
-                generation.width,
-                generation.height,
-                generation.steps,
-                generation.cfg_scale,
-                generation.restored_form_state,
-                generation.startup_restore_applied,
-            ],
+            outputs=startup_restore_outputs(generation, system.capability_message),
             concurrency_limit=1,
         )
         demo.load(

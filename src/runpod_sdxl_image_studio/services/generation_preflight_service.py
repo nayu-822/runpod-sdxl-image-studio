@@ -19,7 +19,11 @@ from runpod_sdxl_image_studio.adapters.storage.disk_usage import (
     DiskUsageAdapterProtocol,
 )
 from runpod_sdxl_image_studio.config import Settings
-from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
+from runpod_sdxl_image_studio.domain.generation_settings import (
+    CURRENT_WORKFLOW_TEMPLATE_VERSION,
+    LEGACY_WORKFLOW_TEMPLATE_VERSION,
+    GenerationSettings,
+)
 from runpod_sdxl_image_studio.domain.preflight import (
     PreflightIssue,
     PreflightResult,
@@ -326,6 +330,18 @@ class GenerationPreflightService:
             required.add("VAELoader")
         if generation_settings is not None and generation_settings.loras:
             required.add("LoraLoader")
+        if generation_settings is not None and generation_settings.hires_fix:
+            if generation_settings.workflow_template_version == LEGACY_WORKFLOW_TEMPLATE_VERSION:
+                required.add("LatentUpscale")
+            elif generation_settings.workflow_template_version == CURRENT_WORKFLOW_TEMPLATE_VERSION:
+                required.update({"ImageScaleBy", "VAEEncode"})
+            else:
+                errors.append(
+                    _error(
+                        "workflow_version_unsupported",
+                        "Hires.fix workflow version is not supported",
+                    )
+                )
         missing = sorted(required.difference(capabilities.available_node_classes))
         if missing:
             errors.append(

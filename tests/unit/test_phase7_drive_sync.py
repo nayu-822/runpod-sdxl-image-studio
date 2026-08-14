@@ -265,6 +265,29 @@ def _fixture(tmp_path: Path, *, adapter: FakeDriveAdapter | None = None):
     return service, DriveSyncRepository(factory), generation_id, image_path, metadata_path, fake
 
 
+def _add_second_image(service: DriveSyncService, generation_id: UUID, image_path: Path) -> Path:
+    created_at = datetime(2026, 8, 7, 15, 30, tzinfo=UTC)
+    second_bytes = _png()
+    second_path = image_path.with_name("second.png")
+    second_path.write_bytes(second_bytes)
+    service._artifact_repository.add(  # type: ignore[attr-defined]
+        GenerationArtifact(
+            id=uuid4(),
+            generation_id=generation_id,
+            artifact_type=ArtifactType.IMAGE,
+            local_path="generations/2026-08-08/generated/second.png",
+            sha256=hashlib.sha256(second_bytes).hexdigest(),
+            size_bytes=len(second_bytes),
+            width=64,
+            height=64,
+            mime_type="image/png",
+            created_at=created_at,
+            display_order=1,
+        )
+    )
+    return second_path
+
+
 def test_drive_sync_success_copies_image_metadata_and_manifest(tmp_path: Path) -> None:
     service, repository, generation_id, image_path, metadata_path, adapter = _fixture(tmp_path)
 
@@ -394,6 +417,69 @@ def test_drive_sync_retry_resumes_after_partial_multi_image_failure(tmp_path: Pa
         item.image_size_bytes for item in completed.artifacts
     ) + (completed.artifacts[0].metadata_size_bytes or 0)
     assert len(service.cache_candidates()) == 1
+
+
+def test_drive_sync_retry_changed_destination_copies_all_artifacts(tmp_path: Path) -> None:
+    adapter = FakeDriveAdapter()
+    service, repository, generation_id, image_path, _, _ = _fixture(tmp_path, adapter=adapter)
+    _add_second_image(service, generation_id, image_path)
+    pending = service.enqueue_generation(generation_id)
+    assert pending is not None
+    adapter.fail_relative_path = pending.artifacts[1].remote_image_path
+    first_job = repository.claim_next("worker-1", 120)
+    assert first_job is not None
+    failed = asyncio.run(service.process_job(first_job, "worker-1"))
+    assert failed is not None and failed.status is DriveSyncStatus.FAILED
+    assert failed.artifacts[0].image_synced is True
+    assert failed.artifacts[1].image_synced is False
+    calls_before_retry = len(adapter.calls)
+
+    service._settings.rclone_remote = "drive-b"
+    service._settings.rclone_base_path = "studio-b"
+    retried, retry_job = service.retry_generation(generation_id)
+    assert retry_job is not None
+    assert all(not item.image_synced and not item.metadata_synced for item in retried.artifacts)
+
+    adapter.fail_relative_path = None
+    claimed_retry = repository.claim_next("worker-1", 120)
+    assert claimed_retry is not None
+    completed = asyncio.run(service.process_job(claimed_retry, "worker-1"))
+    assert completed is not None and completed.status is DriveSyncStatus.SYNCED
+    retry_calls = adapter.calls[calls_before_retry:]
+    assert len(retry_calls) == 3
+    assert all(call[1] == DriveDestination("drive-b", "studio-b") for call in retry_calls)
+    assert {call[2] for call in retry_calls} == {
+        *(item.remote_image_path for item in completed.artifacts),
+        completed.remote_metadata_path,
+    }
+
+
+def test_drive_sync_resync_same_destination_copies_all_artifacts_again(tmp_path: Path) -> None:
+    adapter = FakeDriveAdapter()
+    service, repository, generation_id, image_path, _, _ = _fixture(tmp_path, adapter=adapter)
+    _add_second_image(service, generation_id, image_path)
+    assert service.enqueue_generation(generation_id) is not None
+    initial_job = repository.claim_next("worker-1", 120)
+    assert initial_job is not None
+    assert asyncio.run(service.process_job(initial_job, "worker-1")) is not None
+    initial_manifest = repository.claim_next_manifest("worker-1", 120)
+    assert initial_manifest is not None
+    assert asyncio.run(service.process_manifest_job(initial_manifest, "worker-1")) is not None
+    adapter.calls.clear()
+
+    resynced, resync_job = service.retry_generation(generation_id, resync=True)
+    assert resync_job is not None
+    assert all(not item.image_synced and not item.metadata_synced for item in resynced.artifacts)
+    claimed_resync = repository.claim_next("worker-1", 120)
+    assert claimed_resync is not None
+    completed = asyncio.run(service.process_job(claimed_resync, "worker-1"))
+    assert completed is not None and completed.status is DriveSyncStatus.SYNCED
+    assert len(adapter.calls) == 3
+    assert all(call[1] == DriveDestination("drive", "studio") for call in adapter.calls)
+    assert {call[2] for call in adapter.calls} == {
+        *(item.remote_image_path for item in completed.artifacts),
+        completed.remote_metadata_path,
+    }
 
 
 def test_drive_sync_partial_failure_preserves_local_and_marks_retryable(tmp_path: Path) -> None:
@@ -659,16 +745,25 @@ def test_resync_preserves_old_remote_manifest_and_builds_new_destination_manifes
         (DriveDestination("drive", "studio"), manifest_job_a.remote_manifest_path)
     ]
     assert str(generation_id).encode() in old_manifest
+    calls_before_resync = len(adapter.calls)
 
     service._settings.rclone_remote = "drive-b"
     service._settings.rclone_base_path = "studio-b"
     resynced, resync_job = service.retry_generation(generation_id, resync=True)
     assert resync_job is not None and resync_job.status is DriveSyncStatus.PENDING
     assert (resynced.remote_name, resynced.remote_base_path) == ("drive-b", "studio-b")
+    assert all(not item.image_synced and not item.metadata_synced for item in resynced.artifacts)
 
     drive_job_b = repository.claim_next("worker-1", 120)
     assert drive_job_b is not None
-    assert asyncio.run(service.process_job(drive_job_b, "worker-1")) is not None
+    synced_b = asyncio.run(service.process_job(drive_job_b, "worker-1"))
+    assert synced_b is not None and synced_b.status is DriveSyncStatus.SYNCED
+    assert len(adapter.calls) - calls_before_resync == 2
+    assert all(call[1] == DriveDestination("drive-b", "studio-b") for call in adapter.calls[-2:])
+    assert {call[2] for call in adapter.calls[-2:]} == {
+        synced_b.artifacts[0].remote_image_path,
+        synced_b.remote_metadata_path,
+    }
     manifest_job_b = repository.claim_next_manifest("worker-1", 120)
     assert manifest_job_b is not None
     assert manifest_job_b.destination == DriveDestination("drive-b", "studio-b")

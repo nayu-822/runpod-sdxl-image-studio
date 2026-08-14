@@ -690,7 +690,9 @@ txt2img workflowでは複数LoRA、CLIP skip、Hires.fix、任意の最終4x ups
 ComfyUIのbatch sizeを固定templateの範囲内で扱います。Hires.fixは
 `KSampler -> VAEDecode -> ImageScaleBy(lanczos) -> VAEEncode -> Hires KSampler ->
 VAEDecode`のグラフで、scale、resize method、steps、CFG、sampler、scheduler、
-denoiseをsnapshotへ保存します。ブラウザのローカル日付は対話的開始クリック
+denoiseをsnapshotへ保存します。新規生成はworkflow version 2.1を使い、旧い
+version 2.0 snapshotのHires.fixは従来のLatentUpscaleグラフで再現します。
+ブラウザのローカル日付は対話的開始クリック
 ごとにブラウザから取得し、`generations/YYYY-MM-DD/000001.png`の6桁連番を
 generated/upscaled共通でexclusive createします。日付が不正、保存先外、または同名
 の場合は保存せず失敗させます。通常のサーバー日付保存では従来どおりgenerated/

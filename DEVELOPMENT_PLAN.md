@@ -656,6 +656,8 @@ exclusive createして、generated/upscaledをまたいだ同時実行時の衝�
 通常のサーバー日付保存はgenerated/upscaledを分離します。不正な日付、保存先外の
 パス、同名上書きは受け付けません。Hires.fixは画像スケール、resize method、
 steps、CFG、sampler、scheduler、denoiseをtyped snapshotとsidecarへ含めます。
+新規生成はworkflow version 2.1のpixel-space graphを使い、version 2.0の既存snapshotは
+LatentUpscale graphとして再現します。
 Phase AはFake/SQLite/Alembicと
 Playwright viewport testで検証し、実GPU・実ComfyUI・実RunPod・実Driveは引き続き
 手動確認の対象です。

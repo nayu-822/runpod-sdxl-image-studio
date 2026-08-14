@@ -77,6 +77,8 @@ from runpod_sdxl_image_studio.domain.generation_queue import (
     ReconciliationOutcome,
 )
 from runpod_sdxl_image_studio.domain.generation_settings import (
+    CURRENT_WORKFLOW_TEMPLATE_VERSION,
+    LEGACY_WORKFLOW_TEMPLATE_VERSION,
     MAX_SEED,
     RANDOM_SEED,
     GenerationSettings,
@@ -1576,12 +1578,15 @@ def _validate_generation(
         raise WorkflowError("LoRA loading is unavailable in ComfyUI")
     if settings.clip_skip > 1 and "CLIPSetLastLayer" not in node_classes:
         raise WorkflowError("CLIP skip is unavailable in ComfyUI")
-    if settings.hires_fix and (
-        "ImageScaleBy" not in node_classes
-        or "VAEEncode" not in node_classes
-        or "VAEDecode" not in node_classes
-    ):
-        raise WorkflowError("Hires.fix is unavailable in ComfyUI")
+    if settings.hires_fix:
+        if settings.workflow_template_version == LEGACY_WORKFLOW_TEMPLATE_VERSION:
+            required_hires_nodes = {"LatentUpscale", "VAEDecode"}
+        elif settings.workflow_template_version == CURRENT_WORKFLOW_TEMPLATE_VERSION:
+            required_hires_nodes = {"ImageScaleBy", "VAEEncode", "VAEDecode"}
+        else:
+            raise WorkflowError("Hires.fix workflow version is unsupported")
+        if not required_hires_nodes.issubset(node_classes):
+            raise WorkflowError("Hires.fix is unavailable in ComfyUI")
     if settings.hires_fix and settings.width * settings.hires_scale > limits.max_width:
         raise WorkflowError("Hires.fix width exceeds the configured limit")
     if settings.hires_fix and settings.height * settings.hires_scale > limits.max_height:

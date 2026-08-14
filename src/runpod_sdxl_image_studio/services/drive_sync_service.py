@@ -237,6 +237,7 @@ class DriveSyncService:
             metadata,
             paths,
             existing=existing,
+            resync=resync,
         )
         try:
             saved_record, saved_job = self._run_with_admission(
@@ -851,6 +852,7 @@ class DriveSyncService:
         paths: DriveRemotePaths,
         *,
         existing: DriveSyncRecord | None,
+        resync: bool = False,
     ) -> tuple[DriveSyncRecord, DriveSyncJob]:
         if not images:
             raise DriveSyncServiceError(
@@ -867,9 +869,19 @@ class DriveSyncService:
             )
         now = datetime.now(UTC)
         record_id = existing.id if existing is not None else self._id_factory()
+        destination = DriveDestination(
+            self._settings.rclone_remote,
+            self._settings.rclone_base_path,
+        )
+        previous_destination = (
+            DriveDestination(existing.remote_name, existing.remote_base_path)
+            if existing is not None
+            else None
+        )
+        resume_allowed = not resync and previous_destination == destination
         previous = {
             item.image_artifact_id: item
-            for item in (existing.artifacts if existing is not None else ())
+            for item in (existing.artifacts if resume_allowed and existing is not None else ())
         }
         sync_artifacts = tuple(
             DriveSyncArtifact(
@@ -889,10 +901,20 @@ class DriveSyncService:
                     image,
                     build_remote_image_path(paths, image.display_order, len(ordered_images)),
                     kind="image",
+                    previous_destination=previous_destination,
+                    destination=destination,
+                    force_resync=resync,
                 ),
                 metadata_synced=(
                     metadata is not None
-                    and _can_resume_metadata(previous.get(image.id), metadata, paths.metadata_path)
+                    and _can_resume_metadata(
+                        previous.get(image.id),
+                        metadata,
+                        paths.metadata_path,
+                        previous_destination=previous_destination,
+                        destination=destination,
+                        force_resync=resync,
+                    )
                 ),
             )
             for image in ordered_images
@@ -1129,10 +1151,15 @@ def _can_resume_artifact(
     remote_path: str,
     *,
     kind: str,
+    previous_destination: DriveDestination | None,
+    destination: DriveDestination,
+    force_resync: bool,
 ) -> bool:
     return bool(
-        kind == "image"
+        not force_resync
+        and kind == "image"
         and previous is not None
+        and previous_destination == destination
         and previous.image_synced
         and previous.image_artifact_id == image.id
         and previous.remote_image_path == remote_path
@@ -1145,9 +1172,15 @@ def _can_resume_metadata(
     previous: DriveSyncArtifact | None,
     metadata: GenerationArtifact,
     remote_path: str,
+    *,
+    previous_destination: DriveDestination | None,
+    destination: DriveDestination,
+    force_resync: bool,
 ) -> bool:
     return bool(
-        previous is not None
+        not force_resync
+        and previous is not None
+        and previous_destination == destination
         and previous.metadata_synced
         and previous.metadata_artifact_id == metadata.id
         and previous.remote_metadata_path == remote_path

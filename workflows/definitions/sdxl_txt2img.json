@@ -1,7 +1,7 @@
 {
   "template_id": "sdxl_txt2img",
   "schema_version": 1,
-  "workflow_version": "2.0",
+  "workflow_version": "2.1",
   "workflow_file": "workflows/templates/sdxl_txt2img.json",
   "required_node_classes": [
     "CheckpointLoaderSimple",

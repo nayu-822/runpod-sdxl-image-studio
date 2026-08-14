@@ -200,6 +200,71 @@ def capability_refresh_outputs(generation: GenerationTabComponents) -> tuple[Any
     )
 
 
+def startup_restore_form_outputs(generation: GenerationTabComponents) -> tuple[Any, ...]:
+    """Single source of truth for the form fields restored at startup."""
+
+    return (
+        generation.positive_prompt,
+        generation.negative_prompt,
+        generation.seed_mode,
+        generation.seed,
+        generation.width,
+        generation.height,
+        generation.steps,
+        generation.cfg_scale,
+        generation.clip_skip,
+        generation.hires_fix,
+        generation.hires_scale,
+        generation.hires_resize_method,
+        generation.hires_steps,
+        generation.hires_cfg_scale,
+        generation.hires_sampler,
+        generation.hires_scheduler,
+        generation.hires_denoise,
+        generation.final_upscale,
+    )
+
+
+def startup_restore_form_values(snapshot: GenerationFormStateSnapshot) -> tuple[object, ...]:
+    """Return startup-restored form values in the same order as their components."""
+
+    return (
+        snapshot.positive_prompt,
+        snapshot.negative_prompt,
+        snapshot.ui_seed_mode,
+        snapshot.seed,
+        snapshot.width,
+        snapshot.height,
+        snapshot.steps,
+        snapshot.cfg_scale,
+        snapshot.clip_skip,
+        snapshot.hires_fix,
+        snapshot.hires_scale,
+        snapshot.hires_resize_method,
+        snapshot.hires_steps,
+        snapshot.hires_cfg_scale,
+        snapshot.hires_sampler_name,
+        snapshot.hires_scheduler_name,
+        snapshot.hires_denoise,
+        snapshot.final_upscale,
+    )
+
+
+def startup_restore_outputs(
+    generation: GenerationTabComponents, capability_message: gr.Markdown
+) -> tuple[Any, ...]:
+    """Single source of truth for the startup restore event outputs."""
+
+    return (
+        generation.startup_restore_timer,
+        capability_message,
+        *capability_refresh_outputs(generation),
+        *startup_restore_form_outputs(generation),
+        generation.restored_form_state,
+        generation.startup_restore_applied,
+    )
+
+
 def build_system_tab(
     comfyui_url: str,
     initial_markdown: str,
@@ -745,7 +810,7 @@ def make_startup_restore_handler(
     """Apply the desired form only after background model preparation is terminal."""
 
     capability_count = len(capability_refresh_outputs(generation))
-    form_tail_count = 19
+    form_tail_count = len(startup_restore_form_outputs(generation)) + 1
 
     async def handler(
         checkpoint: str | None,
@@ -826,24 +891,7 @@ def make_startup_restore_handler(
             gr.Timer(active=False),
             message,
             *updates,
-            snapshot.positive_prompt,
-            snapshot.negative_prompt,
-            snapshot.ui_seed_mode,
-            snapshot.seed,
-            snapshot.width,
-            snapshot.height,
-            snapshot.steps,
-            snapshot.cfg_scale,
-            snapshot.clip_skip,
-            snapshot.hires_fix,
-            snapshot.hires_scale,
-            snapshot.hires_resize_method,
-            snapshot.hires_steps,
-            snapshot.hires_cfg_scale,
-            snapshot.hires_sampler_name,
-            snapshot.hires_scheduler_name,
-            snapshot.hires_denoise,
-            snapshot.final_upscale,
+            *startup_restore_form_values(snapshot),
             snapshot.model_dump(mode="json"),
             True,
         )

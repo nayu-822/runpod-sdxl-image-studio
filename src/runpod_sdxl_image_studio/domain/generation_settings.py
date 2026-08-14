@@ -13,6 +13,8 @@ from runpod_sdxl_image_studio.domain.lora import LoraSetting
 
 RANDOM_SEED = -1
 MAX_SEED = 2**63 - 1
+LEGACY_WORKFLOW_TEMPLATE_VERSION = "2.0"
+CURRENT_WORKFLOW_TEMPLATE_VERSION = "2.1"
 
 
 class GenerationSettings(BaseModel):
@@ -46,7 +48,7 @@ class GenerationSettings(BaseModel):
     vae_name: str | None = None
     loras: tuple[LoraSetting, ...] = ()
     workflow_template_id: str = Field(default="sdxl_txt2img", min_length=1)
-    workflow_template_version: str = Field(default="2.0", min_length=1)
+    workflow_template_version: str = Field(default=CURRENT_WORKFLOW_TEMPLATE_VERSION, min_length=1)
 
     @field_validator(
         "sampler_name",
@@ -122,4 +124,10 @@ class GenerationSettings(BaseModel):
         return self
 
 
-__all__ = ["MAX_SEED", "RANDOM_SEED", "GenerationSettings"]
+__all__ = [
+    "CURRENT_WORKFLOW_TEMPLATE_VERSION",
+    "LEGACY_WORKFLOW_TEMPLATE_VERSION",
+    "MAX_SEED",
+    "RANDOM_SEED",
+    "GenerationSettings",
+]

@@ -17,7 +17,11 @@ from runpod_sdxl_image_studio.adapters.storage.exceptions import StorageError
 from runpod_sdxl_image_studio.adapters.storage.local_storage import LocalStorageAdapter
 from runpod_sdxl_image_studio.config import Settings
 from runpod_sdxl_image_studio.domain.generation import GenerationKind
-from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
+from runpod_sdxl_image_studio.domain.generation_settings import (
+    CURRENT_WORKFLOW_TEMPLATE_VERSION,
+    LEGACY_WORKFLOW_TEMPLATE_VERSION,
+    GenerationSettings,
+)
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
 from runpod_sdxl_image_studio.domain.lora import LoraSetting
 from runpod_sdxl_image_studio.ui.tabs.system_tab import build_generation_tab
@@ -84,6 +88,21 @@ def test_phase_a_workflow_binds_batch_and_optional_nodes() -> None:
     assert workflow["final_upscale_loader"]["inputs"]["model_name"] == "4x-UltraSharp.pth"  # type: ignore[index]
     assert workflow["9"]["inputs"]["images"] == ["final_upscale", 0]  # type: ignore[index]
 
+    legacy_workflow = WorkflowAdapter(load_txt2img_template().as_mapping()).build_txt2img_workflow(
+        _settings(
+            workflow_template_version=LEGACY_WORKFLOW_TEMPLATE_VERSION,
+            hires_fix=True,
+            hires_scale=1.5,
+            hires_denoise=0.35,
+        )
+    )
+    assert legacy_workflow["hires_latent"]["class_type"] == "LatentUpscale"  # type: ignore[index]
+    assert legacy_workflow["hires_latent"]["inputs"]["width"] == 1536  # type: ignore[index]
+    assert legacy_workflow["hires_latent"]["inputs"]["height"] == 1536  # type: ignore[index]
+    assert legacy_workflow["hires_sampler"]["inputs"]["steps"] == 28  # type: ignore[index]
+    assert legacy_workflow["8"]["inputs"]["samples"] == ["hires_sampler", 0]  # type: ignore[index]
+    assert "hires_scale" not in legacy_workflow
+
     without_optional = WorkflowAdapter(load_txt2img_template().as_mapping()).build_txt2img_workflow(
         _settings(batch_size=2)
     )
@@ -126,7 +145,27 @@ def test_phase_a_snapshot_round_trip_preserves_new_generation_options() -> None:
     assert restored.final_upscale is True
     assert restored.final_upscale_model == "4x-UltraSharp.pth"
     assert restored.client_local_date == "2026-08-13"
-    assert restored.workflow_template_version == "2.0"
+    assert restored.workflow_template_version == CURRENT_WORKFLOW_TEMPLATE_VERSION
+
+
+def test_phase_a_legacy_hires_version_survives_snapshot_reload_and_retry_rebuild() -> None:
+    settings = _settings(
+        workflow_template_version=LEGACY_WORKFLOW_TEMPLATE_VERSION,
+        hires_fix=True,
+        hires_scale=1.75,
+        hires_denoise=0.3,
+    )
+    snapshot = GenerationSettingsSnapshot.from_settings(settings)
+    reloaded = GenerationSettingsSnapshot.from_json(snapshot.to_json()).to_generation_settings()
+    retry_snapshot = GenerationSettingsSnapshot.from_settings(reloaded)
+    retried = GenerationSettingsSnapshot.from_json(
+        retry_snapshot.to_json()
+    ).to_generation_settings()
+
+    assert reloaded.workflow_template_version == LEGACY_WORKFLOW_TEMPLATE_VERSION
+    assert retried.workflow_template_version == LEGACY_WORKFLOW_TEMPLATE_VERSION
+    workflow = WorkflowAdapter(load_txt2img_template().as_mapping()).build_txt2img_workflow(retried)
+    assert workflow["hires_latent"]["class_type"] == "LatentUpscale"  # type: ignore[index]
 
 
 def test_phase_a_local_storage_uses_client_date_and_six_digit_exclusive_sequence(
