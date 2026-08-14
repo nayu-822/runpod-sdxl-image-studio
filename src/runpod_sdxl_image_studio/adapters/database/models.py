@@ -232,6 +232,26 @@ class InteractiveGenerationRunModel(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class GenerationCustomSizeModel(Base):
+    """A user preference table, separate from immutable generation snapshots."""
+
+    __tablename__ = "generation_custom_sizes"
+    __table_args__ = (
+        CheckConstraint("width > 0 AND height > 0", name="ck_custom_generation_size_positive"),
+        CheckConstraint(
+            "width % 64 = 0 AND height % 64 = 0",
+            name="ck_custom_generation_size_multiple_of_64",
+        ),
+        CheckConstraint("width * height > 0", name="ck_custom_generation_size_pixels"),
+        UniqueConstraint("width", "height", name="uq_custom_generation_size_dimensions"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    width: Mapped[int] = mapped_column(Integer, nullable=False)
+    height: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class MetadataImportModel(Base):
     """Stored canonical external image and its non-executable metadata preview."""
 

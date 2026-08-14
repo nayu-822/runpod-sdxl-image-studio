@@ -496,7 +496,7 @@ def test_phase6_migration_empty_head_downgrade_upgrade_roundtrip(tmp_path: Path)
         )
     ).connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "0019_phase_a_multi_image_drive_sync"
+            "0020_phase_b_custom_generation_sizes"
         )
 
 

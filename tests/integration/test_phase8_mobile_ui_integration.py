@@ -11,7 +11,7 @@ def test_phase8_generation_surface_is_mobile_ready_and_status_poll_is_wired() ->
     generate_buttons = [
         component
         for component in components
-        if component["type"] == "button" and component["props"].get("value") == "生成をキューへ追加"
+        if component["type"] == "button" and component["props"].get("value") == "生成"
     ]
     timers = [component for component in components if component["type"] == "timer"]
     action_labels = {
@@ -25,7 +25,31 @@ def test_phase8_generation_surface_is_mobile_ready_and_status_poll_is_wired() ->
 
     assert len(generate_buttons) == 1
     assert timers and timers[0]["props"].get("value") == 5
-    assert {"同条件で再生成", "設定を編集", "アップスケール"}.issubset(action_labels)
+    assert {"生成", "キャンセル", "同条件で再生成", "設定を編集", "アップスケール"}.issubset(
+        action_labels
+    )
+    assert "生成をキューへ追加" not in action_labels
+    assert "対話的生成を開始" not in {
+        component["props"].get("value")
+        for component in components
+        if component["type"] == "button" and component["props"].get("visible") is not False
+    }
+    assert "バッチをキューへ追加" not in {
+        component["props"].get("value")
+        for component in components
+        if component["type"] == "button" and component["props"].get("visible") is not False
+    }
+    assert any(
+        component["type"] == "button"
+        and component["props"].get("value") == "選択画像の設定を読み込む"
+        for component in components
+    )
+    clipboard_dependencies = [
+        dependency
+        for dependency in demo.config["dependencies"]
+        if "navigator.clipboard" in str(dependency.get("js"))
+    ]
+    assert len(clipboard_dependencies) >= 4
     assert any(
         component["props"].get("label") == "実使用Seed（コピー）"
         for component in copyable_seed_fields

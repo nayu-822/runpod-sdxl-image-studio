@@ -90,8 +90,8 @@ async def test_system_handler_uses_service_and_returns_dropdown_updates() -> Non
     assert "接続" in result[0]
     assert result[2].choices
     assert result[2].choices[0][0] == "model.safetensors"
-    assert result[6].choices
-    assert result[6].choices[0][0] == "upscaler.pth"
+    assert result[8].choices
+    assert result[8].choices[0][0] == "upscaler.pth"
     assert "style.safetensors" in result[14]
 
 

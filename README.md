@@ -704,3 +704,33 @@ Drive同期は1 Generationの全ての`IMAGE` Artifactを`display_order`順に�
 
 Phase Aの自動検証はFake、SQLite、Alembic、Playwrightのbrowser testを使用し、
 実GPU、実ComfyUI、実RunPod、実Google Driveへの接続を必要としません。
+
+## Phase B: スマホ向け対話的生成UI
+
+生成タブの通常の「生成」は`InteractiveGenerationService`を通る1本の経路です。
+旧単発・バッチenqueueボタンは通常UIから隠し、永続Queueとworkerはバックエンドとして
+維持します。`Batch size`は1回のComfyUI promptから得る画像数、`Batch count`は順次
+実行するGeneration数です。生成中はGenerateを無効化し、Cancel、run status、現在の
+Generation、Batch進捗を表示します。再読込後はSQLiteのactive runとQueue状態を再取得し、
+送信済みComfyUI promptを再送信しません。
+
+現在の対話的結果は最新completed batchだけを2×2までのGalleryで表示します。保存済みの
+Customサイズは`generation_custom_sizes`（migration `0020_phase_b_custom_generation_sizes`）
+へ別管理され、生成完了後に重複寸法を登録できます。組み込みサイズは削除できず、保存済み
+Customサイズの削除は履歴・snapshot・sidecarを変更しません。
+
+Positive/Negative promptにはブラウザ側ClipboardのPaste/Copyを用意しています。Clipboard
+権限やAPIが使えない場合は現在のpromptを保持し、`クリップボードを利用できませんでした`
+と表示します。Galleryで選択した画像の設定復元は、run IDとdisplay orderをserver側で
+検証したうえで、LoRA、Hires/final upscale、元のbatch size、workflow versionを復元します。
+新規手入力はworkflow 2.1、legacy snapshotはworkflow 2.0を維持します。
+
+Phase Bのbrowser確認:
+
+```bash
+IMAGE_STUDIO_BROWSER_URL=http://127.0.0.1:7860 pytest -q tests/browser/test_phase8_mobile_viewports.py
+```
+
+実ComfyUI・実GPU・実RunPod・実Google Driveを使う手動生成は未実施です。新しいHistory UI、
+全過去画像のGallery、複数Interactive run、複数worker、queue reorder、workflow editor、
+自動retryはPhase Bの対象外です。

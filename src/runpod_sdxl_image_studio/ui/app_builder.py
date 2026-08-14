@@ -23,6 +23,9 @@ from runpod_sdxl_image_studio.adapters.database.engine import (
 from runpod_sdxl_image_studio.adapters.database.repositories.drive_sync_repository import (
     DriveSyncRepository,
 )
+from runpod_sdxl_image_studio.adapters.database.repositories.generation_custom_size_repository import (  # noqa: E501
+    GenerationCustomSizeRepository,
+)
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_dispatch_queue_repository import (  # noqa: E501
     GenerationDispatchQueueRepository,
 )
@@ -106,6 +109,10 @@ from runpod_sdxl_image_studio.jobs.model_transfer_worker import (
 from runpod_sdxl_image_studio.jobs.startup_model_restore import StartupModelRestoreRuntime
 from runpod_sdxl_image_studio.services.comfyui_service import ComfyUIService
 from runpod_sdxl_image_studio.services.drive_sync_service import DriveSyncService
+from runpod_sdxl_image_studio.services.generation_custom_size_service import (
+    GenerationCustomSizeError,
+    GenerationCustomSizeService,
+)
 from runpod_sdxl_image_studio.services.generation_diff_service import GenerationDiffService
 from runpod_sdxl_image_studio.services.generation_execution_service import (
     GenerationExecutionService,
@@ -114,6 +121,7 @@ from runpod_sdxl_image_studio.services.generation_form_state_service import (
     GenerationFormStateService,
 )
 from runpod_sdxl_image_studio.services.generation_history_service import (
+    GenerationHistoryError,
     GenerationHistoryService,
 )
 from runpod_sdxl_image_studio.services.generation_persistence import (
@@ -249,20 +257,25 @@ from runpod_sdxl_image_studio.ui.tabs.system_tab import (
     capability_refresh_outputs,
     disable_batch_enqueue_button,
     disable_generate_button,
+    interactive_action_updates,
     make_batch_enqueue_handler,
     make_check_connection_handler,
+    make_custom_size_delete_handler,
+    make_custom_size_refresh_handler,
     make_enqueue_handler,
     make_interactive_cancel_handler,
+    make_interactive_gallery_restore_handler,
+    make_interactive_gallery_select_handler,
     make_interactive_refresh_handler,
     make_interactive_start_handler,
     make_pod_lifecycle_readiness_handler,
     make_pod_lifecycle_terminate_handler,
     make_pod_lifecycle_toggle_handler,
     make_refresh_handler,
+    make_size_preset_handler,
     make_startup_restore_handler,
     make_state_backup_handler,
     make_system_health_handler,
-    size_preset_values,
     startup_restore_outputs,
 )
 from runpod_sdxl_image_studio.ui.tabs.upscale_tab import (
@@ -357,6 +370,7 @@ def build_app(
     system_error_repository = SystemErrorEventRepository(session_factory)
     start_repository = GenerationStartRepository(session_factory)
     interactive_run_repository = InteractiveRunRepository(session_factory)
+    custom_size_repository = GenerationCustomSizeRepository(session_factory)
     progress_repository = GenerationProgressRepository(session_factory)
     drive_adapter = GoogleDriveAdapter(app_settings)
     state_sync_service = StateSyncService(
@@ -390,6 +404,12 @@ def build_app(
     )
     lifecycle_service.initialize_session()
     form_state_service.set_work_gate(lifecycle_service)
+    custom_size_service = GenerationCustomSizeService(
+        custom_size_repository,
+        app_settings,
+        state_changed_callback=state_sync_service.mark_dirty,
+        work_gate=lifecycle_service,
+    )
     catalog_service = LoraCatalogService(
         LoraMetadataRepository(create_session_factory(database_engine)),
         LoraThumbnailStorage(
@@ -638,10 +658,19 @@ def build_app(
         history_service,
     )
 
+    try:
+        initial_custom_size_choices = custom_size_service.selector_options()
+    except GenerationCustomSizeError:
+        # An older database is still usable until the normal startup migration runs.
+        initial_custom_size_choices = []
+
     with gr.Blocks(title=APP_TITLE, css=APP_CSS) as demo:
         gr.Markdown(f"# {APP_TITLE}")
         with gr.Tab("生成"):
-            generation = build_generation_tab(app_settings.max_loras)
+            generation = build_generation_tab(
+                app_settings.max_loras,
+                custom_size_choices=initial_custom_size_choices,
+            )
         with gr.Tab("システム"):
             system = build_system_tab(
                 app_settings.comfyui_base_url,
@@ -1116,9 +1145,93 @@ def build_app(
             outputs=[system.capability_message, *capability_outputs],
         )
         generation.size_preset.change(
-            fn=lambda preset: size_preset_values(preset),
+            fn=make_size_preset_handler(custom_size_service),
             inputs=[generation.size_preset],
-            outputs=[generation.width, generation.height],
+            outputs=[
+                generation.width,
+                generation.height,
+                generation.custom_size_delete_button,
+                generation.custom_size_message,
+            ],
+            concurrency_limit=1,
+        )
+        generation.custom_size_delete_button.click(
+            fn=make_custom_size_delete_handler(custom_size_service),
+            inputs=[generation.size_preset],
+            outputs=[
+                generation.size_preset,
+                generation.custom_size_delete_button,
+                generation.custom_size_message,
+            ],
+            concurrency_limit=1,
+        )
+        generation.positive_paste_button.click(
+            fn=None,
+            inputs=[generation.positive_prompt],
+            outputs=[generation.positive_prompt, generation.positive_clipboard_message],
+            js=(
+                "async value => {"
+                "try {"
+                "if (!navigator.clipboard) throw new Error('clipboard');"
+                "const text = await navigator.clipboard.readText();"
+                "return [text, 'クリップボードから貼り付けました。'];"
+                "} catch (_) {"
+                "return [value, 'クリップボードを利用できませんでした'];"
+                "}"
+                "}"
+            ),
+            queue=False,
+        )
+        generation.positive_copy_button.click(
+            fn=None,
+            inputs=[generation.positive_prompt],
+            outputs=[generation.positive_clipboard_message],
+            js=(
+                "async value => {"
+                "try {"
+                "if (!navigator.clipboard) throw new Error('clipboard');"
+                "await navigator.clipboard.writeText(value || '');"
+                "return ['クリップボードへコピーしました。'];"
+                "} catch (_) {"
+                "return ['クリップボードを利用できませんでした'];"
+                "}"
+                "}"
+            ),
+            queue=False,
+        )
+        generation.negative_paste_button.click(
+            fn=None,
+            inputs=[generation.negative_prompt],
+            outputs=[generation.negative_prompt, generation.negative_clipboard_message],
+            js=(
+                "async value => {"
+                "try {"
+                "if (!navigator.clipboard) throw new Error('clipboard');"
+                "const text = await navigator.clipboard.readText();"
+                "return [text, 'クリップボードから貼り付けました。'];"
+                "} catch (_) {"
+                "return [value, 'クリップボードを利用できませんでした'];"
+                "}"
+                "}"
+            ),
+            queue=False,
+        )
+        generation.negative_copy_button.click(
+            fn=None,
+            inputs=[generation.negative_prompt],
+            outputs=[generation.negative_clipboard_message],
+            js=(
+                "async value => {"
+                "try {"
+                "if (!navigator.clipboard) throw new Error('clipboard');"
+                "await navigator.clipboard.writeText(value || '');"
+                "return ['クリップボードへコピーしました。'];"
+                "} catch (_) {"
+                "return ['クリップボードを利用できませんでした'];"
+                "}"
+                "}"
+            ),
+            queue=False,
         )
         generation.positive_clear_button.click(
             fn=lambda: "",
@@ -1227,9 +1340,17 @@ def build_app(
             generation.hires_denoise,
             generation.final_upscale,
             generation.interactive_client_local_date,
+            generation.workflow_template_id,
+            generation.workflow_template_version,
         ]
-        interactive_date_event = generation.interactive_start_button.click(
-            fn=None,
+        interactive_disable_event = generation.generate_button.click(
+            fn=disable_generate_button,
+            outputs=[generation.generate_button],
+            queue=False,
+        )
+        interactive_date_event = interactive_disable_event.then(
+            fn=lambda value: value,
+            inputs=[generation.interactive_client_local_date],
             outputs=[generation.interactive_client_local_date],
             js=(
                 "() => {"
@@ -1239,12 +1360,14 @@ def build_app(
                 "${pad(now.getDate())}`];"
                 "}"
             ),
-            queue=False,
+            queue=True,
         )
-        interactive_date_event.then(
+        interactive_start_result = interactive_date_event.then(
             fn=make_interactive_start_handler(
                 interactive_generation_service,
                 app_settings.max_loras,
+                preflight_service,
+                form_state_service.save,
             ),
             inputs=interactive_inputs,
             outputs=[
@@ -1254,8 +1377,28 @@ def build_app(
                 generation.batch_message,
             ],
             concurrency_limit=1,
+            concurrency_id="interactive-generation",
         )
-        generation.interactive_cancel_button.click(
+        interactive_start_result.then(
+            fn=interactive_action_updates,
+            inputs=[generation.interactive_status],
+            outputs=[generation.generate_button, generation.interactive_cancel_button],
+            queue=False,
+        ).then(
+            fn=make_custom_size_refresh_handler(
+                custom_size_service,
+                interactive_generation_service,
+            ),
+            inputs=[generation.interactive_run_id, generation.size_preset],
+            outputs=[generation.size_preset, generation.custom_size_message],
+            concurrency_limit=1,
+        )
+        cancel_event = generation.interactive_cancel_button.click(
+            fn=lambda: gr.Button(value="キャンセル中...", interactive=False),
+            outputs=[generation.interactive_cancel_button],
+            queue=False,
+        )
+        cancel_result = cancel_event.then(
             fn=make_interactive_cancel_handler(interactive_generation_service),
             inputs=[generation.interactive_run_id],
             outputs=[
@@ -1265,9 +1408,17 @@ def build_app(
                 generation.batch_message,
             ],
             concurrency_limit=1,
+            concurrency_id="interactive-generation",
         )
-        demo.load(
+        cancel_result.then(
+            fn=interactive_action_updates,
+            inputs=[generation.interactive_status],
+            outputs=[generation.generate_button, generation.interactive_cancel_button],
+            queue=False,
+        )
+        restore_interactive_event = demo.load(
             fn=make_interactive_refresh_handler(interactive_generation_service),
+            inputs=[generation.interactive_run_id],
             outputs=[
                 generation.interactive_run_id,
                 generation.interactive_status,
@@ -1275,9 +1426,25 @@ def build_app(
                 generation.batch_message,
             ],
             concurrency_limit=1,
+            concurrency_id="interactive-generation",
         )
-        generation.interactive_poll_timer.tick(
+        restore_interactive_event.then(
+            fn=interactive_action_updates,
+            inputs=[generation.interactive_status],
+            outputs=[generation.generate_button, generation.interactive_cancel_button],
+            queue=False,
+        ).then(
+            fn=make_custom_size_refresh_handler(
+                custom_size_service,
+                interactive_generation_service,
+            ),
+            inputs=[generation.interactive_run_id, generation.size_preset],
+            outputs=[generation.size_preset, generation.custom_size_message],
+            concurrency_limit=1,
+        )
+        interactive_poll_event = generation.interactive_poll_timer.tick(
             fn=make_interactive_refresh_handler(interactive_generation_service),
+            inputs=[generation.interactive_run_id],
             outputs=[
                 generation.interactive_run_id,
                 generation.interactive_status,
@@ -1285,6 +1452,26 @@ def build_app(
                 generation.batch_message,
             ],
             concurrency_limit=1,
+            concurrency_id="interactive-generation",
+        )
+        interactive_poll_event.then(
+            fn=interactive_action_updates,
+            inputs=[generation.interactive_status],
+            outputs=[generation.generate_button, generation.interactive_cancel_button],
+            queue=False,
+        ).then(
+            fn=make_custom_size_refresh_handler(
+                custom_size_service,
+                interactive_generation_service,
+            ),
+            inputs=[generation.interactive_run_id, generation.size_preset],
+            outputs=[generation.size_preset, generation.custom_size_message],
+            concurrency_limit=1,
+        )
+        generation.interactive_result_gallery.select(
+            fn=make_interactive_gallery_select_handler(),
+            outputs=[generation.interactive_selected_image_index],
+            queue=False,
         )
         queue_refresh.click(
             fn=make_queue_refresh_handler(queue_service),
@@ -2233,6 +2420,50 @@ def build_app(
             generation.restored_from_generation,
             generation.regeneration_valid,
         ]
+        gallery_restore_base = make_restore_handler(history_service, app_settings.max_loras)
+
+        def gallery_restore_delegate(
+            selected: str | None,
+            checkpoint_choices: object = None,
+            vae_choices: object = None,
+            lora_choices: object = None,
+        ) -> tuple[object, ...]:
+            base = gallery_restore_base(selected, checkpoint_choices, vae_choices, lora_choices)
+            if not selected or base[-1] is not True:
+                return (*base, gr.skip(), gr.skip(), gr.skip(), gr.skip())
+            try:
+                restored = history_service.restore_settings(
+                    UUID(selected),
+                    checkpoints=(
+                        tuple(value for value in checkpoint_choices if isinstance(value, str))
+                        if isinstance(checkpoint_choices, (list, tuple))
+                        else None
+                    ),
+                    vaes=(
+                        tuple(value for value in vae_choices if isinstance(value, str))
+                        if isinstance(vae_choices, (list, tuple))
+                        else None
+                    ),
+                    loras=(
+                        tuple(value for value in lora_choices if isinstance(value, str))
+                        if isinstance(lora_choices, (list, tuple))
+                        else None
+                    ),
+                    max_loras=app_settings.max_loras,
+                )
+            except (ValueError, GenerationHistoryError):
+                return (*base, gr.skip(), gr.skip(), gr.skip(), gr.skip())
+            values = list(base)
+            values[7] = "Fixed"
+            settings = restored.settings
+            return (
+                *values,
+                settings.batch_size,
+                1,
+                settings.workflow_template_id,
+                settings.workflow_template_version,
+            )
+
         metadata_import.apply_generation.click(
             fn=make_metadata_generation_apply_handler(
                 metadata_import_service,
@@ -2265,6 +2496,28 @@ def build_app(
                 generation.lora_editor.choices,
             ],
             outputs=restore_outputs,
+        )
+        generation.interactive_restore_button.click(
+            fn=make_interactive_gallery_restore_handler(
+                interactive_generation_service,
+                gallery_restore_delegate,
+            ),
+            inputs=[
+                generation.interactive_run_id,
+                generation.interactive_selected_image_index,
+                generation.checkpoint_choices,
+                generation.vae_choices,
+                generation.lora_editor.choices,
+            ],
+            outputs=[
+                *restore_outputs,
+                generation.batch_size,
+                generation.batch_count,
+                generation.workflow_template_id,
+                generation.workflow_template_version,
+            ],
+            concurrency_limit=1,
+            concurrency_id="interactive-generation",
         )
         generation_inputs = [
             generation.checkpoint,
@@ -2336,35 +2589,6 @@ def build_app(
             fn=mobile_status_poll_handler,
             inputs=mobile_status_inputs,
             outputs=mobile_status_poll_outputs,
-        )
-        generate_event = generation.generate_button.click(
-            fn=disable_generate_button,
-            outputs=[generation.generate_button],
-            queue=False,
-        )
-        generation_enqueue_event = generate_event.then(
-            fn=make_enqueue_handler(
-                queue_service,
-                app_settings.max_loras,
-                preflight_service,
-                form_state_service.save,
-            ),
-            inputs=generation_inputs,
-            outputs=[
-                generation.generate_button,
-                generation.progress,
-                generation.result_image,
-                generation.result_details,
-                generation.regeneration_requested,
-                generation.active_generation_id,
-            ],
-            concurrency_limit=1,
-        )
-        generation_enqueue_event.then(
-            fn=mobile_status_poll_handler,
-            inputs=mobile_status_inputs,
-            outputs=mobile_status_poll_outputs,
-            concurrency_limit=1,
         )
         generation.result_edit_button.click(
             fn=make_restore_handler(history_service, app_settings.max_loras),

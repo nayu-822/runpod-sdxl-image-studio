@@ -70,6 +70,8 @@ class InteractiveRunRepositoryProtocol(Protocol):
 
     def get_latest_completed(self) -> InteractiveGenerationRun | None: ...
 
+    def get_latest(self) -> InteractiveGenerationRun | None: ...
+
     def get_by_id(self, run_id: UUID) -> InteractiveGenerationRun | None: ...
 
     def attach_generations(
@@ -261,6 +263,23 @@ class InteractiveRunRepository(InteractiveRunRepositoryProtocol):
             raise InteractiveRunRepositoryError(
                 "latest completed interactive run could not be read"
             ) from exc
+
+    def get_latest(self) -> InteractiveGenerationRun | None:
+        """Return the newest run regardless of its terminal status."""
+
+        try:
+            with session_scope(self._session_factory) as session:
+                row = session.scalar(
+                    select(InteractiveGenerationRunModel)
+                    .order_by(
+                        InteractiveGenerationRunModel.created_at.desc(),
+                        InteractiveGenerationRunModel.updated_at.desc(),
+                    )
+                    .limit(1)
+                )
+                return _to_domain(row) if row is not None else None
+        except (SQLAlchemyError, SnapshotError, ValueError) as exc:
+            raise InteractiveRunRepositoryError("latest interactive run could not be read") from exc
 
     def get_by_id(self, run_id: UUID) -> InteractiveGenerationRun | None:
         try:

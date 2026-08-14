@@ -21,7 +21,14 @@ VIEWPORTS = (
     (1280, 800),
 )
 TAB_CONTROLS = {
-    "生成": ("Positive prompt", "生成をキューへ追加", "実使用Seed（コピー）"),
+    "生成": (
+        "Positive prompt",
+        "生成",
+        "キャンセル",
+        "Positiveへ貼り付け",
+        "Negativeへ貼り付け",
+        "実使用Seed（コピー）",
+    ),
     "システム": (
         "System Health",
         "Refresh system status",
@@ -180,7 +187,7 @@ def test_phase9_system_tab_is_usable_at_all_required_viewports() -> None:
 
 
 def test_phase_a_batch_controls_are_present_at_mobile_viewport() -> None:
-    """The interactive batch controls remain reachable on a narrow screen."""
+    """The batch semantics remain reachable while legacy enqueue controls stay hidden."""
 
     from playwright.sync_api import sync_playwright
 
@@ -195,8 +202,9 @@ def test_phase_a_batch_controls_are_present_at_mobile_viewport() -> None:
             accordion = page.get_by_text("バッチ生成", exact=True)
             assert _click_visible(page, accordion), "batch accordion is not reachable"
             assert _has_visible_text(page, "Batch size")
-            assert _has_visible_text(page, "対話的生成を開始")
-            assert _has_visible_text(page, "対話的生成をキャンセル")
+            assert _has_visible_text(page, "Batch count")
+            assert not _has_visible_text(page, "対話的生成を開始")
+            assert not _has_visible_text(page, "バッチをキューへ追加")
             _assert_no_horizontal_overflow(page)
         finally:
             browser.close()
