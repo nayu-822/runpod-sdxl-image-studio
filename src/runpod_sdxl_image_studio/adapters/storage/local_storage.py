@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import warnings
 from datetime import datetime
 from io import BytesIO
@@ -55,6 +56,7 @@ class LocalStorageAdapter:
         created_at: datetime,
         *,
         kind: GenerationKind = GenerationKind.STANDARD,
+        client_local_date: str | None = None,
     ) -> StoredImage:
         """Validate and atomically save an image without overwriting an existing file."""
 
@@ -62,10 +64,18 @@ class LocalStorageAdapter:
             raise StorageError("Image data is empty")
         width, height = _validate_image(image_bytes)
         local_datetime = created_at.astimezone(self._timezone)
-        local_date = local_datetime.date().isoformat()
+        local_date = _validated_client_date(client_local_date) or local_datetime.date().isoformat()
         folder = "upscaled" if kind is GenerationKind.UPSCALE else "generated"
         target_dir = self._data_dir / "generations" / local_date / folder
+        _ensure_safe_storage_directory(target_dir, self._data_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
+        if client_local_date is not None:
+            return self._store_with_client_sequence(
+                image_bytes,
+                width,
+                height,
+                target_dir,
+            )
         timestamp = local_datetime.strftime("%Y%m%d_%H%M%S")
         final_path = target_dir / f"{timestamp}_{generation_id.hex[:8]}.png"
         if final_path.exists():
@@ -105,6 +115,48 @@ class LocalStorageAdapter:
             mime_type="image/png",
         )
 
+    def _store_with_client_sequence(
+        self,
+        image_bytes: bytes,
+        width: int,
+        height: int,
+        target_dir: Path,
+    ) -> StoredImage:
+        """Create a browser-date filename with an exclusive, race-safe allocation."""
+
+        canonical = _canonical_png(image_bytes)
+        digest = hashlib.sha256(canonical).hexdigest()
+        for sequence in range(1, 1_000_000):
+            final_path = target_dir / f"{sequence:06d}.png"
+            file_descriptor: int | None = None
+            try:
+                file_descriptor = os.open(
+                    final_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o644,
+                )
+                with os.fdopen(file_descriptor, "wb") as output:
+                    file_descriptor = None
+                    output.write(canonical)
+                    output.flush()
+                    os.fsync(output.fileno())
+                return StoredImage(
+                    path=final_path,
+                    sha256=digest,
+                    size_bytes=len(canonical),
+                    width=width,
+                    height=height,
+                    mime_type="image/png",
+                )
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                raise StorageError("Could not store generated image") from exc
+            finally:
+                if file_descriptor is not None:
+                    os.close(file_descriptor)
+        raise StorageError("No available six-digit image sequence remains")
+
 
 def _validate_image(image_bytes: bytes) -> tuple[int, int]:
     try:
@@ -128,6 +180,52 @@ def _canonical_png(image_bytes: bytes) -> bytes:
             return output.getvalue()
     except (UnidentifiedImageError, OSError) as exc:
         raise StorageError("Generated image could not be normalized") from exc
+
+
+def _validated_client_date(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized) is None:
+        raise StorageError("Client local date must use YYYY-MM-DD")
+    try:
+        datetime.strptime(normalized, "%Y-%m-%d")
+    except ValueError as exc:
+        raise StorageError("Client local date is invalid") from exc
+    return normalized
+
+
+def _ensure_safe_storage_directory(target_dir: Path, data_dir: Path) -> None:
+    """Reject a date/folder path that escapes the configured data root via a symlink."""
+
+    resolved_root = _normalized_windows_path(os.path.realpath(os.fspath(data_dir)))
+    resolved_target = _normalized_windows_path(os.path.realpath(os.fspath(target_dir)))
+    try:
+        resolved_target.relative_to(resolved_root)
+    except ValueError as exc:
+        raise StorageError("Storage directory is outside the data directory") from exc
+
+    absolute_root = _normalized_windows_path(os.path.abspath(os.fspath(data_dir)))
+    absolute_target = _normalized_windows_path(os.path.abspath(os.fspath(target_dir)))
+    try:
+        relative_parts = absolute_target.relative_to(absolute_root).parts
+    except ValueError as exc:
+        raise StorageError("Storage directory is outside the data directory") from exc
+    current = absolute_root
+    for part in relative_parts:
+        current = current / part
+        if current.is_symlink():
+            raise StorageError("Storage directory must not contain symlinks")
+
+
+def _normalized_windows_path(value: str) -> Path:
+    """Normalize Windows extended-length paths returned during concurrent mkdir."""
+
+    if value.startswith("\\\\?\\UNC\\"):
+        value = "\\\\" + value[8:]
+    elif value.startswith("\\\\?\\"):
+        value = value[4:]
+    return Path(os.path.normcase(value))
 
 
 __all__ = ["LocalStorageAdapter", "StorageError"]

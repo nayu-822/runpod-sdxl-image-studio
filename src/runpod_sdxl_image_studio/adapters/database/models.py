@@ -17,6 +17,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -166,7 +167,12 @@ class PodLifecycleSessionModel(Base):
 class GenerationArtifactModel(Base):
     __tablename__ = "generation_artifacts"
     __table_args__ = (
-        UniqueConstraint("generation_id", "artifact_type", "sha256", name="uq_generation_artifact"),
+        UniqueConstraint(
+            "generation_id",
+            "artifact_type",
+            "display_order",
+            name="uq_generation_artifact_order",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -181,6 +187,49 @@ class GenerationArtifactModel(Base):
     height: Mapped[int | None] = mapped_column(Integer, nullable=True)
     mime_type: Mapped[str] = mapped_column(String(100), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    display_order: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+
+
+class InteractiveGenerationRunModel(Base):
+    """Durable state for the one-at-a-time interactive generation session."""
+
+    __tablename__ = "interactive_generation_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'cancelling', 'completed', 'failed', 'cancelled')",
+            name="ck_interactive_run_status",
+        ),
+        CheckConstraint("batch_count > 0 AND batch_count <= 100", name="ck_interactive_run_count"),
+        CheckConstraint("batch_size > 0 AND batch_size <= 4", name="ck_interactive_run_size"),
+        Index(
+            "uq_interactive_run_active",
+            text("1"),
+            unique=True,
+            sqlite_where=text("status IN ('active', 'cancelling')"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    batch_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    batch_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    settings_snapshot_json: Mapped[str] = mapped_column(Text, nullable=False)
+    snapshot_schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    client_local_date: Mapped[str] = mapped_column(String(10), nullable=False)
+    generation_ids_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    completed_generation_ids_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    current_generation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    last_completed_generation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class MetadataImportModel(Base):

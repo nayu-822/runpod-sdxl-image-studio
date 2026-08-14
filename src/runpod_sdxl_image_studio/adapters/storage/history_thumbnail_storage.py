@@ -27,7 +27,16 @@ class HistoryThumbnailStorage:
         self._max_edge = min(app_settings.history_thumbnail_max_edge, 2048)
         self._timezone = ZoneInfo(app_settings.timezone)
 
-    def save(self, image_path: Path, generation_id: UUID, created_at: datetime) -> Path:
+    def save(
+        self,
+        image_path: Path,
+        generation_id: UUID,
+        created_at: datetime,
+        *,
+        display_order: int = 0,
+    ) -> Path:
+        if display_order < 0:
+            raise StorageError("Thumbnail display order must not be negative")
         try:
             with Image.open(image_path) as source:
                 image = source.convert("RGB")
@@ -40,7 +49,8 @@ class HistoryThumbnailStorage:
         local_date = created_at.astimezone(self._timezone).date().isoformat()
         target_dir = self._data_dir / "generations" / local_date / "thumbnails"
         target_dir.mkdir(parents=True, exist_ok=True)
-        target = target_dir / f"{generation_id}.webp"
+        suffix = "" if display_order == 0 else f"_{display_order:06d}"
+        target = target_dir / f"{generation_id}{suffix}.webp"
         temporary: Path | None = None
         try:
             with NamedTemporaryFile(

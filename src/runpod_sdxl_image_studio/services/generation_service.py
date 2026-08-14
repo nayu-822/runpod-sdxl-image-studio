@@ -300,14 +300,22 @@ class GenerationService:
         ):
             return OptionalArtifactRepairOutcome.DEFERRED
 
-        primary_artifact = next(
-            (artifact for artifact in artifacts if artifact.artifact_type is ArtifactType.IMAGE),
-            None,
+        primary_artifacts = tuple(
+            sorted(
+                (
+                    artifact
+                    for artifact in artifacts
+                    if artifact.artifact_type is ArtifactType.IMAGE
+                ),
+                key=lambda artifact: artifact.display_order,
+            )
         )
-        if primary_artifact is None:
+        if not primary_artifacts:
             return OptionalArtifactRepairOutcome.DEFERRED
         try:
-            stored_image = self._stored_image_from_artifact(primary_artifact)
+            stored_images = tuple(
+                self._stored_image_from_artifact(artifact) for artifact in primary_artifacts
+            )
             settings = generation.settings_snapshot.to_generation_settings()
             upscale_snapshot = None
             if generation.kind is GenerationKind.UPSCALE:
@@ -321,13 +329,14 @@ class GenerationService:
             self._persist_optional_artifacts(
                 job,
                 settings,
-                stored_image,
+                stored_images[0],
                 generation.completed_at,
                 generation.kind,
                 generation.parent_generation_id,
                 existing_artifacts=artifacts,
                 persisted_upscale_snapshot=upscale_snapshot,
                 load_upscale_settings=False,
+                images=stored_images,
             )
             repaired_artifacts = self._artifact_repository.list_by_generation(generation_id)
         except Exception as exc:  # noqa: BLE001 - one repair must not alter terminal state
@@ -426,32 +435,42 @@ class GenerationService:
                 return ReconciliationOutcome.UNAVAILABLE
             if not history.is_completed or not history.outputs:
                 return ReconciliationOutcome.IN_PROGRESS
-            image_bytes = await self._client.get_output_image(history.outputs[0])
             persisted_upscale = None
-            if generation.kind is GenerationKind.UPSCALE:
-                try:
-                    persisted_upscale = self._validate_upscale_output(generation_id, image_bytes)
-                except UpscaleEnqueueError as exc:
-                    if exc.code in _RECONCILIATION_UPSCALE_FAILURE_CODES:
-                        return self._fail_reconciled_upscale(job, exc)
-                    raise
-            stored_image = self._storage.store_image(
-                image_bytes, generation_id, generation.created_at, kind=generation.kind
-            )
-            if persisted_upscale is not None:
-                try:
-                    self._ensure_stored_upscale_dimensions(stored_image, persisted_upscale)
-                except UpscaleEnqueueError as exc:
-                    if exc.code in _RECONCILIATION_UPSCALE_FAILURE_CODES:
-                        return self._fail_reconciled_upscale(job, exc)
-                    raise
+            stored_images: list[StoredImage] = []
+            for output in history.outputs:
+                image_bytes = await self._client.get_output_image(output)
+                if generation.kind is GenerationKind.UPSCALE:
+                    try:
+                        persisted_upscale = self._validate_upscale_output(
+                            generation_id, image_bytes
+                        )
+                    except UpscaleEnqueueError as exc:
+                        if exc.code in _RECONCILIATION_UPSCALE_FAILURE_CODES:
+                            return self._fail_reconciled_upscale(job, exc)
+                        raise
+                stored_image = self._storage.store_image(
+                    image_bytes,
+                    generation_id,
+                    generation.created_at,
+                    kind=generation.kind,
+                    client_local_date=generation.settings_snapshot.client_local_date,
+                )
+                if persisted_upscale is not None:
+                    try:
+                        self._ensure_stored_upscale_dimensions(stored_image, persisted_upscale)
+                    except UpscaleEnqueueError as exc:
+                        if exc.code in _RECONCILIATION_UPSCALE_FAILURE_CODES:
+                            return self._fail_reconciled_upscale(job, exc)
+                        raise
+                stored_images.append(stored_image)
             recovery_job = GenerationJob(
                 generation_id=generation_id,
                 status=GenerationStatus.RUNNING,
                 id=job.id,
                 prompt_id=prompt_id,
                 created_at=generation.created_at,
-                stored_image=stored_image,
+                stored_image=stored_images[0],
+                stored_images=tuple(stored_images),
             )
             self._complete_job(
                 recovery_job,
@@ -1024,16 +1043,23 @@ class GenerationService:
             raise ComfyUIPromptError("ComfyUI completed without an output image")
         if cancel_check is not None and cancel_check():
             raise GenerationCancelledError("generation was cancelled during execution")
-        image_bytes = await self._client.get_output_image(history.outputs[0])
         persisted_upscale = None
-        if kind is GenerationKind.UPSCALE:
-            persisted_upscale = self._validate_upscale_output(job.generation_id, image_bytes)
-        job.stored_image = self._storage.store_image(
-            image_bytes,
-            job.generation_id,
-            created_at,
-            kind=kind,
-        )
+        stored_images: list[StoredImage] = []
+        for output in history.outputs:
+            image_bytes = await self._client.get_output_image(output)
+            if kind is GenerationKind.UPSCALE:
+                persisted_upscale = self._validate_upscale_output(job.generation_id, image_bytes)
+            stored_images.append(
+                self._storage.store_image(
+                    image_bytes,
+                    job.generation_id,
+                    created_at,
+                    kind=kind,
+                    client_local_date=settings.client_local_date,
+                )
+            )
+        job.stored_images = tuple(stored_images)
+        job.stored_image = stored_images[0]
         if (
             kind is GenerationKind.UPSCALE
             and persisted_upscale is None
@@ -1176,18 +1202,35 @@ class GenerationService:
     ) -> None:
         if job.stored_image is None:
             raise GenerationPersistenceError("stored image is missing")
-        image = job.stored_image
+        images = job.stored_images or (job.stored_image,)
+        if any(image is None for image in images):
+            raise GenerationPersistenceError("stored image is missing")
+        stored_images = tuple(image for image in images if image is not None)
+        image = stored_images[0]
         completed_at = datetime.now(UTC)
-        primary_artifact = self._primary_image_artifact(job, image, completed_at)
+        primary_artifacts = tuple(
+            self._primary_image_artifact(job, item, completed_at, display_order=index)
+            for index, item in enumerate(stored_images)
+        )
         if self._generation_repository is not None:
             if self._completion_repository is not None:
                 try:
-                    self._completion_repository.complete_generation(
-                        job.generation_id,
-                        job.id,
-                        primary_artifact,
-                        completed_at,
-                    )
+                    if len(primary_artifacts) == 1:
+                        self._completion_repository.complete_generation(
+                            job.generation_id,
+                            job.id,
+                            primary_artifacts[0],
+                            completed_at,
+                        )
+                    else:
+                        complete_batch = getattr(
+                            self._completion_repository, "complete_generation_batch", None
+                        )
+                        if not callable(complete_batch):
+                            raise GenerationRepositoryError(
+                                "batch completion repository is unavailable"
+                            )
+                        complete_batch(job.generation_id, job.id, primary_artifacts, completed_at)
                 except GenerationRepositoryError as exc:
                     logger.error(
                         "Generation completion persistence failed generation=%s job=%s "
@@ -1195,7 +1238,7 @@ class GenerationService:
                         job.generation_id,
                         job.id,
                         job.prompt_id or "",
-                        primary_artifact.local_path,
+                        primary_artifacts[0].local_path,
                         type(exc).__name__,
                     )
                     error_type = (
@@ -1205,7 +1248,8 @@ class GenerationService:
             else:
                 if self._job_repository is None:
                     raise CompletionPersistenceError("job persistence is unavailable")
-                self._persist_primary_image_artifact(job, primary_artifact)
+                for primary_artifact in primary_artifacts:
+                    self._persist_primary_image_artifact(job, primary_artifact)
                 try:
                     self._generation_repository.mark_completed(job.generation_id, completed_at)
                     self._job_repository.mark_completed(job.id, completed_at)
@@ -1231,6 +1275,7 @@ class GenerationService:
             completed_at,
             kind,
             parent_generation_id,
+            images=stored_images,
         )
         self._notify_drive_sync(job.generation_id)
 
@@ -1313,15 +1358,13 @@ class GenerationService:
         existing_artifacts: tuple[GenerationArtifact, ...] | None = None,
         persisted_upscale_snapshot: UpscaleSettingsSnapshot | None = None,
         load_upscale_settings: bool = True,
+        images: tuple[StoredImage, ...] | None = None,
     ) -> None:
         if self._artifact_repository is None:
             return
         if existing_artifacts is None:
             try:
-                existing_types = {
-                    artifact.artifact_type
-                    for artifact in self._artifact_repository.list_by_generation(job.generation_id)
-                }
+                current_artifacts = self._artifact_repository.list_by_generation(job.generation_id)
             except Exception as exc:  # noqa: BLE001 - optional metadata must not change completion
                 logger.warning(
                     "Optional artifact lookup warning generation=%s error=%s",
@@ -1330,7 +1373,14 @@ class GenerationService:
                 )
                 return
         else:
-            existing_types = {artifact.artifact_type for artifact in existing_artifacts}
+            current_artifacts = existing_artifacts
+        existing_types = {artifact.artifact_type for artifact in current_artifacts}
+        existing_thumbnail_orders = {
+            artifact.display_order
+            for artifact in current_artifacts
+            if artifact.artifact_type is ArtifactType.THUMBNAIL
+        }
+        all_images = images or (image,)
         image_path = image.path
         if self._metadata_storage is not None:
             if ArtifactType.METADATA in existing_types:
@@ -1344,6 +1394,7 @@ class GenerationService:
                         kind,
                         parent_generation_id,
                         created_at,
+                        images=all_images,
                     )
                     if kind is GenerationKind.UPSCALE and load_upscale_settings:
                         if self._upscale_settings_repository is None:
@@ -1369,6 +1420,7 @@ class GenerationService:
                             height=None,
                             mime_type="application/json",
                             created_at=created_at,
+                            display_order=0,
                         )
                     )
                 except Exception as exc:  # noqa: BLE001 - optional metadata is best effort
@@ -1377,37 +1429,54 @@ class GenerationService:
                         job.generation_id,
                         type(exc).__name__,
                     )
-        if self._thumbnail_storage is not None and ArtifactType.THUMBNAIL not in existing_types:
-            try:
-                thumbnail_path = self._thumbnail_storage.save(
-                    image_path, job.generation_id, created_at
-                )
-                self._artifact_repository.add(
-                    GenerationArtifact(
-                        id=self._id_factory(),
-                        generation_id=job.generation_id,
-                        artifact_type=ArtifactType.THUMBNAIL,
-                        local_path=self._thumbnail_storage.relative_path(thumbnail_path),
-                        sha256=self._thumbnail_storage.sha256(thumbnail_path),
-                        size_bytes=thumbnail_path.stat().st_size,
-                        width=None,
-                        height=None,
-                        mime_type="image/webp",
-                        created_at=created_at,
+        if self._thumbnail_storage is not None:
+            for display_order, stored in enumerate(all_images):
+                if display_order in existing_thumbnail_orders:
+                    continue
+                try:
+                    if display_order == 0:
+                        thumbnail_path = self._thumbnail_storage.save(
+                            stored.path,
+                            job.generation_id,
+                            created_at,
+                        )
+                    else:
+                        thumbnail_path = self._thumbnail_storage.save(
+                            stored.path,
+                            job.generation_id,
+                            created_at,
+                            display_order=display_order,
+                        )
+                    self._artifact_repository.add(
+                        GenerationArtifact(
+                            id=self._id_factory(),
+                            generation_id=job.generation_id,
+                            artifact_type=ArtifactType.THUMBNAIL,
+                            local_path=self._thumbnail_storage.relative_path(thumbnail_path),
+                            sha256=self._thumbnail_storage.sha256(thumbnail_path),
+                            size_bytes=thumbnail_path.stat().st_size,
+                            width=None,
+                            height=None,
+                            mime_type="image/webp",
+                            created_at=created_at,
+                            display_order=display_order,
+                        )
                     )
-                )
-            except Exception as exc:  # noqa: BLE001 - optional thumbnail is best effort
-                logger.warning(
-                    "Generation thumbnail warning generation=%s error=%s",
-                    job.generation_id,
-                    type(exc).__name__,
-                )
+                except Exception as exc:  # noqa: BLE001 - optional thumbnail is best effort
+                    logger.warning(
+                        "Generation thumbnail warning generation=%s order=%s error=%s",
+                        job.generation_id,
+                        display_order,
+                        type(exc).__name__,
+                    )
 
     def _primary_image_artifact(
         self,
         job: GenerationJob,
         image: StoredImage,
         created_at: datetime,
+        *,
+        display_order: int = 0,
     ) -> GenerationArtifact:
         return GenerationArtifact(
             id=self._id_factory(),
@@ -1420,6 +1489,7 @@ class GenerationService:
             height=image.height,
             mime_type=image.mime_type,
             created_at=created_at,
+            display_order=display_order,
         )
 
     def _mark_failed_pair(self, job: GenerationJob, code: str, summary: str) -> None:
@@ -1465,6 +1535,7 @@ class GenerationService:
             stored_image=job.stored_image,
             error_message=None,
             created_at=created_at,
+            stored_images=job.stored_images or (job.stored_image,),
         )
 
     @staticmethod
@@ -1503,6 +1574,20 @@ def _validate_generation(
         raise WorkflowError("The configured maximum number of LoRAs was exceeded")
     if settings.loras and "LoraLoader" not in node_classes:
         raise WorkflowError("LoRA loading is unavailable in ComfyUI")
+    if settings.clip_skip > 1 and "CLIPSetLastLayer" not in node_classes:
+        raise WorkflowError("CLIP skip is unavailable in ComfyUI")
+    if settings.hires_fix and "LatentUpscale" not in node_classes:
+        raise WorkflowError("Hires.fix is unavailable in ComfyUI")
+    if settings.hires_fix and settings.width * settings.hires_scale > limits.max_width:
+        raise WorkflowError("Hires.fix width exceeds the configured limit")
+    if settings.hires_fix and settings.height * settings.hires_scale > limits.max_height:
+        raise WorkflowError("Hires.fix height exceeds the configured limit")
+    if settings.final_upscale:
+        if "UpscaleModelLoader" not in node_classes or "ImageUpscaleWithModel" not in node_classes:
+            raise WorkflowError("Final upscaling is unavailable in ComfyUI")
+        final_model = settings.final_upscale_model or "4x-UltraSharp.pth"
+        if final_model not in getattr(capabilities, "upscale_models", ()):
+            raise WorkflowError("Selected final upscale model is unavailable")
     if settings.vae_name is not None and "VAELoader" not in node_classes:
         raise WorkflowError("External VAE loading is unavailable in ComfyUI")
     missing_loras = [lora.name for lora in settings.loras if lora.name not in loras]
@@ -1597,7 +1682,10 @@ def _sidecar_payload(
     kind: GenerationKind,
     parent_generation_id: UUID | None,
     completed_at: datetime,
+    *,
+    images: tuple[StoredImage, ...] = (),
 ) -> dict[str, object]:
+    stored_images = images or (image,)
     return {
         "schema_version": 1,
         "generation_id": str(job.generation_id),
@@ -1615,4 +1703,14 @@ def _sidecar_payload(
             "height": image.height,
             "mime_type": image.mime_type,
         },
+        "images": [
+            {
+                "display_order": index,
+                "sha256": item.sha256,
+                "width": item.width,
+                "height": item.height,
+                "mime_type": item.mime_type,
+            }
+            for index, item in enumerate(stored_images)
+        ],
     }

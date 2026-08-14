@@ -671,3 +671,24 @@ stateと設定を復元できることを確認します。
 
 Docker buildと実RunPod確認はlocal test suiteとは別です。Dockerがない環境ではbuildと
 Docker smoke testを未実施と報告し、static checkをimage build成功とは扱いません。
+
+## Phase A: 対話的バッチ生成
+
+Phase Aでは、1回のComfyUI promptから生成する画像数を`batch_size`（1〜4）、
+順番に投入するGeneration数を`batch_count`として分離します。各Generationの
+primary imageは`display_order`付きArtifactとして同一Generationへ保存し、完了時の
+Generation、Job、複数画像ArtifactをSQLite transactionで確定します。
+
+対話的実行は`interactive_generation_runs`へ保存され、同時にactiveにできるrunは
+1件だけです。開始、進捗復元、キャンセル、再起動後のactiveまたは最新completed
+batchの復元をアプリケーションサービス経由で行います。既に送信済みのpromptを
+再送信せず、キャンセル時は既存のqueue reconciliationを利用します。
+
+txt2img workflowでは複数LoRA、CLIP skip、Hires.fix、任意の最終4x upscale、
+ComfyUIのbatch sizeを固定templateの範囲内で扱います。クライアントのAsia/Tokyo
+日付を受け取った場合は`generations/YYYY-MM-DD/{generated,upscaled}`配下で
+6桁連番をexclusive createし、同時実行時の同名上書きを防止します。日付が不正な
+場合は保存せず失敗させます。
+
+Phase Aの自動検証はFake、SQLite、Alembic、Playwrightのbrowser testを使用し、
+実GPU、実ComfyUI、実RunPod、実Google Driveへの接続を必要としません。

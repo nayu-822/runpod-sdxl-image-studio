@@ -39,6 +39,7 @@ REQUIRED_BINDING_FIELDS = (
     "scheduler_name",
     "width",
     "height",
+    "batch_size",
     "filename_prefix",
 )
 
@@ -104,6 +105,7 @@ def build_txt2img_workflow(
         "scheduler_name": settings.scheduler_name,
         "width": settings.width,
         "height": settings.height,
+        "batch_size": settings.batch_size,
         "filename_prefix": SAFE_FILENAME_PREFIX,
     }
     for field_name, binding in bindings.items():
@@ -114,6 +116,11 @@ def build_txt2img_workflow(
 
     _apply_external_vae(workflow, settings.vae_name)
     _apply_lora_chain(workflow, settings)
+    _apply_clip_skip(workflow, settings.clip_skip)
+    if settings.hires_fix:
+        _apply_hires_fix(workflow, settings)
+    if settings.final_upscale:
+        _apply_final_upscale(workflow, settings.final_upscale_model)
 
     try:
         json.dumps(workflow)
@@ -162,6 +169,83 @@ def _apply_lora_chain(workflow: dict[str, object], settings: GenerationSettings)
     _set_binding(workflow, (KSampler_NODE_ID, "inputs", "model"), model_link)
     _set_binding(workflow, (POSITIVE_CLIP_NODE_ID, "inputs", "clip"), clip_link)
     _set_binding(workflow, (NEGATIVE_CLIP_NODE_ID, "inputs", "clip"), clip_link)
+
+
+def _apply_clip_skip(workflow: dict[str, object], clip_skip: int) -> None:
+    if clip_skip == 1:
+        return
+    node_id = "clip_skip"
+    if node_id in workflow:
+        raise WorkflowTemplateError("reserved CLIP skip node id is already in use")
+    positive = _get_input(workflow, POSITIVE_CLIP_NODE_ID, "clip")
+    workflow[node_id] = {
+        "class_type": "CLIPSetLastLayer",
+        "inputs": {"clip": positive, "stop_at_clip_layer": -clip_skip},
+    }
+    link = [node_id, 0]
+    _set_binding(workflow, (POSITIVE_CLIP_NODE_ID, "inputs", "clip"), link)
+    _set_binding(workflow, (NEGATIVE_CLIP_NODE_ID, "inputs", "clip"), link)
+
+
+def _apply_hires_fix(workflow: dict[str, object], settings: GenerationSettings) -> None:
+    if "hires_latent" in workflow or "hires_sampler" in workflow:
+        raise WorkflowTemplateError("reserved Hires.fix node id is already in use")
+    model = _get_input(workflow, KSampler_NODE_ID, "model")
+    positive = _get_input(workflow, KSampler_NODE_ID, "positive")
+    negative = _get_input(workflow, KSampler_NODE_ID, "negative")
+    workflow["hires_latent"] = {
+        "class_type": "LatentUpscale",
+        "inputs": {
+            "upscale_method": "nearest-exact",
+            "width": int(settings.width * settings.hires_scale),
+            "height": int(settings.height * settings.hires_scale),
+            "crop": "disabled",
+            "samples": [KSampler_NODE_ID, 0],
+        },
+    }
+    workflow["hires_sampler"] = {
+        "class_type": "KSampler",
+        "inputs": {
+            "seed": settings.seed,
+            "steps": settings.steps,
+            "cfg": settings.cfg_scale,
+            "sampler_name": settings.sampler_name,
+            "scheduler": settings.scheduler_name,
+            "denoise": settings.hires_denoise,
+            "model": model,
+            "positive": positive,
+            "negative": negative,
+            "latent_image": ["hires_latent", 0],
+        },
+    }
+    _set_binding(workflow, (VAE_DECODE_NODE_ID, "inputs", "samples"), ["hires_sampler", 0])
+
+
+def _apply_final_upscale(workflow: dict[str, object], model_name: str | None) -> None:
+    if "final_upscale_loader" in workflow or "final_upscale" in workflow:
+        raise WorkflowTemplateError("reserved final upscale node id is already in use")
+    workflow["final_upscale_loader"] = {
+        "class_type": "UpscaleModelLoader",
+        "inputs": {"model_name": model_name or "4x-UltraSharp.pth"},
+    }
+    workflow["final_upscale"] = {
+        "class_type": "ImageUpscaleWithModel",
+        "inputs": {
+            "upscale_model": ["final_upscale_loader", 0],
+            "image": [VAE_DECODE_NODE_ID, 0],
+        },
+    }
+    _set_binding(workflow, ("9", "inputs", "images"), ["final_upscale", 0])
+
+
+def _get_input(workflow: dict[str, object], node_id: str, input_name: str) -> object:
+    node_payload = workflow.get(node_id)
+    if not isinstance(node_payload, dict):
+        raise WorkflowBindingError(f"workflow node {node_id} is missing")
+    inputs = node_payload.get("inputs")
+    if not isinstance(inputs, dict) or input_name not in inputs:
+        raise WorkflowBindingError(f"workflow input {node_id}.inputs.{input_name} is missing")
+    return inputs[input_name]
 
 
 def _required_classes(value: object) -> tuple[str, ...]:

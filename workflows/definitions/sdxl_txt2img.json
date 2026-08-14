@@ -1,7 +1,7 @@
 {
   "template_id": "sdxl_txt2img",
   "schema_version": 1,
-  "workflow_version": "1.0",
+  "workflow_version": "2.0",
   "workflow_file": "workflows/templates/sdxl_txt2img.json",
   "required_node_classes": [
     "CheckpointLoaderSimple",
@@ -22,6 +22,7 @@
     "scheduler_name": ["3", "inputs", "scheduler"],
     "width": ["5", "inputs", "width"],
     "height": ["5", "inputs", "height"],
+    "batch_size": ["5", "inputs", "batch_size"],
     "filename_prefix": ["9", "inputs", "filename_prefix"]
   }
 }

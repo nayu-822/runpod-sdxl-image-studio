@@ -26,3 +26,4 @@ class GenerationArtifact:
     height: int | None
     mime_type: str
     created_at: datetime
+    display_order: int = 0

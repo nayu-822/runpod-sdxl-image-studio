@@ -688,6 +688,14 @@ class GenerationCompletionRepositoryProtocol(Protocol):
         completed_at: datetime | None = None,
     ) -> None: ...
 
+    def complete_generation_batch(
+        self,
+        generation_id: UUID,
+        job_id: UUID,
+        image_artifacts: tuple[GenerationArtifact, ...],
+        completed_at: datetime | None = None,
+    ) -> None: ...
+
 
 class GenerationArtifactRepository(GenerationArtifactRepositoryProtocol):
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
@@ -704,10 +712,15 @@ class GenerationArtifactRepository(GenerationArtifactRepositoryProtocol):
                     select(GenerationArtifactModel).where(
                         GenerationArtifactModel.generation_id == str(artifact.generation_id),
                         GenerationArtifactModel.artifact_type == artifact.artifact_type.value,
-                        GenerationArtifactModel.sha256 == artifact.sha256,
+                        GenerationArtifactModel.display_order == artifact.display_order,
                     )
                 )
                 if existing is not None:
+                    if (
+                        existing.sha256 != artifact.sha256
+                        or existing.local_path != artifact.local_path
+                    ):
+                        raise GenerationRepositoryError("artifact display order does not match")
                     return _artifact_domain(existing)
                 row = GenerationArtifactModel(
                     id=str(artifact.id),
@@ -720,6 +733,7 @@ class GenerationArtifactRepository(GenerationArtifactRepositoryProtocol):
                     height=artifact.height,
                     mime_type=artifact.mime_type,
                     created_at=_utc(artifact.created_at),
+                    display_order=artifact.display_order,
                 )
                 session.add(row)
                 session.flush()
@@ -735,7 +749,10 @@ class GenerationArtifactRepository(GenerationArtifactRepositoryProtocol):
                 rows = session.scalars(
                     select(GenerationArtifactModel)
                     .where(GenerationArtifactModel.generation_id == str(generation_id))
-                    .order_by(GenerationArtifactModel.created_at.asc())
+                    .order_by(
+                        GenerationArtifactModel.display_order.asc(),
+                        GenerationArtifactModel.created_at.asc(),
+                    )
                 ).all()
                 return tuple(_artifact_domain(row) for row in rows)
         except SQLAlchemyError as exc:
@@ -750,7 +767,10 @@ class GenerationArtifactRepository(GenerationArtifactRepositoryProtocol):
                         GenerationArtifactModel.generation_id == str(generation_id),
                         GenerationArtifactModel.artifact_type == ArtifactType.IMAGE.value,
                     )
-                    .order_by(GenerationArtifactModel.created_at.asc())
+                    .order_by(
+                        GenerationArtifactModel.display_order.asc(),
+                        GenerationArtifactModel.created_at.asc(),
+                    )
                 )
                 return _artifact_domain(row) if row is not None else None
         except SQLAlchemyError as exc:
@@ -770,10 +790,29 @@ class GenerationCompletionRepository(GenerationCompletionRepositoryProtocol):
         image_artifact: GenerationArtifact,
         completed_at: datetime | None = None,
     ) -> None:
-        if image_artifact.generation_id != generation_id:
+        self.complete_generation_batch(
+            generation_id,
+            job_id,
+            (image_artifact,),
+            completed_at,
+        )
+
+    def complete_generation_batch(
+        self,
+        generation_id: UUID,
+        job_id: UUID,
+        image_artifacts: tuple[GenerationArtifact, ...],
+        completed_at: datetime | None = None,
+    ) -> None:
+        if not image_artifacts:
+            raise GenerationRepositoryError("at least one image artifact is required")
+        if any(artifact.generation_id != generation_id for artifact in image_artifacts):
             raise GenerationRepositoryError("image artifact generation does not match")
-        if _unsafe_relative_path(image_artifact.local_path):
+        if any(_unsafe_relative_path(artifact.local_path) for artifact in image_artifacts):
             raise GenerationRepositoryError("artifact path must be relative")
+        orders = [artifact.display_order for artifact in image_artifacts]
+        if sorted(orders) != list(range(len(image_artifacts))):
+            raise GenerationRepositoryError("image artifact display order is not contiguous")
         timestamp = _utc(completed_at or datetime.now(UTC)) or datetime.now(UTC)
         try:
             with session_scope(self._session_factory) as session:
@@ -781,7 +820,7 @@ class GenerationCompletionRepository(GenerationCompletionRepositoryProtocol):
                 job = _require_job(session, job_id)
                 if job.generation_id != str(generation_id):
                     raise GenerationRepositoryError("job generation does not match")
-                self._add_or_validate_primary_artifact(session, image_artifact)
+                self._add_or_validate_primary_artifacts(session, image_artifacts)
                 _mark_generation_completed(generation, timestamp)
                 _mark_job_completed(job, timestamp)
                 session.flush()
@@ -822,34 +861,39 @@ class GenerationCompletionRepository(GenerationCompletionRepositoryProtocol):
             ) from exc
 
     @staticmethod
-    def _add_or_validate_primary_artifact(session: Session, artifact: GenerationArtifact) -> None:
-        generation = session.get(GenerationModel, str(artifact.generation_id))
+    def _add_or_validate_primary_artifacts(
+        session: Session, artifacts: tuple[GenerationArtifact, ...]
+    ) -> None:
+        generation = session.get(GenerationModel, str(artifacts[0].generation_id))
         if generation is None:
             raise GenerationRepositoryError("generation was not found")
-        existing = session.scalar(
-            select(GenerationArtifactModel).where(
-                GenerationArtifactModel.generation_id == str(artifact.generation_id),
-                GenerationArtifactModel.artifact_type == ArtifactType.IMAGE.value,
+        for artifact in artifacts:
+            existing = session.scalar(
+                select(GenerationArtifactModel).where(
+                    GenerationArtifactModel.generation_id == str(artifact.generation_id),
+                    GenerationArtifactModel.artifact_type == ArtifactType.IMAGE.value,
+                    GenerationArtifactModel.display_order == artifact.display_order,
+                )
             )
-        )
-        if existing is not None:
-            if existing.sha256 != artifact.sha256 or existing.local_path != artifact.local_path:
-                raise GenerationRepositoryError("primary image artifact does not match")
-            return
-        session.add(
-            GenerationArtifactModel(
-                id=str(artifact.id),
-                generation_id=str(artifact.generation_id),
-                artifact_type=ArtifactType.IMAGE.value,
-                local_path=artifact.local_path,
-                sha256=artifact.sha256,
-                size_bytes=artifact.size_bytes,
-                width=artifact.width,
-                height=artifact.height,
-                mime_type=artifact.mime_type,
-                created_at=_utc(artifact.created_at),
+            if existing is not None:
+                if existing.sha256 != artifact.sha256 or existing.local_path != artifact.local_path:
+                    raise GenerationRepositoryError("primary image artifact does not match")
+                continue
+            session.add(
+                GenerationArtifactModel(
+                    id=str(artifact.id),
+                    generation_id=str(artifact.generation_id),
+                    artifact_type=ArtifactType.IMAGE.value,
+                    local_path=artifact.local_path,
+                    sha256=artifact.sha256,
+                    size_bytes=artifact.size_bytes,
+                    width=artifact.width,
+                    height=artifact.height,
+                    mime_type=artifact.mime_type,
+                    created_at=_utc(artifact.created_at),
+                    display_order=artifact.display_order,
+                )
             )
-        )
 
 
 def _require_job(session: Session, job_id: UUID) -> GenerationJobModel:
@@ -1122,6 +1166,7 @@ def _artifact_domain(row: GenerationArtifactModel) -> GenerationArtifact:
         height=row.height,
         mime_type=row.mime_type,
         created_at=_utc(row.created_at) or datetime.now(UTC),
+        display_order=row.display_order,
     )
 
 

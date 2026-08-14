@@ -43,7 +43,7 @@ def test_phase11_migration_round_trip_preserves_existing_rows(tmp_path: Path) ->
     with Session(engine) as session:
         assert session.scalar(select(GenerationModel.id).where(GenerationModel.id == generation_id))
 
-    command.downgrade(config, "-1")
+    command.downgrade(config, "0016_phase11_model_transfer_jobs")
     assert inspect(engine).has_table("model_transfer_jobs")
     assert not inspect(engine).has_table("generation_form_state")
     assert not inspect(engine).has_table("pod_lifecycle_sessions")

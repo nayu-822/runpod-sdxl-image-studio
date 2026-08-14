@@ -631,3 +631,25 @@ troubleshootingを記載します。
 Phase 13の検証では、Dockerfileと`.dockerignore`のpolicy、bootstrapのsyntaxとSecret
 materialization、ComfyUI readinessとprocess supervision、GPU不要のimage smoke test、
 Phase 10〜12のregression test、Alembic upgrade/downgrade互換性を確認します。
+
+## Phase A: 対話的バッチ生成の完了条件
+
+Phase Aでは、`batch_size`を1回のComfyUI promptから得る画像数（1〜4）、
+`batch_count`を順次作成するGeneration数として扱います。1つのGenerationに
+複数のprimary image Artifactを`display_order`付きで保存し、Generation、Job、
+primary Artifactの完了確定を同一SQLite transactionにします。既存の通常生成、
+アップスケール、親子関係、Queue workerは変更しません。
+
+対話的実行の状態はSQLiteの`interactive_generation_runs`に保持します。同時に
+activeまたはcancellingにできるrunは1件だけとし、開始、進捗、キャンセル、
+再起動後のactive runまたは最新completed batchの復元をサービス境界で処理します。
+run単位のsnapshotを使い、送信済みpromptを復元時に再送信しません。run中に個別
+Generationが失敗した場合はrunをfailedへ確定し、既にQueueへ投入された兄弟Jobは
+既存のQueue reconciliationへ委譲します。
+
+workflowは固定txt2img templateの範囲で、複数LoRA、CLIP skip、Hires.fix、任意の
+最終4x upscale、ComfyUI batch sizeを扱います。クライアント日付は検証後に保存先
+へ反映し、6桁連番をexclusive createして同時実行時の衝突を防ぎます。不正な日付、
+保存先外のパス、同名上書きは受け付けません。Phase AはFake/SQLite/Alembicと
+Playwright viewport testで検証し、実GPU・実ComfyUI・実RunPod・実Driveは引き続き
+手動確認の対象です。

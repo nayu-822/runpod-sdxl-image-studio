@@ -44,6 +44,9 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_reposito
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_start_repository import (
     GenerationStartRepository,
 )
+from runpod_sdxl_image_studio.adapters.database.repositories.interactive_run_repository import (
+    InteractiveRunRepository,
+)
 from runpod_sdxl_image_studio.adapters.database.repositories.lora_metadata_repository import (
     LoraMetadataRepository,
 )
@@ -124,6 +127,9 @@ from runpod_sdxl_image_studio.services.generation_recovery_service import (
     GenerationRecoveryService,
 )
 from runpod_sdxl_image_studio.services.generation_service import GenerationService
+from runpod_sdxl_image_studio.services.interactive_generation_service import (
+    InteractiveGenerationService,
+)
 from runpod_sdxl_image_studio.services.lora_catalog_service import (
     LoraCatalogError,
     LoraCatalogService,
@@ -246,6 +252,9 @@ from runpod_sdxl_image_studio.ui.tabs.system_tab import (
     make_batch_enqueue_handler,
     make_check_connection_handler,
     make_enqueue_handler,
+    make_interactive_cancel_handler,
+    make_interactive_refresh_handler,
+    make_interactive_start_handler,
     make_pod_lifecycle_readiness_handler,
     make_pod_lifecycle_terminate_handler,
     make_pod_lifecycle_toggle_handler,
@@ -346,6 +355,7 @@ def build_app(
     model_transfer_repository = ModelTransferRepository(session_factory)
     system_error_repository = SystemErrorEventRepository(session_factory)
     start_repository = GenerationStartRepository(session_factory)
+    interactive_run_repository = InteractiveRunRepository(session_factory)
     progress_repository = GenerationProgressRepository(session_factory)
     drive_adapter = GoogleDriveAdapter(app_settings)
     state_sync_service = StateSyncService(
@@ -483,6 +493,13 @@ def build_app(
         generation_enqueued_callback=lifecycle_service.arm_on_generation_enqueue,
         state_changed_callback=state_sync_service.mark_dirty,
     )
+    interactive_generation_service = InteractiveGenerationService(
+        interactive_run_repository,
+        queue_service,
+        app_settings,
+        artifact_repository=artifact_repository,
+        state_changed_callback=state_sync_service.mark_dirty,
+    )
     disk_usage_adapter = LocalDiskUsageAdapter()
     preflight_service = GenerationPreflightService(
         comfyui_service,
@@ -555,6 +572,10 @@ def build_app(
     async def repair_one_optional_artifact() -> tuple[str, ...]:
         return await recovery_service.repair_completed_optional_artifacts(1)
 
+    def generation_state_changed() -> None:
+        state_sync_service.mark_dirty()
+        interactive_generation_service.reconcile_after_queue_change()
+
     queue_worker = GenerationQueueWorker(
         dispatch_queue_repository,
         execution_service,
@@ -562,7 +583,7 @@ def build_app(
         reconcile_handler=reconcile_queue_item,
         cancellation_adapter=cancellation_adapter,
         completed_optional_artifact_handler=repair_one_optional_artifact,
-        state_changed_callback=state_sync_service.mark_dirty,
+        state_changed_callback=generation_state_changed,
     )
     queue_runtime = GenerationQueueRuntime(queue_worker)
     drive_sync_worker = DriveSyncWorker(
@@ -1165,6 +1186,87 @@ def build_app(
             fn=mobile_status_poll_handler,
             inputs=mobile_status_inputs,
             outputs=mobile_status_poll_outputs,
+            concurrency_limit=1,
+        )
+        demo.load(
+            fn=None,
+            outputs=[generation.interactive_client_local_date],
+            js=(
+                "() => {"
+                "const now = new Date();"
+                "const pad = value => String(value).padStart(2, '0');"
+                "return [`${now.getFullYear()}-${pad(now.getMonth() + 1)}-"
+                "${pad(now.getDate())}`];"
+                "}"
+            ),
+            queue=False,
+        )
+        interactive_inputs = [
+            generation.checkpoint,
+            generation.positive_prompt,
+            generation.negative_prompt,
+            generation.size_preset,
+            generation.width,
+            generation.height,
+            generation.seed_mode,
+            generation.seed,
+            generation.steps,
+            generation.cfg_scale,
+            generation.sampler,
+            generation.scheduler,
+            generation.vae,
+            generation.lora_editor.state,
+            generation.batch_count,
+            generation.batch_size,
+            generation.upscaler,
+            generation.clip_skip,
+            generation.hires_fix,
+            generation.final_upscale,
+            generation.interactive_client_local_date,
+        ]
+        generation.interactive_start_button.click(
+            fn=make_interactive_start_handler(
+                interactive_generation_service,
+                app_settings.max_loras,
+            ),
+            inputs=interactive_inputs,
+            outputs=[
+                generation.interactive_run_id,
+                generation.interactive_status,
+                generation.interactive_result_gallery,
+                generation.batch_message,
+            ],
+            concurrency_limit=1,
+        )
+        generation.interactive_cancel_button.click(
+            fn=make_interactive_cancel_handler(interactive_generation_service),
+            inputs=[generation.interactive_run_id],
+            outputs=[
+                generation.interactive_run_id,
+                generation.interactive_status,
+                generation.interactive_result_gallery,
+                generation.batch_message,
+            ],
+            concurrency_limit=1,
+        )
+        demo.load(
+            fn=make_interactive_refresh_handler(interactive_generation_service),
+            outputs=[
+                generation.interactive_run_id,
+                generation.interactive_status,
+                generation.interactive_result_gallery,
+                generation.batch_message,
+            ],
+            concurrency_limit=1,
+        )
+        generation.interactive_poll_timer.tick(
+            fn=make_interactive_refresh_handler(interactive_generation_service),
+            outputs=[
+                generation.interactive_run_id,
+                generation.interactive_status,
+                generation.interactive_result_gallery,
+                generation.batch_message,
+            ],
             concurrency_limit=1,
         )
         queue_refresh.click(
@@ -2276,6 +2378,7 @@ def build_app(
     demo.startup_model_restore_runtime = startup_model_restore_runtime
     demo.state_sync_service = state_sync_service
     demo.stateless_reconciliation_service = stateless_reconciliation_service
+    demo.interactive_generation_service = interactive_generation_service
     demo.pod_lifecycle_service = lifecycle_service
     return demo
 

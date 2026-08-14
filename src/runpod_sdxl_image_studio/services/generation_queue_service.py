@@ -264,6 +264,37 @@ class GenerationQueueService:
         except Exception as exc:  # noqa: BLE001 - hide adapter details at the UI boundary
             raise GenerationQueueServiceError("キャンセルに失敗しました。") from exc
 
+    def cancel_pending(self, generation_id: UUID) -> GenerationQueueItem | None:
+        """Cancel an unstarted Generation without making an async prompt request."""
+
+        try:
+            return self._run_mutation(
+                lambda: self._cancel_pending_item(generation_id),
+                wake=False,
+            )
+        except (GenerationDispatchQueueRepositoryError, ValueError) as exc:
+            raise GenerationQueueServiceError(
+                "未開始のジョブをキャンセルできませんでした。"
+            ) from exc
+
+    def _cancel_pending_item(self, generation_id: UUID) -> GenerationQueueItem | None:
+        item = self._repository.get_queue_item(generation_id)
+        if item is None:
+            return None
+        if item.generation.status in {
+            GenerationStatus.COMPLETED,
+            GenerationStatus.FAILED,
+            GenerationStatus.CANCELLED,
+        }:
+            return item
+        if (
+            item.generation.status is GenerationStatus.PENDING
+            and item.entry.worker_id is None
+            and item.entry.submission_state is SubmissionState.READY
+        ):
+            return self._repository.mark_cancelled(generation_id)
+        return self._repository.request_cancel(generation_id)
+
     def link_ambiguous_prompt(self, generation_id: UUID, prompt_id: str) -> GenerationQueueItem:
         """Manually attach a prompt ID after an ambiguous submission."""
 

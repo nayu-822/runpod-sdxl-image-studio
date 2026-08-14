@@ -124,3 +124,4 @@ class GenerationResult:
     stored_image: StoredImage | None
     error_message: str | None
     created_at: datetime
+    stored_images: tuple[StoredImage, ...] = ()

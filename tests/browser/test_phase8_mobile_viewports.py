@@ -177,3 +177,26 @@ def test_phase9_system_tab_is_usable_at_all_required_viewports() -> None:
                 _assert_no_horizontal_overflow(page)
         finally:
             browser.close()
+
+
+def test_phase_a_batch_controls_are_present_at_mobile_viewport() -> None:
+    """The interactive batch controls remain reachable on a narrow screen."""
+
+    from playwright.sync_api import sync_playwright
+
+    url = os.environ["IMAGE_STUDIO_BROWSER_URL"]
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page(viewport={"width": 390, "height": 844})
+        try:
+            page.goto(url, wait_until="domcontentloaded")
+            page.wait_for_selector("button", state="visible")
+            accordion = page.get_by_text("バッチ生成", exact=True)
+            assert _click_visible(page, accordion), "batch accordion is not reachable"
+            assert _has_visible_text(page, "Batch size")
+            assert _has_visible_text(page, "対話的生成を開始")
+            assert _has_visible_text(page, "対話的生成をキャンセル")
+            _assert_no_horizontal_overflow(page)
+        finally:
+            browser.close()

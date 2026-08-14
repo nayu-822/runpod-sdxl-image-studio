@@ -6,7 +6,7 @@ from uuid import uuid4
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine, inspect, select
+from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.orm import Session
 
 from runpod_sdxl_image_studio.adapters.database.models import (
@@ -46,16 +46,6 @@ def test_phase9_migration_is_reversible_without_changing_existing_rows(tmp_path:
             created_at=timestamp,
             updated_at=timestamp,
         )
-        artifact = GenerationArtifactModel(
-            id=str(artifact_id),
-            generation_id=str(generation_id),
-            artifact_type="image",
-            local_path="images/existing.png",
-            sha256="a" * 64,
-            size_bytes=3,
-            mime_type="image/png",
-            created_at=timestamp,
-        )
         job = GenerationJobModel(
             id=str(job_id),
             generation_id=str(generation_id),
@@ -63,8 +53,23 @@ def test_phase9_migration_is_reversible_without_changing_existing_rows(tmp_path:
             created_at=timestamp,
             updated_at=timestamp,
         )
-        session.add_all((generation, artifact, job))
+        session.add_all((generation, job))
         session.flush()
+        session.execute(
+            text(
+                "INSERT INTO generation_artifacts "
+                "(id, generation_id, artifact_type, local_path, sha256, size_bytes, "
+                "mime_type, created_at) VALUES "
+                "(:id, :generation_id, 'image', 'images/existing.png', :sha256, "
+                "3, 'image/png', :created_at)"
+            ),
+            {
+                "id": str(artifact_id),
+                "generation_id": str(generation_id),
+                "sha256": "a" * 64,
+                "created_at": timestamp,
+            },
+        )
         session.add(
             DriveSyncRecordModel(
                 id=str(drive_record_id),

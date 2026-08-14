@@ -67,7 +67,6 @@ from runpod_sdxl_image_studio.domain.generation import (
     GenerationProgress,
     GenerationStatus,
 )
-from runpod_sdxl_image_studio.domain.generation_artifact import ArtifactType, GenerationArtifact
 from runpod_sdxl_image_studio.domain.generation_queue import ReconciliationOutcome
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
@@ -289,20 +288,24 @@ def test_phase6_migration_backfills_legacy_artifact_sources_without_data_loss(
         parent_generation_id=None,
         created_at=now,
     )
-    GenerationArtifactRepository(factory).add(
-        GenerationArtifact(
-            id=artifact_id,
-            generation_id=generation_id,
-            artifact_type=ArtifactType.IMAGE,
-            local_path="generations/legacy.png",
-            sha256="a" * 64,
-            size_bytes=4,
-            width=512,
-            height=512,
-            mime_type="image/png",
-            created_at=now,
+    # This fixture intentionally stops before Phase A.  Insert the legacy row
+    # without asking the current ORM model to select its future display_order.
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO generation_artifacts "
+                "(id, generation_id, artifact_type, local_path, sha256, size_bytes, "
+                "width, height, mime_type, created_at) VALUES "
+                "(:id, :generation_id, 'image', 'generations/legacy.png', :sha256, "
+                "4, 512, 512, 'image/png', :created_at)"
+            ),
+            {
+                "id": str(artifact_id),
+                "generation_id": str(generation_id),
+                "sha256": "a" * 64,
+                "created_at": now,
+            },
         )
-    )
     upscale_snapshot = UpscaleSettingsSnapshot.from_settings(
         UpscaleSettings(
             method=UpscaleMethod.IMAGE,
@@ -493,7 +496,7 @@ def test_phase6_migration_empty_head_downgrade_upgrade_roundtrip(tmp_path: Path)
         )
     ).connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "0017_phase12_session_lifecycle"
+            "0018_phase_a_interactive_runs_and_artifact_order"
         )
 
 

@@ -19,6 +19,7 @@ from runpod_sdxl_image_studio.domain.generation import (
 )
 from runpod_sdxl_image_studio.domain.generation_form_state import GenerationFormStateSnapshot
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
+from runpod_sdxl_image_studio.domain.interactive_run import InteractiveRunView
 from runpod_sdxl_image_studio.jobs.startup_model_restore import (
     StartupModelRestoreRuntime,
     StartupRestoreState,
@@ -32,6 +33,10 @@ from runpod_sdxl_image_studio.services.generation_queue_service import (
     GenerationQueueServiceError,
 )
 from runpod_sdxl_image_studio.services.generation_service import GenerationService
+from runpod_sdxl_image_studio.services.interactive_generation_service import (
+    InteractiveGenerationError,
+    InteractiveGenerationService,
+)
 from runpod_sdxl_image_studio.services.lora_catalog_service import (
     LoraCatalogError,
     LoraCatalogService,
@@ -111,14 +116,25 @@ class GenerationTabComponents:
     seed: gr.Number
     steps: gr.Number
     cfg_scale: gr.Number
+    clip_skip: gr.Number
+    hires_fix: gr.Checkbox
+    final_upscale: gr.Checkbox
     generate_button: gr.Button
     batch_count: gr.Number
+    batch_size: gr.Number
     batch_seed_strategy: gr.Radio
     batch_start_seed: gr.Number
     batch_seed_step: gr.Number
     batch_name: gr.Textbox
     batch_enqueue_button: gr.Button
     batch_message: gr.Markdown
+    interactive_start_button: gr.Button
+    interactive_cancel_button: gr.Button
+    interactive_status: gr.Markdown
+    interactive_run_id: gr.State
+    interactive_result_gallery: gr.Gallery
+    interactive_client_local_date: gr.Textbox
+    interactive_poll_timer: gr.Timer
     progress: gr.Markdown
     result_image: gr.Image
     result_details: gr.Markdown
@@ -354,6 +370,10 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
         with gr.Row(elem_classes=["size-dimensions"]):
             steps = gr.Number(value=28, precision=0, label="Steps")
             cfg_scale = gr.Number(value=5.5, label="CFG")
+            clip_skip = gr.Number(value=1, precision=0, minimum=1, maximum=12, label="CLIP skip")
+        with gr.Row(elem_classes=["size-dimensions"]):
+            hires_fix = gr.Checkbox(value=False, label="Hires.fix")
+            final_upscale = gr.Checkbox(value=False, label="Final 4x upscale")
         with gr.Row(elem_classes=["size-dimensions"]):
             sampler = gr.Dropdown([], label="Sampler", interactive=False)
             scheduler = gr.Dropdown([], label="Scheduler", interactive=False)
@@ -368,6 +388,7 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
 
     with gr.Accordion("バッチ生成", open=False, elem_classes=["generation-batch"]):
         batch_count = gr.Number(value=2, precision=0, label="生成枚数")
+        batch_size = gr.Number(value=1, precision=0, minimum=1, maximum=4, label="Batch size")
         batch_seed_strategy = gr.Radio(
             [("ランダム", "random"), ("連番", "sequential")],
             value="random",
@@ -380,6 +401,20 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
             "バッチをキューへ追加", variant="primary", elem_classes=["mobile-tap-button"]
         )
         batch_message = gr.Markdown("")
+        interactive_client_local_date = gr.Textbox(value="", visible=False)
+        with gr.Row(elem_classes=["interactive-run-actions"]):
+            interactive_start_button = gr.Button(
+                "対話的生成を開始", variant="primary", elem_classes=["mobile-tap-button"]
+            )
+            interactive_cancel_button = gr.Button(
+                "対話的生成をキャンセル", elem_classes=["mobile-tap-button"]
+            )
+        interactive_status = gr.Markdown("対話的生成: 待機中")
+        interactive_result_gallery = gr.Gallery(
+            label="今回の生成結果", columns=1, rows=1, object_fit="contain"
+        )
+        interactive_run_id = gr.State(None)
+        interactive_poll_timer = gr.Timer(value=3.0, active=True)
     return GenerationTabComponents(
         checkpoint=checkpoint,
         vae=vae,
@@ -403,14 +438,25 @@ def build_generation_tab(max_loras: int = 8) -> GenerationTabComponents:
         seed=seed,
         steps=steps,
         cfg_scale=cfg_scale,
+        clip_skip=clip_skip,
+        hires_fix=hires_fix,
+        final_upscale=final_upscale,
         generate_button=generate_button,
         batch_count=batch_count,
+        batch_size=batch_size,
         batch_seed_strategy=batch_seed_strategy,
         batch_start_seed=batch_start_seed,
         batch_seed_step=batch_seed_step,
         batch_name=batch_name,
         batch_enqueue_button=batch_enqueue_button,
         batch_message=batch_message,
+        interactive_start_button=interactive_start_button,
+        interactive_cancel_button=interactive_cancel_button,
+        interactive_status=interactive_status,
+        interactive_run_id=interactive_run_id,
+        interactive_result_gallery=interactive_result_gallery,
+        interactive_client_local_date=interactive_client_local_date,
+        interactive_poll_timer=interactive_poll_timer,
         progress=progress,
         result_image=result_image,
         result_details=result_details,
@@ -1152,6 +1198,120 @@ def make_batch_enqueue_handler(
         )
 
     return _wrap_batch_handler(handler)
+
+
+def make_interactive_start_handler(
+    service: InteractiveGenerationService,
+    max_loras: int,
+) -> Callable[..., Awaitable[tuple[object, ...]]]:
+    """Create the small UI boundary for one durable interactive run."""
+
+    async def handler(
+        checkpoint: str | None,
+        positive_prompt: str,
+        negative_prompt: str,
+        size_preset: str,
+        width: float | int,
+        height: float | int,
+        seed_mode: str,
+        seed: float | int,
+        steps: float | int,
+        cfg_scale: float | int,
+        sampler: str | None,
+        scheduler: str | None,
+        vae: str | None,
+        lora_state: object,
+        batch_count: float | int,
+        batch_size: float | int,
+        upscaler: str | None,
+        clip_skip: float | int,
+        hires_fix: bool,
+        final_upscale: bool,
+        client_local_date: str | None,
+    ) -> tuple[object, ...]:
+        del size_preset
+        try:
+            settings = GenerationSettings(
+                positive_prompt=positive_prompt or "",
+                negative_prompt=negative_prompt or "",
+                checkpoint_name=checkpoint or "",
+                sampler_name=sampler or "",
+                scheduler_name=scheduler or "",
+                vae_name=vae,
+                loras=lora_settings_from_state(lora_state, max_loras=max_loras),
+                width=int(width),
+                height=int(height),
+                seed=-1 if seed_mode == "Random" else int(seed),
+                steps=int(steps),
+                cfg_scale=float(cfg_scale),
+                clip_skip=int(clip_skip),
+                hires_fix=bool(hires_fix),
+                final_upscale=bool(final_upscale),
+                final_upscale_model=upscaler if final_upscale else None,
+            )
+            view = service.start(
+                settings,
+                batch_count=int(batch_count),
+                batch_size=int(batch_size),
+                client_local_date=client_local_date or "",
+            )
+        except (TypeError, ValueError, ValidationError, InteractiveGenerationError) as exc:
+            return (
+                None,
+                "対話的生成: 開始できません",
+                [],
+                str(exc),
+            )
+        return _interactive_view_outputs(view)
+
+    return handler
+
+
+def make_interactive_refresh_handler(
+    service: InteractiveGenerationService,
+) -> Callable[[], tuple[object, ...]]:
+    """Create a reload/timer handler that restores the active run from SQLite."""
+
+    def handler() -> tuple[object, ...]:
+        try:
+            view = service.restore()
+        except InteractiveGenerationError as exc:
+            return (None, "対話的生成: 状態を復元できません", [], str(exc))
+        if view is None:
+            return (None, "対話的生成: 待機中", [], "")
+        return _interactive_view_outputs(view)
+
+    return handler
+
+
+def make_interactive_cancel_handler(
+    service: InteractiveGenerationService,
+) -> Callable[[str | None], Awaitable[tuple[object, ...]]]:
+    """Create the cancel boundary for the active run."""
+
+    async def handler(run_id: str | None) -> tuple[object, ...]:
+        try:
+            identifier = UUID(run_id) if run_id else None
+            view = await service.cancel(identifier)
+        except (ValueError, InteractiveGenerationError) as exc:
+            return (run_id, "対話的生成: キャンセル処理を継続中", [], str(exc))
+        if view is None:
+            return (None, "対話的生成: 待機中", [], "")
+        return _interactive_view_outputs(view)
+
+    return handler
+
+
+def _interactive_view_outputs(view: InteractiveRunView) -> tuple[object, ...]:
+    run = view.run
+    status = run.status.value
+    completed_count = view.completed_count
+    batch_count = run.batch_count
+    current_status = view.current_generation_status
+    detail = f"Interactive run `{run.id}`: {status} ({completed_count}/{batch_count})"
+    if current_status:
+        detail += f"; current Generation={current_status}"
+    return str(run.id), detail, list(view.result_image_paths), ""
 
 
 def _wrap_batch_handler(

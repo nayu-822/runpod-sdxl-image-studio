@@ -38,6 +38,14 @@ class GenerationSettingsSnapshot(BaseModel):
     height: int = Field(gt=0)
     steps: int = Field(ge=1, le=150)
     cfg_scale: float = Field(ge=0.0, le=30.0)
+    batch_size: int = Field(default=1, ge=1, le=4)
+    clip_skip: int = Field(default=1, ge=1, le=12)
+    hires_fix: bool = False
+    hires_scale: float = Field(default=1.5, ge=1.0, le=4.0)
+    hires_denoise: float = Field(default=0.4, ge=0.0, le=1.0)
+    final_upscale: bool = False
+    final_upscale_model: str | None = None
+    client_local_date: str | None = None
     sampler_name: str = Field(min_length=1)
     scheduler_name: str = Field(min_length=1)
     checkpoint_name: str = Field(min_length=1)
@@ -58,6 +66,14 @@ class GenerationSettingsSnapshot(BaseModel):
             height=settings.height,
             steps=settings.steps,
             cfg_scale=settings.cfg_scale,
+            batch_size=settings.batch_size,
+            clip_skip=settings.clip_skip,
+            hires_fix=settings.hires_fix,
+            hires_scale=settings.hires_scale,
+            hires_denoise=settings.hires_denoise,
+            final_upscale=settings.final_upscale,
+            final_upscale_model=settings.final_upscale_model,
+            client_local_date=settings.client_local_date,
             sampler_name=settings.sampler_name,
             scheduler_name=settings.scheduler_name,
             checkpoint_name=settings.checkpoint_name,
@@ -102,6 +118,14 @@ class GenerationSettingsSnapshot(BaseModel):
                 height=self.height,
                 steps=self.steps,
                 cfg_scale=self.cfg_scale,
+                batch_size=self.batch_size,
+                clip_skip=self.clip_skip,
+                hires_fix=self.hires_fix,
+                hires_scale=self.hires_scale,
+                hires_denoise=self.hires_denoise,
+                final_upscale=self.final_upscale,
+                final_upscale_model=self.final_upscale_model,
+                client_local_date=self.client_local_date,
                 sampler_name=self.sampler_name,
                 scheduler_name=self.scheduler_name,
                 checkpoint_name=self.checkpoint_name,
