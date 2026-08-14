@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+from uuid import uuid4
 
 from alembic import command
 from alembic.config import Config
@@ -16,7 +18,10 @@ from runpod_sdxl_image_studio.services.generation_custom_size_service import (
     GenerationCustomSizeError,
     GenerationCustomSizeService,
 )
-from runpod_sdxl_image_studio.ui.tabs.system_tab import interactive_action_updates
+from runpod_sdxl_image_studio.ui.tabs.system_tab import (
+    interactive_action_updates,
+    make_custom_size_refresh_handler,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -59,6 +64,43 @@ def test_custom_generation_size_validation_does_not_register_invalid_values() ->
         else:
             raise AssertionError(f"invalid dimensions were accepted: {dimensions}")
     assert service.list() == ()
+    engine.dispose()
+
+
+def test_custom_size_refresh_only_registers_custom_selection_and_notifies_once() -> None:
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    notifications: list[str] = []
+    service = GenerationCustomSizeService(
+        GenerationCustomSizeRepository(create_session_factory(engine)),
+        Settings(_env_file=None, max_width=2048, max_height=2048, max_pixels=4_194_304),
+        state_changed_callback=lambda: notifications.append("changed"),
+    )
+
+    class _Interactive:
+        completed_count = 0
+
+        def refresh(self, _run_id: object) -> object:
+            return SimpleNamespace(
+                completed_count=self.completed_count,
+                run=SimpleNamespace(settings_snapshot=SimpleNamespace(width=768, height=1024)),
+            )
+
+    interactive = _Interactive()
+    handler = make_custom_size_refresh_handler(service, interactive)  # type: ignore[arg-type]
+    run_id = str(uuid4())
+
+    handler(run_id, "1024 × 1024")
+    assert service.list() == ()
+
+    interactive.completed_count = 1
+    handler(run_id, "Custom")
+    assert [(item.width, item.height) for item in service.list()] == [(768, 1024)]
+    assert notifications == ["changed"]
+
+    interactive.completed_count = 0
+    handler(run_id, "Custom")
+    assert notifications == ["changed"]
     engine.dispose()
 
 

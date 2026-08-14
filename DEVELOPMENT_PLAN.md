@@ -673,7 +673,9 @@ Phase Bでは、生成タブの通常操作を`InteractiveGenerationService`へ�
 promptあたりの画像数）とBatch count（順次実行するGeneration数）を区別します。
 旧来の単発・バッチenqueueボタンはUIから隠し、Queue、worker、reconciliationは
 既存の耐久性あるバックエンドとして維持します。生成中は「生成」を無効化し、
-「キャンセル中...」を含むrunとcurrent Generationの状態、Batch進捗を表示します。
+「キャンセル中...」を含むrunとcurrent Generationの状態、Batch進捗をバッチAccordionの
+外側で常時表示します。Galleryと設定復元ボタンも閉じたAccordionを開かずに到達でき、
+旧result surfaceは通常画面から隠して結果表示をInteractive Galleryへ統一します。
 
 再読込・ブラウザ切断後はSQLiteのInteractive run、Generation、Job、Queue状態から
 active runまたは最新completed runを復元し、送信済みpromptを再送信しません。poll、
@@ -681,14 +683,20 @@ start、cancel、restoreは同じGradio concurrency groupで直列化し、古�
 新しいrunの表示を上書きしないようserver側でrun IDを検証します。結果Galleryは
 最新completed batchだけをdisplay orderで表示し、2×2までのモバイル向け配置にします。
 
-生成成功後のサイズはGeneration snapshotとは別の`generation_custom_sizes`へ保存し、
-`0020_phase_b_custom_generation_sizes`で重複寸法を排除します。保存済みサイズは選択・
+生成成功後のサイズは、ユーザーが`Custom`プリセットを選択し、1枚以上のGenerationが
+完了した場合だけGeneration snapshotとは別の`generation_custom_sizes`へ保存し、
+`0020_phase_b_custom_generation_sizes`のunique制約で重複寸法を排除します。pollによる
+既存寸法の再確認ではDB mutationやdirty通知を発生させません。保存済みサイズは選択・
 削除でき、組み込みプリセットや既存履歴には影響しません。Positive/Negative prompt
 にはブラウザ側のClipboard Paste/Copyを用意し、権限エラー時は入力を保持したまま
 安全なメッセージを表示します。Galleryから選択した画像の設定復元では、server側で
 runとArtifactを検証してから、prompt、LoRA、Hires/final upscale、元のbatch size、
 workflow template versionを復元します。新規手入力はworkflow 2.1を既定とし、既存の
-legacy snapshotは2.0のまま扱います。
+legacy snapshotは2.0のまま扱います。Final 4x upscaleは明示したupscalerを必須とし、
+未選択・capability外のモデルや`UpscaleModelLoader` / `ImageUpscaleWithModel`不足はpreflightで
+拒否します。既定の`4x-UltraSharp.pth`は暗黙選択しません。Interactive runがactiveまたは
+cancellingの間は、History・旧resultからの通常Generation再生成もserver-side admission guard
+で拒否し、完了・失敗・キャンセル後だけ再度許可します。
 
 Phase Bで追加したUI・Repository・Alembic・Fake/SQLiteテストは、実GPU、実ComfyUI、
 実RunPod、実Google Driveを使わず検証します。新しいHistory UI、全過去画像のGallery、

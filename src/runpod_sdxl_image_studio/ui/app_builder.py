@@ -257,6 +257,7 @@ from runpod_sdxl_image_studio.ui.tabs.system_tab import (
     capability_refresh_outputs,
     disable_batch_enqueue_button,
     disable_generate_button,
+    final_upscale_validation_message,
     interactive_action_updates,
     make_batch_enqueue_handler,
     make_check_connection_handler,
@@ -1165,6 +1166,13 @@ def build_app(
             ],
             concurrency_limit=1,
         )
+        for component in (generation.final_upscale, generation.upscaler):
+            component.change(
+                fn=final_upscale_validation_message,
+                inputs=[generation.final_upscale, generation.upscaler],
+                outputs=[generation.final_upscale_message],
+                queue=False,
+            )
         generation.positive_paste_button.click(
             fn=None,
             inputs=[generation.positive_prompt],
@@ -2570,6 +2578,7 @@ def build_app(
                 app_settings.max_loras,
                 preflight_service,
                 form_state_service.save,
+                interactive_service=interactive_generation_service,
             ),
             inputs=generation_inputs,
             outputs=[
@@ -2634,6 +2643,7 @@ def build_app(
                 app_settings.max_loras,
                 preflight_service,
                 form_state_service.save,
+                interactive_service=interactive_generation_service,
             ),
             inputs=generation_inputs,
             outputs=[

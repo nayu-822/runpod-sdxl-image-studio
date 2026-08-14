@@ -121,11 +121,17 @@ class GenerationPreflightService:
                 )
             )
         else:
+            effective_uses_upscaler = uses_upscaler or generation_settings.final_upscale
+            effective_upscaler_name = (
+                upscaler_name
+                if upscaler_name is not None
+                else generation_settings.final_upscale_model
+            )
             self._check_capabilities(
                 capabilities,
                 generation_settings,
-                uses_upscaler=uses_upscaler,
-                upscaler_name=upscaler_name,
+                uses_upscaler=effective_uses_upscaler,
+                upscaler_name=effective_upscaler_name,
                 errors=errors,
             )
             self._check_required_nodes(
@@ -342,6 +348,8 @@ class GenerationPreflightService:
                         "Hires.fix workflow version is not supported",
                     )
                 )
+        if generation_settings is not None and generation_settings.final_upscale:
+            required.update({"UpscaleModelLoader", "ImageUpscaleWithModel"})
         missing = sorted(required.difference(capabilities.available_node_classes))
         if missing:
             errors.append(

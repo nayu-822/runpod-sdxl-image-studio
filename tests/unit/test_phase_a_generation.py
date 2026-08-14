@@ -12,7 +12,11 @@ import gradio as gr
 import pytest
 from PIL import Image
 
-from runpod_sdxl_image_studio.adapters.comfyui.workflow_adapter import WorkflowAdapter
+from runpod_sdxl_image_studio.adapters.comfyui.workflow_adapter import (
+    WorkflowAdapter,
+    WorkflowTemplateError,
+    _apply_final_upscale,
+)
 from runpod_sdxl_image_studio.adapters.storage.exceptions import StorageError
 from runpod_sdxl_image_studio.adapters.storage.local_storage import LocalStorageAdapter
 from runpod_sdxl_image_studio.config import Settings
@@ -110,6 +114,16 @@ def test_phase_a_workflow_binds_batch_and_optional_nodes() -> None:
     assert "hires_sampler" not in without_optional
     assert "final_upscale" not in without_optional
     assert without_optional["9"]["inputs"]["images"] == ["8", 0]  # type: ignore[index]
+
+
+def test_final_upscale_requires_an_explicit_model_and_never_uses_a_default() -> None:
+    assert _settings(final_upscale=False).final_upscale_model is None
+
+    with pytest.raises(ValueError, match="final_upscale_model"):
+        _settings(final_upscale=True)
+
+    with pytest.raises(WorkflowTemplateError, match="final upscale model is required"):
+        _apply_final_upscale({}, None)
 
 
 def test_phase_a_snapshot_round_trip_preserves_new_generation_options() -> None:

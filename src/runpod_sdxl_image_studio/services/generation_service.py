@@ -1601,7 +1601,9 @@ def _validate_generation(
     if settings.final_upscale:
         if "UpscaleModelLoader" not in node_classes or "ImageUpscaleWithModel" not in node_classes:
             raise WorkflowError("Final upscaling is unavailable in ComfyUI")
-        final_model = settings.final_upscale_model or "4x-UltraSharp.pth"
+        final_model = settings.final_upscale_model
+        if final_model is None:
+            raise WorkflowError("A final upscale model must be selected")
         if final_model not in getattr(capabilities, "upscale_models", ()):
             raise WorkflowError("Selected final upscale model is unavailable")
     if settings.vae_name is not None and "VAELoader" not in node_classes:

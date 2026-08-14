@@ -42,7 +42,39 @@ def test_phase8_generation_surface_is_mobile_ready_and_status_poll_is_wired() ->
     assert any(
         component["type"] == "button"
         and component["props"].get("value") == "選択画像の設定を読み込む"
+        and component["props"].get("visible") is not False
         for component in components
+    )
+    assert any(
+        component["type"] == "markdown"
+        and component["props"].get("value") == "対話的生成: 待機中"
+        and component["props"].get("visible") is not False
+        for component in components
+    )
+    assert any(
+        component["type"] == "gallery"
+        and component["props"].get("label") == "今回の生成結果"
+        and component["props"].get("visible") is not False
+        for component in components
+    )
+    assert any(
+        component["type"] == "image"
+        and component["props"].get("label") == "生成画像"
+        and component["props"].get("visible") is False
+        for component in components
+    )
+    assert {
+        "同条件で再生成",
+        "設定を編集",
+        "アップスケール",
+    }.isdisjoint(
+        {
+            component["props"].get("value")
+            for component in components
+            if component["type"] == "button"
+            and component["props"].get("elem_classes") == ["mobile-tap-button"]
+            and component["props"].get("visible") is not False
+        }
     )
     clipboard_dependencies = [
         dependency

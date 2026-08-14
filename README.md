@@ -711,19 +711,27 @@ Phase Aの自動検証はFake、SQLite、Alembic、Playwrightのbrowser testを�
 旧単発・バッチenqueueボタンは通常UIから隠し、永続Queueとworkerはバックエンドとして
 維持します。`Batch size`は1回のComfyUI promptから得る画像数、`Batch count`は順次
 実行するGeneration数です。生成中はGenerateを無効化し、Cancel、run status、現在の
-Generation、Batch進捗を表示します。再読込後はSQLiteのactive runとQueue状態を再取得し、
-送信済みComfyUI promptを再送信しません。
+Generation、Batch進捗をバッチAccordionの外側で表示します。Generate後はAccordionを
+開かなくても進捗、Gallery、設定復元ボタンを確認できます。旧単発result surfaceは
+通常画面から隠し、通常の結果表示はInteractive Galleryへ統一します。再読込後はSQLiteの
+active runとQueue状態を再取得し、送信済みComfyUI promptを再送信しません。
 
 現在の対話的結果は最新completed batchだけを2×2までのGalleryで表示します。保存済みの
-Customサイズは`generation_custom_sizes`（migration `0020_phase_b_custom_generation_sizes`）
-へ別管理され、生成完了後に重複寸法を登録できます。組み込みサイズは削除できず、保存済み
-Customサイズの削除は履歴・snapshot・sidecarを変更しません。
+Customサイズは、ユーザーが`Custom`プリセットを選択して正常に1枚以上完了した場合だけ
+`generation_custom_sizes`（migration `0020_phase_b_custom_generation_sizes`）へ別管理されます。
+組み込みサイズは登録・削除できず、同じ寸法のpollはDB mutationやdirty通知を繰り返しません。
+保存済みCustomサイズの削除は履歴・snapshot・sidecarを変更しません。
 
 Positive/Negative promptにはブラウザ側ClipboardのPaste/Copyを用意しています。Clipboard
 権限やAPIが使えない場合は現在のpromptを保持し、`クリップボードを利用できませんでした`
 と表示します。Galleryで選択した画像の設定復元は、run IDとdisplay orderをserver側で
 検証したうえで、LoRA、Hires/final upscale、元のbatch size、workflow versionを復元します。
-新規手入力はworkflow 2.1、legacy snapshotはworkflow 2.0を維持します。
+新規手入力はworkflow 2.1、legacy snapshotはworkflow 2.0を維持します。Final 4x upscaleを
+使う場合はupscalerの明示選択が必須です。未選択またはComfyUIのcapabilityにないモデル、
+`UpscaleModelLoader` / `ImageUpscaleWithModel`不足の場合はpreflightで停止し、既定モデルを
+暗黙選択しません。Interactive runがactiveまたはcancellingの間は、Historyや旧resultからの
+通常Generation再生成もserver-side admission guardで拒否し、完了・失敗・キャンセル後に
+だけ再度許可します。
 
 Phase Bのbrowser確認:
 

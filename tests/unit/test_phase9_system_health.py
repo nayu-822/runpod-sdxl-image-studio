@@ -1199,6 +1199,42 @@ async def test_preflight_warning_is_ready_and_drive_is_not_a_hard_stop(tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_final_upscale_preflight_requires_selected_available_model_and_nodes(
+    tmp_path: Path,
+) -> None:
+    comfyui = _FakeComfyUI()
+    service = GenerationPreflightService(
+        comfyui,
+        _settings(tmp_path),
+        disk_usage_adapter=_FakeDisk(DiskUsage(1000, 700, 300)),
+    )
+
+    without_final_upscale = await service.check(_generation_settings(final_upscale=False))
+    assert without_final_upscale.is_ready is True
+
+    with pytest.raises(ValueError, match="final_upscale_model"):
+        _generation_settings(final_upscale=True)
+
+    final_capabilities = replace(
+        _capabilities(),
+        available_node_classes=frozenset(
+            set(REQUIRED_NODES) | {"UpscaleModelLoader", "ImageUpscaleWithModel"}
+        ),
+    )
+    comfyui.status = replace(comfyui.status, capabilities=final_capabilities)
+    unavailable = await service.check(
+        _generation_settings(final_upscale=True, final_upscale_model="missing.pth")
+    )
+    assert unavailable.is_ready is False
+    assert any(issue.code == "upscaler_missing" for issue in unavailable.errors)
+
+    available = await service.check(
+        _generation_settings(final_upscale=True, final_upscale_model="4x.pth")
+    )
+    assert available.is_ready is True
+
+
+@pytest.mark.asyncio
 async def test_preflight_telemetry_marks_state_dirty_after_normal_persistence(
     tmp_path: Path,
 ) -> None:

@@ -50,8 +50,19 @@ class GenerationCustomSizeService:
                 else nullcontext()
             )
             with context:
-                result = self._repository.add(normalized_width, normalized_height)
-                self._notify_changed()
+                add_if_absent = getattr(self._repository, "add_if_absent", None)
+                if callable(add_if_absent):
+                    result, created = add_if_absent(normalized_width, normalized_height)
+                else:
+                    existing = self._repository.get_by_dimensions(
+                        normalized_width, normalized_height
+                    )
+                    if existing is not None:
+                        return existing
+                    result = self._repository.add(normalized_width, normalized_height)
+                    created = True
+                if created:
+                    self._notify_changed()
                 return result
         except GenerationCustomSizeRepositoryError as exc:
             raise GenerationCustomSizeError("保存済みサイズを登録できませんでした。") from exc

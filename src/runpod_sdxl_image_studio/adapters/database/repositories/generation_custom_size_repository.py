@@ -32,6 +32,14 @@ class GenerationCustomSizeRepositoryProtocol(Protocol):
         created_at: datetime | None = None,
     ) -> GenerationCustomSize: ...
 
+    def add_if_absent(
+        self,
+        width: int,
+        height: int,
+        *,
+        created_at: datetime | None = None,
+    ) -> tuple[GenerationCustomSize, bool]: ...
+
     def delete(self, size_id: UUID) -> None: ...
 
 
@@ -81,10 +89,28 @@ class GenerationCustomSizeRepository(GenerationCustomSizeRepositoryProtocol):
         *,
         created_at: datetime | None = None,
     ) -> GenerationCustomSize:
+        result, _ = self.add_if_absent(width, height, created_at=created_at)
+        return result
+
+    def add_if_absent(
+        self,
+        width: int,
+        height: int,
+        *,
+        created_at: datetime | None = None,
+    ) -> tuple[GenerationCustomSize, bool]:
         identifier = uuid4()
         timestamp = _utc(created_at or datetime.now(UTC))
         try:
             with session_scope(self._session_factory) as session:
+                existing = session.scalar(
+                    select(GenerationCustomSizeModel).where(
+                        GenerationCustomSizeModel.width == width,
+                        GenerationCustomSizeModel.height == height,
+                    )
+                )
+                if existing is not None:
+                    return _to_domain(existing), False
                 row = GenerationCustomSizeModel(
                     id=str(identifier),
                     width=width,
@@ -93,11 +119,11 @@ class GenerationCustomSizeRepository(GenerationCustomSizeRepositoryProtocol):
                 )
                 session.add(row)
                 session.flush()
-                return _to_domain(row)
+                return _to_domain(row), True
         except IntegrityError:
             existing = self.get_by_dimensions(width, height)
             if existing is not None:
-                return existing
+                return existing, False
             raise GenerationCustomSizeRepositoryError(
                 "custom generation size could not be created"
             ) from None

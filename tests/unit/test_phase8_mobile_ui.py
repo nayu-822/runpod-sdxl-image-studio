@@ -23,6 +23,9 @@ from runpod_sdxl_image_studio.services.generation_queue_service import (
     GenerationQueueService,
     GenerationQueueServiceError,
 )
+from runpod_sdxl_image_studio.services.interactive_generation_service import (
+    InteractiveGenerationError,
+)
 from runpod_sdxl_image_studio.ui.components.lora_editor import build_lora_editor
 from runpod_sdxl_image_studio.ui.components.mobile_actions import (
     make_mobile_status_poll_handler,
@@ -35,6 +38,7 @@ from runpod_sdxl_image_studio.ui.tabs.system_tab import (
     build_generation_tab,
     make_batch_enqueue_handler,
     make_enqueue_handler,
+    make_interactive_start_handler,
 )
 
 
@@ -199,8 +203,59 @@ def test_generation_tab_exposes_mobile_status_and_prompt_controls() -> None:
     assert generation.negative_prompt.lines == 4
     assert generation.status_poll_timer.value == 5
     assert generation.generate_button.elem_classes == ["mobile-tap-button"]
+    assert generation.final_upscale_message.value == ""
+    assert ".interactive-result-gallery" in MOBILE_UI_CSS
     assert generation.lora_editor.rows[0].container.elem_classes == ["lora-card-row"]
     assert generation.lora_editor.rows[0].name.label == "LoRA名"
+
+
+def test_interactive_final_upscale_without_model_does_not_create_a_run() -> None:
+    class _Interactive:
+        def __init__(self) -> None:
+            self.start_calls = 0
+
+        def start(self, *_args: object, **_kwargs: object) -> object:
+            self.start_calls += 1
+            raise AssertionError("invalid final-upscale settings must not start a run")
+
+    service = _Interactive()
+    handler = make_interactive_start_handler(service, max_loras=2)  # type: ignore[arg-type]
+    result = asyncio.run(
+        handler(
+            "checkpoint.safetensors",
+            "positive",
+            "negative",
+            "1024 × 1024",
+            1024,
+            1024,
+            "Fixed",
+            1,
+            28,
+            5.5,
+            "euler",
+            "normal",
+            None,
+            [],
+            1,
+            1,
+            None,
+            1,
+            False,
+            1.5,
+            "lanczos",
+            20,
+            5.5,
+            "euler",
+            "normal",
+            0.4,
+            True,
+            "2026-08-14",
+        )
+    )
+
+    assert service.start_calls == 0
+    assert result[0] is None
+    assert "アップスケーラーを選択" in result[3]
 
 
 def test_lora_editor_uses_fixed_state_rows_and_mobile_card_actions() -> None:
@@ -578,6 +633,48 @@ def test_result_regeneration_returns_new_active_generation_id_after_completed_pa
     assert service.enqueue_calls == 1
     assert service.parent_generation_ids == [parent_id]
     assert result[5] == str(new_id)
+
+
+@pytest.mark.parametrize("active_status", ["active", "cancelling", None])
+def test_legacy_regeneration_is_admitted_only_without_active_interactive_run(
+    active_status: str | None,
+) -> None:
+    parent_id = uuid4()
+    new_id = uuid4()
+    parent = _queue_item(parent_id, sequence=1, status=GenerationStatus.COMPLETED)
+    queued = _queue_item(new_id, sequence=2, status=GenerationStatus.PENDING)
+    service = _FakeEnqueueService(parent, enqueue_item=queued)
+
+    class _InteractiveAdmission:
+        def ensure_no_active_run(self) -> None:
+            if active_status is not None:
+                raise InteractiveGenerationError(
+                    f"interactive run is {active_status}; regeneration is blocked"
+                )
+
+    handler = make_enqueue_handler(
+        service,
+        max_loras=2,
+        interactive_service=_InteractiveAdmission(),  # type: ignore[arg-type]
+    )
+
+    result = asyncio.run(
+        handler(
+            *_enqueue_inputs(
+                parent_id,
+                regeneration_valid=True,
+                regeneration_requested=True,
+            )
+        )
+    )
+
+    if active_status is None:
+        assert service.enqueue_calls == 1
+        assert result[5] == str(new_id)
+    else:
+        assert service.enqueue_calls == 0
+        assert active_status in result[3]
+        assert result[5] is None or isinstance(result[5], dict)
 
 
 def test_recent_lora_shortcut_fills_the_first_empty_middle_row() -> None:

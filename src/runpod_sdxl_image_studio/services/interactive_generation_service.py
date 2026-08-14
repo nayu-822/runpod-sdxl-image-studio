@@ -136,6 +136,20 @@ class InteractiveGenerationService:
             raise InteractiveGenerationError("active interactive run could not be read") from exc
         return self._refresh_run(run) if run is not None else None
 
+    def ensure_no_active_run(self) -> None:
+        """Reject legacy generation admission while an interactive run owns the queue."""
+
+        try:
+            active = self._repository.get_active()
+        except InteractiveRunRepositoryError as exc:
+            raise InteractiveGenerationError(
+                "active interactive run could not be verified; generation was not queued"
+            ) from exc
+        if active is not None:
+            raise InteractiveGenerationError(
+                "generation is unavailable while an interactive run is active or cancelling"
+            )
+
     def is_current_run(self, run_id: UUID) -> bool:
         """Check a client-supplied run token against the newest durable run."""
 

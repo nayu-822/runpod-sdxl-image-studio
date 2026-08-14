@@ -73,6 +73,21 @@ MOBILE_UI_CSS = """
   gap: 0.75rem !important;
 }
 
+.interactive-result-gallery,
+.interactive-result-gallery .grid-wrap,
+.interactive-result-gallery .gallery-item {
+  min-width: 0 !important;
+  max-width: 100% !important;
+}
+
+.interactive-result-gallery .grid-wrap {
+  overflow: hidden !important;
+}
+
+.validation-message {
+  color: var(--body-text-color, #374151);
+}
+
 .model-preparation-selection,
 .model-preparation-actions {
   min-width: 0 !important;

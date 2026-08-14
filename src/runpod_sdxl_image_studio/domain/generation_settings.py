@@ -115,6 +115,8 @@ class GenerationSettings(BaseModel):
 
     @model_validator(mode="after")
     def validate_lora_collection(self) -> GenerationSettings:
+        if self.final_upscale and self.final_upscale_model is None:
+            raise ValueError("final_upscale_model is required when final_upscale is enabled")
         names = [lora.name for lora in self.loras]
         if len(names) != len(set(names)):
             raise ValueError("The same LoRA cannot be selected more than once")

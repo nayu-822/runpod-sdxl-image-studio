@@ -287,9 +287,11 @@ def _apply_legacy_hires_fix(workflow: dict[str, object], settings: GenerationSet
 def _apply_final_upscale(workflow: dict[str, object], model_name: str | None) -> None:
     if "final_upscale_loader" in workflow or "final_upscale" in workflow:
         raise WorkflowTemplateError("reserved final upscale node id is already in use")
+    if model_name is None or not model_name.strip():
+        raise WorkflowTemplateError("final upscale model is required")
     workflow["final_upscale_loader"] = {
         "class_type": "UpscaleModelLoader",
-        "inputs": {"model_name": model_name or "4x-UltraSharp.pth"},
+        "inputs": {"model_name": model_name},
     }
     workflow["final_upscale"] = {
         "class_type": "ImageUpscaleWithModel",

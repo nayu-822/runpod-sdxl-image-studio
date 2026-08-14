@@ -142,6 +142,7 @@ class GenerationTabComponents:
     hires_scheduler: gr.Dropdown
     hires_denoise: gr.Number
     final_upscale: gr.Checkbox
+    final_upscale_message: gr.Markdown
     workflow_template_id: gr.State
     workflow_template_version: gr.State
     generate_button: gr.Button
@@ -479,24 +480,41 @@ def build_generation_tab(
             status_components = build_generation_status_card()
             startup_restore_timer = gr.Timer(value=1.0, active=True)
             startup_restore_applied = gr.State(False)
+            interactive_status = gr.Markdown("対話的生成: 待機中")
             progress = gr.Markdown("")
-            result_image = gr.Image(label="生成画像", type="filepath")
-            result_details = gr.Markdown("")
-            with gr.Row(elem_classes=["result-actions"]):
+            batch_message = gr.Markdown("")
+            interactive_result_gallery = gr.Gallery(
+                label="今回の生成結果",
+                columns=2,
+                rows=2,
+                object_fit="contain",
+                elem_classes=["interactive-result-gallery"],
+            )
+            interactive_restore_button = gr.Button(
+                "選択画像の設定を読み込む",
+                elem_classes=["mobile-tap-button"],
+            )
+            # Keep the legacy result components as hidden state targets for old handlers.
+            result_image = gr.Image(label="生成画像", type="filepath", visible=False)
+            result_details = gr.Markdown("", visible=False)
+            with gr.Row(elem_classes=["result-actions"], visible=False):
                 result_regenerate_button = gr.Button(
-                    "同条件で再生成", elem_classes=["mobile-tap-button"]
+                    "同条件で再生成", visible=False, elem_classes=["mobile-tap-button"]
                 )
-                result_edit_button = gr.Button("設定を編集", elem_classes=["mobile-tap-button"])
+                result_edit_button = gr.Button(
+                    "設定を編集", visible=False, elem_classes=["mobile-tap-button"]
+                )
                 result_upscale_button = gr.Button(
-                    "アップスケール", elem_classes=["mobile-tap-button"]
+                    "アップスケール", visible=False, elem_classes=["mobile-tap-button"]
                 )
-                result_favorite = gr.Checkbox(label="お気に入り", value=False)
+                result_favorite = gr.Checkbox(label="お気に入り", value=False, visible=False)
             result_seed = gr.Textbox(
                 label="実使用Seed（コピー）",
                 interactive=False,
                 show_copy_button=True,
+                visible=False,
             )
-            result_message = gr.Markdown("")
+            result_message = gr.Markdown("", visible=False)
 
     with gr.Accordion("高度な設定", open=False, elem_classes=["generation-advanced"]):
         with gr.Row(elem_classes=["size-dimensions"]):
@@ -525,6 +543,7 @@ def build_generation_tab(
             )
         with gr.Row(elem_classes=["size-dimensions"]):
             final_upscale = gr.Checkbox(value=False, label="Final 4x upscale")
+        final_upscale_message = gr.Markdown("", elem_classes=["validation-message"])
         with gr.Row(elem_classes=["size-dimensions"]):
             sampler = gr.Dropdown([], label="Sampler", interactive=False)
             scheduler = gr.Dropdown([], label="Scheduler", interactive=False)
@@ -554,21 +573,12 @@ def build_generation_tab(
             visible=False,
             elem_classes=["mobile-tap-button"],
         )
-        batch_message = gr.Markdown("")
         interactive_client_local_date = gr.Textbox(value="", visible=False)
         interactive_start_button = gr.Button(
             "対話的生成を開始", variant="primary", visible=False, elem_classes=["mobile-tap-button"]
         )
-        interactive_status = gr.Markdown("対話的生成: 待機中")
-        interactive_result_gallery = gr.Gallery(
-            label="今回の生成結果", columns=2, rows=2, object_fit="contain"
-        )
         interactive_run_id = gr.State(None)
         interactive_selected_image_index = gr.State(None)
-        interactive_restore_button = gr.Button(
-            "選択画像の設定を読み込む",
-            elem_classes=["mobile-tap-button"],
-        )
         interactive_poll_timer = gr.Timer(value=3.0, active=True)
     workflow_template_id = gr.State("sdxl_txt2img")
     workflow_template_version = gr.State(CURRENT_WORKFLOW_TEMPLATE_VERSION)
@@ -613,6 +623,7 @@ def build_generation_tab(
         hires_scheduler=hires_scheduler,
         hires_denoise=hires_denoise,
         final_upscale=final_upscale,
+        final_upscale_message=final_upscale_message,
         workflow_template_id=workflow_template_id,
         workflow_template_version=workflow_template_version,
         generate_button=generate_button,
@@ -1148,6 +1159,7 @@ def make_enqueue_handler(
     max_loras: int,
     preflight_service: GenerationPreflightService | None = None,
     form_state_saver: Callable[[GenerationFormStateSnapshot], object] | None = None,
+    interactive_service: InteractiveGenerationService | None = None,
 ) -> Callable[..., Awaitable[tuple[object, object, object, object, object, object]]]:
     """Create the non-blocking UI boundary that only persists queue work."""
 
@@ -1193,6 +1205,11 @@ def make_enqueue_handler(
                 gr.skip(),
             )
 
+        if interactive_service is not None:
+            try:
+                interactive_service.ensure_no_active_run()
+            except InteractiveGenerationError as exc:
+                return failure(str(exc))
         try:
             loras = lora_settings_from_state(lora_state, max_loras=max_loras)
             generation_settings = GenerationSettings(
@@ -1221,7 +1238,10 @@ def make_enqueue_handler(
                 final_upscale_model=upscaler if final_upscale else None,
             )
         except (TypeError, ValueError, ValidationError):
-            return failure("入力値を確認してください。")
+            return failure(
+                final_upscale_validation_message(bool(final_upscale), upscaler)
+                or "入力値を確認してください。"
+            )
         if regeneration_requested and not restored_from_generation_id:
             return failure("履歴設定の復元に失敗したため、キューへ追加しませんでした。")
         if regeneration_requested and not regeneration_valid:
@@ -1310,6 +1330,14 @@ def make_enqueue_handler(
     return handler
 
 
+def final_upscale_validation_message(final_upscale: bool, upscaler: str | None) -> str:
+    """Return a visible, safe hint before a final-upscale request is submitted."""
+
+    if final_upscale and not upscaler:
+        return "Final 4x upscaleを使う場合はアップスケーラーを選択してください。"
+    return ""
+
+
 def make_batch_enqueue_handler(
     service: GenerationQueueService,
     max_loras: int,
@@ -1378,7 +1406,15 @@ def make_batch_enqueue_handler(
             preflight_message = ""
             if preflight_service is not None:
                 try:
-                    preflight = await preflight_service.check(settings)
+                    preflight = (
+                        await preflight_service.check(
+                            settings,
+                            uses_upscaler=True,
+                            upscaler_name=settings.final_upscale_model,
+                        )
+                        if settings.final_upscale
+                        else await preflight_service.check(settings)
+                    )
                 except Exception:  # noqa: BLE001 - restore the action on preflight failure
                     return (
                         gr.Button("バッチをキューへ追加", interactive=True),
@@ -1407,7 +1443,8 @@ def make_batch_enqueue_handler(
                 "",
                 str(exc)
                 if isinstance(exc, GenerationQueueServiceError)
-                else "入力値を確認してください。",
+                else final_upscale_validation_message(bool(final_upscale), upscaler)
+                or "入力値を確認してください。",
             )
         if form_state_saver is not None:
             try:
@@ -1524,7 +1561,15 @@ def make_interactive_start_handler(
                 or CURRENT_WORKFLOW_TEMPLATE_VERSION,
             )
             if preflight_service is not None:
-                preflight = await preflight_service.check(settings)
+                preflight = (
+                    await preflight_service.check(
+                        settings,
+                        uses_upscaler=True,
+                        upscaler_name=settings.final_upscale_model,
+                    )
+                    if settings.final_upscale
+                    else await preflight_service.check(settings)
+                )
                 if not preflight.is_ready:
                     return (
                         None,
@@ -1539,15 +1584,19 @@ def make_interactive_start_handler(
                 client_local_date=client_local_date or "",
             )
         except (TypeError, ValueError, ValidationError, InteractiveGenerationError) as exc:
+            if bool(final_upscale) and not upscaler:
+                message = final_upscale_validation_message(True, upscaler)
+            else:
+                message = (
+                    "入力値または実行条件を確認してください。"
+                    if isinstance(exc, ValidationError)
+                    else str(exc)
+                )
             return (
                 None,
                 "対話的生成: 開始できません",
                 [],
-                (
-                    "入力値または実行条件を確認してください。"
-                    if isinstance(exc, ValidationError)
-                    else str(exc)
-                ),
+                message,
             )
         except Exception:  # noqa: BLE001 - hide adapter details at the UI boundary
             return None, "対話的生成: 生成前チェックに失敗", [], "生成を開始できませんでした。"
@@ -1867,7 +1916,7 @@ def make_custom_size_refresh_handler(
             view = None
             if run_id:
                 view = interactive_service.refresh(UUID(run_id))
-            if view is not None and view.completed_count > 0:
+            if current_preset == "Custom" and view is not None and view.completed_count > 0:
                 settings = view.run.settings_snapshot
                 custom_size_service.add(settings.width, settings.height)
             choices: list[object] = [
