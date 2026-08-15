@@ -204,8 +204,8 @@ def test_phase_c_settings_system_tab_is_usable_at_all_required_viewports() -> No
             browser.close()
 
 
-def test_phase_c_batch_controls_are_present_at_mobile_viewport() -> None:
-    """The batch semantics remain reachable while legacy enqueue controls stay hidden."""
+def test_phase_c_batch_controls_keep_only_interactive_fields_at_mobile_viewport() -> None:
+    """The interactive batch fields stay visible while legacy controls stay hidden."""
 
     from playwright.sync_api import sync_playwright
 
@@ -219,10 +219,10 @@ def test_phase_c_batch_controls_are_present_at_mobile_viewport() -> None:
             page.wait_for_selector("button", state="visible")
             assert _has_visible_text(page, "1回の枚数")
             assert _has_visible_text(page, "回数")
-            accordion = page.get_by_text("バッチ生成", exact=True)
-            assert _click_visible(page, accordion), "batch accordion is not reachable"
-            assert _has_visible_text(page, "Seed方式")
-            assert _has_visible_text(page, "バッチ名")
+            assert not _has_visible_text(page, "バッチ生成")
+            assert not _has_visible_text(page, "開始Seed")
+            assert not _has_visible_text(page, "Seed増分")
+            assert not _has_visible_text(page, "バッチ名")
             assert not _has_visible_text(page, "対話的生成を開始")
             assert not _has_visible_text(page, "バッチをキューへ追加")
             _assert_no_horizontal_overflow(page)
@@ -266,11 +266,11 @@ def test_phase_c_initial_generation_surface_is_dark_and_progressive() -> None:
                 "VAE",
                 "Hires Steps",
                 "最近の設定を更新",
+                "最近使った設定",
                 "生成結果",
                 "キャンセル",
             ):
                 assert not _has_visible_text(page, hidden_control), hidden_control
-            assert _has_visible_text(page, "最近使った設定")
             colors = page.evaluate(
                 """() => {
                     const body = getComputedStyle(document.body);

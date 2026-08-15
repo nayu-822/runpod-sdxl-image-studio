@@ -4,7 +4,7 @@ from runpod_sdxl_image_studio.config import Settings
 from runpod_sdxl_image_studio.ui.app_builder import build_app
 
 
-def test_phase_c_generation_surface_is_mobile_ready_and_status_poll_is_wired() -> None:
+def test_phase_c_generation_surface_uses_interactive_status_only() -> None:
     demo = build_app(Settings(_env_file=None, environment="phase8-ui-test"))
     components = demo.config["components"]
 
@@ -105,14 +105,31 @@ def test_phase_c_generation_surface_is_mobile_ready_and_status_poll_is_wired() -
     assert ".generation-sticky-action" in demo.config["css"]
     assert "safe-area-inset-bottom" in demo.config["css"]
 
-    timer_id = timers[0]["id"]
-    timer_dependencies = [
+    legacy_status_timer_id = next(
+        timer["id"] for timer in timers if timer["props"].get("value") == 5
+    )
+    legacy_status_dependencies = [
         dependency
         for dependency in demo.config["dependencies"]
-        if (timer_id, "tick") in dependency["targets"]
+        if (legacy_status_timer_id, "tick") in dependency["targets"]
     ]
-    assert len(timer_dependencies) == 1
-    assert len(timer_dependencies[0]["outputs"]) == 7
+    assert legacy_status_dependencies == []
+
+    interactive_timer_id = next(timer["id"] for timer in timers if timer["props"].get("value") == 3)
+    interactive_timer_dependencies = [
+        dependency
+        for dependency in demo.config["dependencies"]
+        if (interactive_timer_id, "tick") in dependency["targets"]
+    ]
+    assert len(interactive_timer_dependencies) == 1
+    assert len(interactive_timer_dependencies[0]["outputs"]) == 8
+
+    assert any(
+        component["type"] == "accordion"
+        and component["props"].get("label") == "バッチ生成"
+        and component["props"].get("visible") is False
+        for component in components
+    )
 
     result_regenerate_id = next(
         component["id"]
@@ -189,13 +206,12 @@ def test_phase_c_batch_enqueue_does_not_mutate_active_generation_state() -> None
         for dependency in dependencies
         if dependency.get("trigger_after") == disable_dependency["id"]
     )
-    poll_dependency = next(
+    legacy_status_poll_dependencies = [
         dependency
         for dependency in dependencies
         if dependency.get("trigger_after") == batch_dependency["id"]
-    )
+    ]
 
     assert len(batch_dependency["outputs"]) == 3
     assert active_state_id not in batch_dependency["outputs"]
-    assert len(poll_dependency["outputs"]) == 7
-    assert active_state_id not in poll_dependency["outputs"]
+    assert legacy_status_poll_dependencies == []

@@ -345,11 +345,11 @@ Asia/Tokyoの日付別manifest、destination snapshot、転送中progress/PID/lo
 ### 実装状況
 
 フェーズ8を実装済みです。生成画面をスマートフォンでは1カラム、デスクトップでは2カラムへ配置し、Positive/Negative promptの入力高さ、
-LoRAカード、サイズ・Seed入力、高度な設定Accordion、バッチAccordion、stickyな生成ボタンを追加・整理しました。重要なボタンは44px以上の
+LoRAカード、サイズ・Seed入力、高度な設定Accordion、互換用の非表示バッチ領域、stickyな生成ボタンを追加・整理しました。重要なボタンは44px以上の
 tap targetを確保し、safe area、320pxから1024px以上までのresponsive breakpoint、focus outlineを共通CSSへまとめています。
 
-生成中のstatus cardは`GenerationQueueService`と既存履歴Serviceから状態を読み取り、5秒間隔のbounded poll、`demo.load`による初期取得、
-enqueue後の再取得でGeneration ID、Queue position、進捗、現在処理、完了Artifactを表示します。poll障害時は最後の表示を保持して安全な警告だけを表示し、
+通常生成のstatusは`InteractiveGenerationService`のprojectionだけを表示正本とし、旧`GenerationStatusCard`の`demo.load`/timer表示は行いません。
+Interactive runの再読込・pollでは現在runだけを扱い、Gallery選択は表示中Generation IDとdisplay indexをserver側で再検証します。batch切替時は古い選択をclearし、
 DBの状態遷移は変更しません。最近使ったcheckpoint、VAE、LoRA、Presetは既存`RecentSettingsService`とPreset handlerを再利用し、適用操作だけで生成を開始しません。
 
 履歴一覧はthumbnail Artifactだけを使用し、thumbnail欠損時は軽量placeholderを表示します。原寸画像は詳細表示・完了結果表示のService経路だけで復元します。
@@ -714,14 +714,18 @@ Phase Bで追加したUI・Repository・Alembic・Fake/SQLiteテストは、実G
 Phase Cは、既存のPhase A / Bの生成・Queue・履歴機能を維持したUI再構成です。
 生成タブの初期表示をモデル、LoRA要約、Positive / Negative prompt、サイズ、1回の枚数、
 回数、Hires.fix、4x upscale、生成ボタンに絞り、Seed、Steps、CFG、Sampler、Scheduler、
-VAE、Hires詳細、バッチseed戦略、最近使った設定、LoRA編集は閉じたAccordionへ移します。
+VAE、Hires詳細、最近使った設定、LoRA編集は閉じたAccordionへ移します。旧来のバッチseed戦略、
+開始Seed、Seed増分、バッチ名は互換用の非表示領域に残し、通常Interactive生成では表示しません。
 upscalerは4x upscale選択時だけ表示し、Customサイズ時だけ幅・高さ編集を表示します。
 
 トップレベルは「生成」「履歴」「LoRA」「設定」の4タブとし、既存のシステム、キュー、
 アップスケール、プリセット、外部metadata、同期、モデル準備は「設定」内へネストします。
 初期状態では結果Gallery、選択画像の設定復元、キャンセル操作を隠し、完了結果やactive runが
-ある場合だけ表示します。状態表示は利用者向けの短い日本語へ投影し、Generation ID、Queue
-position、worker、prompt IDなどの運用識別子を通常表示から除外します。
+ある場合だけ表示します。通常生成のstatusはInteractive run projectionの1系統を正本とし、
+旧GenerationStatusCardのload/timer表示は行いません。Gallery選択は表示中Generation IDと
+display indexの組で保持してserver側でArtifactを再検証し、最新completed batchが変わった場合は
+古い選択をclearして復元を無効化します。状態表示は利用者向けの短い日本語へ投影し、Generation
+ID、Queue position、worker、prompt IDなどの運用識別子を通常表示から除外します。
 
 `ui/theme.py` と `ui/mobile_styles.py` で常時ダークのsurface / text / accent token、
 focus outline、responsive 2カラム / 1カラム、52px sticky Generate、safe-area paddingを

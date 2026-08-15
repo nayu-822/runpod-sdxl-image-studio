@@ -29,6 +29,7 @@ from runpod_sdxl_image_studio.services.generation_queue_service import (
 )
 from runpod_sdxl_image_studio.services.interactive_generation_service import (
     InteractiveGenerationError,
+    InteractiveGenerationService,
 )
 from runpod_sdxl_image_studio.ui.components.lora_editor import build_lora_editor
 from runpod_sdxl_image_studio.ui.components.mobile_actions import (
@@ -39,6 +40,7 @@ from runpod_sdxl_image_studio.ui.mobile_styles import MOBILE_UI_CSS
 from runpod_sdxl_image_studio.ui.tabs.history_tab import render_history_thumbnails
 from runpod_sdxl_image_studio.ui.tabs.preset_tab import make_recent_lora_add_handler
 from runpod_sdxl_image_studio.ui.tabs.system_tab import (
+    _interactive_view_outputs,
     build_generation_tab,
     final_upscaler_visibility,
     make_batch_enqueue_handler,
@@ -234,6 +236,9 @@ def test_generation_tab_exposes_mobile_status_and_prompt_controls() -> None:
     assert generation.interactive_cancel_button.visible is False
     assert generation.interactive_result_gallery.visible is False
     assert generation.interactive_restore_button.visible is False
+    assert generation.interactive_gallery_generation_id.value is None
+    assert generation.interactive_selected_generation_id.value is None
+    assert generation.interactive_selected_image_index.value is None
     assert generation.status_surface.visible is False
     assert ".interactive-result-gallery" in MOBILE_UI_CSS
     assert generation.lora_editor.rows[0].container.elem_classes == ["lora-card-row"]
@@ -300,15 +305,115 @@ def test_final_upscaler_visibility_follows_the_final_upscale_toggle() -> None:
 
 
 def test_gallery_restore_button_is_revealed_only_after_selection() -> None:
-    handler = make_interactive_gallery_select_handler()
+    generation_id = uuid4()
+    run_id = uuid4()
 
-    no_selection, hidden_button = handler(None)
-    selected, shown_button = handler(SimpleNamespace(index=1))
+    class _GalleryService:
+        def resolve_gallery_generation(
+            self,
+            requested_run_id: UUID,
+            requested_generation_id: UUID,
+            image_index: int,
+        ) -> UUID:
+            assert requested_run_id == run_id
+            assert requested_generation_id == generation_id
+            assert image_index == 1
+            return requested_generation_id
 
+    handler = make_interactive_gallery_select_handler(_GalleryService())  # type: ignore[arg-type]
+
+    no_generation, no_selection, hidden_button = handler(
+        SimpleNamespace(index=None), str(run_id), str(generation_id)
+    )
+    selected_generation, selected, shown_button = handler(
+        SimpleNamespace(index=1), str(run_id), str(generation_id)
+    )
+
+    assert no_generation is None
     assert no_selection is None
     assert hidden_button.visible is False
+    assert selected_generation == str(generation_id)
     assert selected == 1
     assert shown_button.visible is True
+
+
+def test_gallery_selection_is_cleared_when_the_displayed_generation_changes() -> None:
+    run_id = uuid4()
+    first_generation_id = uuid4()
+    second_generation_id = uuid4()
+
+    def view(generation_id: UUID) -> SimpleNamespace:
+        return SimpleNamespace(
+            run=SimpleNamespace(
+                id=run_id,
+                status=SimpleNamespace(value="completed"),
+                batch_count=2,
+                last_completed_generation_id=generation_id,
+                completed_generation_ids=(first_generation_id, second_generation_id),
+            ),
+            completed_count=2,
+            current_generation_status=None,
+            result_image_paths=(
+                Path(f"{generation_id}-0.png"),
+                Path(f"{generation_id}-1.png"),
+            ),
+        )
+
+    first = _interactive_view_outputs(view(first_generation_id), str(first_generation_id), 1)
+    assert first[5] == str(first_generation_id)
+    assert first[6] == str(first_generation_id)
+    assert first[7] == 1
+    assert first[3].visible is True
+
+    changed = _interactive_view_outputs(view(second_generation_id), str(first_generation_id), 1)
+    assert changed[5] == str(second_generation_id)
+    assert changed[6] is None
+    assert changed[7] is None
+    assert changed[3].visible is False
+
+    selected_second = _interactive_view_outputs(
+        view(second_generation_id), str(second_generation_id), 0
+    )
+    assert selected_second[6] == str(second_generation_id)
+    assert selected_second[7] == 0
+    assert selected_second[3].visible is True
+
+
+def test_gallery_service_rejects_stale_generation_and_out_of_range_index() -> None:
+    run_id = uuid4()
+    first_generation_id = uuid4()
+    second_generation_id = uuid4()
+
+    class _RunRepository:
+        def get_by_id(self, requested_run_id: UUID) -> object:
+            assert requested_run_id == run_id
+            return SimpleNamespace(
+                last_completed_generation_id=second_generation_id,
+                completed_generation_ids=(first_generation_id, second_generation_id),
+            )
+
+    class _ArtifactRepository:
+        def list_by_generation(self, generation_id: UUID) -> tuple[object, ...]:
+            assert generation_id == second_generation_id
+            return (
+                SimpleNamespace(artifact_type=SimpleNamespace(value="image"), display_order=0),
+                SimpleNamespace(artifact_type=SimpleNamespace(value="image"), display_order=1),
+            )
+
+    service = InteractiveGenerationService(
+        _RunRepository(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        Settings(_env_file=None),
+        artifact_repository=_ArtifactRepository(),  # type: ignore[arg-type]
+    )
+
+    assert (
+        service.resolve_gallery_generation(run_id, second_generation_id, 1) == second_generation_id
+    )
+    with pytest.raises(InteractiveGenerationError):
+        service.resolve_gallery_generation(run_id, first_generation_id, 0)
+    with pytest.raises(InteractiveGenerationError):
+        service.resolve_gallery_generation(run_id, second_generation_id, 2)
 
 
 def test_interactive_final_upscale_without_model_does_not_create_a_run() -> None:

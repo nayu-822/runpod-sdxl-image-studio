@@ -541,9 +541,9 @@ alembic upgrade head
 ## Phase 8: モバイルUI改善
 
 生成画面はスマートフォンで1カラム、デスクトップで設定とプレビューの2カラムになります。Positive/Negative promptの入力高さ、LoRAカード、
-sticky生成ボタン、status card、最近使ったcheckpoint・LoRA・Preset、高度な設定Accordionを用意し、主要ボタンは44px以上のtap targetを確保しています。
-320px、375px、390px、430px、768px、1024px以上を共通responsive CSSで扱い、safe areaを考慮します。画面復帰・初期load・5秒pollでは既存のQueue/履歴Serviceから状態を再取得し、
-生成workerを停止せずに完了Generationと主Artifactを復元します。
+sticky生成ボタン、Interactive status、最近使ったcheckpoint・LoRA・Preset、高度な設定Accordionを用意し、主要ボタンは44px以上のtap targetを確保しています。
+旧status cardは互換用に非表示で保持し、通常生成のload/timerでは表示しません。320px、375px、390px、430px、768px、1024px以上を共通responsive CSSで扱い、
+safe areaを考慮します。Interactive runの再読込・pollでは現在runだけを復元し、生成workerを停止せずに完了Generationと主Artifactを表示します。
 
 履歴一覧はthumbnail Artifactのみを表示し、thumbnail欠損時はplaceholderを使います。原寸画像を一覧へfallbackせず、詳細または完了結果でだけ復元します。
 履歴、Queue、アップスケール比較、Drive同期、metadata import、Presetの既存Serviceと状態遷移は維持しています。Phase 8ではDB schema・migrationの変更はありません。
@@ -754,14 +754,17 @@ Phase Cでは、既存のGeneration / Queue / History / Driveの処理を変更�
 画像作成に集中したユーザー向けの初期画面へ再構成しました。最初に表示するのはモデル、
 選択中LoRAの要約、Positive / Negative prompt、サイズ、1回の枚数、回数、Hires.fix、
 4x upscale、生成ボタンです。Seed、Steps、CFG、Sampler、Scheduler、VAE、Hires詳細、
-バッチのseed戦略などは「詳細設定」または「バッチ生成」へ段階的に格納し、最近使った設定と
-LoRA編集も初期状態では閉じています。
+バッチのseed戦略などは互換用の非表示領域へ退避し、通常のInteractive生成では表示・使用せず、最近使った設定と
+LoRA編集も初期状態では閉じています。最近使った設定は「高度な設定」の閉じたAccordionへ移しています。
 
 トップナビゲーションは「生成」「履歴」「LoRA」「設定」の4項目に整理し、システム、キュー、
 アップスケール、プリセット、外部metadata、同期、モデル準備は設定内のネストしたタブから
 開きます。生成前は結果Galleryと設定復元を非表示にし、結果が利用可能な場合だけ表示します。
-生成状態は「生成中」「キャンセル中…」「完了」「生成に失敗しました」などの利用者向け表現へ
-変換し、Generation ID、Queue position、worker、prompt IDなどの運用情報は通常画面へ出しません。
+通常画面のstatusはInteractive run projectionだけを正本とし、旧GenerationStatusCardのload/timer表示は
+行いません。生成状態は「生成中」「キャンセル中…」「完了」「生成に失敗しました」などの利用者向け表現へ
+変換し、Generation ID、Queue position、worker、prompt IDなどの運用情報は通常画面へ出しません。Gallery
+選択は表示中Generation IDとdisplay indexの組で保持し、別batchへ切り替わったpollでは古い選択と設定復元を
+無効化します。
 
 配色は常時ダークテーマとし、`#0B0D12` の背景、`#12151C` / `#181C24` のsurface、
 `#F5F7FB` / `#9AA4B2` の文字、`#7C5CFF` のaccentをCSS tokenとして定義しています。

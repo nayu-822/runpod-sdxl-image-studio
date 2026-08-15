@@ -189,8 +189,13 @@ class InteractiveGenerationService:
             raise InteractiveGenerationError("interactive run could not be read") from exc
         return self._refresh_run(run) if run is not None else None
 
-    def resolve_gallery_generation(self, run_id: UUID, image_index: int) -> UUID:
-        """Resolve a current-run Gallery index without trusting a client path."""
+    def resolve_gallery_generation(
+        self,
+        run_id: UUID,
+        gallery_generation_id: UUID,
+        image_index: int,
+    ) -> UUID:
+        """Resolve a current-run Gallery identity without trusting client state."""
 
         if isinstance(image_index, bool) or image_index < 0:
             raise InteractiveGenerationError("selected Gallery image is invalid")
@@ -198,14 +203,18 @@ class InteractiveGenerationService:
             run = self._repository.get_by_id(run_id)
             if run is None:
                 raise InteractiveGenerationError("interactive run was not found")
-            generation_id = run.last_completed_generation_id
-            if generation_id is None and run.completed_generation_ids:
-                generation_id = run.completed_generation_ids[-1]
-            if generation_id is None or generation_id not in run.completed_generation_ids:
+            current_generation_id = run.last_completed_generation_id
+            if current_generation_id is None and run.completed_generation_ids:
+                current_generation_id = run.completed_generation_ids[-1]
+            if (
+                current_generation_id is None
+                or current_generation_id != gallery_generation_id
+                or gallery_generation_id not in run.completed_generation_ids
+            ):
                 raise InteractiveGenerationError("no completed Gallery batch is available")
             if self._artifact_repository is None:
                 raise InteractiveGenerationError("Gallery artifact is unavailable")
-            artifacts = self._artifact_repository.list_by_generation(generation_id)
+            artifacts = self._artifact_repository.list_by_generation(gallery_generation_id)
             images = tuple(
                 sorted(
                     (artifact for artifact in artifacts if artifact.artifact_type.value == "image"),
@@ -214,7 +223,7 @@ class InteractiveGenerationService:
             )
             if image_index >= len(images):
                 raise InteractiveGenerationError("selected Gallery image is invalid")
-            return generation_id
+            return gallery_generation_id
         except InteractiveGenerationError:
             raise
         except Exception as exc:  # noqa: BLE001 - keep raw repository details out of UI

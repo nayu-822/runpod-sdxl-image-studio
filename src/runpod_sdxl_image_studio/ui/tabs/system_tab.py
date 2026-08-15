@@ -148,6 +148,8 @@ class GenerationTabComponents:
     workflow_template_id: gr.State
     workflow_template_version: gr.State
     generate_button: gr.Button
+    interactive_gallery_generation_id: gr.State
+    interactive_selected_generation_id: gr.State
     interactive_selected_image_index: gr.State
     interactive_restore_button: gr.Button
     batch_count: gr.Number
@@ -379,22 +381,6 @@ def build_generation_tab(
     upscaler_choices = gr.State(None)
     with gr.Row(elem_classes=["generation-layout"]):
         with gr.Column(elem_classes=["generation-primary"]):
-            with gr.Accordion("最近使った設定", open=False, elem_classes=["recent-settings"]):
-                recent_refresh = gr.Button("最近の設定を更新", elem_classes=["mobile-tap-button"])
-                recent_checkpoints = gr.Dropdown([], label="最近のモデル")
-                recent_checkpoint_apply = gr.Button(
-                    "モデルを反映", elem_classes=["mobile-tap-button"]
-                )
-                recent_vaes = gr.Dropdown([], label="最近のVAE")
-                recent_vae_apply = gr.Button("VAEを反映", elem_classes=["mobile-tap-button"])
-                recent_loras = gr.Dropdown([], label="最近のLoRA")
-                recent_lora_add = gr.Button("LoRAを追加", elem_classes=["mobile-tap-button"])
-                recent_generation_presets = gr.Dropdown([], label="最近のPreset")
-                recent_preset_apply = gr.Button("Presetを適用", elem_classes=["mobile-tap-button"])
-                recent_prompt_presets = gr.Dropdown([], visible=False)
-                recent_lora_presets = gr.Dropdown([], visible=False)
-                recent_message = gr.Markdown("")
-
             checkpoint = gr.Dropdown([], label="モデル", interactive=False)
             lora_summary = gr.Markdown(
                 selected_lora_summary_markdown([], max_loras),
@@ -571,7 +557,21 @@ def build_generation_tab(
                 interactive=True,
             )
 
-    with gr.Accordion("バッチ生成", open=False, elem_classes=["generation-batch"]):
+        with gr.Accordion("最近使った設定", open=False, elem_classes=["recent-settings"]):
+            recent_refresh = gr.Button("最近の設定を更新", elem_classes=["mobile-tap-button"])
+            recent_checkpoints = gr.Dropdown([], label="最近のモデル")
+            recent_checkpoint_apply = gr.Button("モデルを反映", elem_classes=["mobile-tap-button"])
+            recent_vaes = gr.Dropdown([], label="最近のVAE")
+            recent_vae_apply = gr.Button("VAEを反映", elem_classes=["mobile-tap-button"])
+            recent_loras = gr.Dropdown([], label="最近のLoRA")
+            recent_lora_add = gr.Button("LoRAを追加", elem_classes=["mobile-tap-button"])
+            recent_generation_presets = gr.Dropdown([], label="最近のPreset")
+            recent_preset_apply = gr.Button("Presetを適用", elem_classes=["mobile-tap-button"])
+            recent_prompt_presets = gr.Dropdown([], visible=False)
+            recent_lora_presets = gr.Dropdown([], visible=False)
+            recent_message = gr.Markdown("")
+
+    with gr.Accordion("バッチ生成", open=False, visible=False, elem_classes=["generation-batch"]):
         batch_seed_strategy = gr.Radio(
             [("ランダム", "random"), ("連番", "sequential")],
             value="random",
@@ -591,6 +591,8 @@ def build_generation_tab(
             "対話的生成を開始", variant="primary", visible=False, elem_classes=["mobile-tap-button"]
         )
         interactive_run_id = gr.State(None)
+        interactive_gallery_generation_id = gr.State(None)
+        interactive_selected_generation_id = gr.State(None)
         interactive_selected_image_index = gr.State(None)
         interactive_poll_timer = gr.Timer(value=3.0, active=True)
     workflow_template_id = gr.State("sdxl_txt2img")
@@ -641,6 +643,8 @@ def build_generation_tab(
         workflow_template_id=workflow_template_id,
         workflow_template_version=workflow_template_version,
         generate_button=generate_button,
+        interactive_gallery_generation_id=interactive_gallery_generation_id,
+        interactive_selected_generation_id=interactive_selected_generation_id,
         interactive_selected_image_index=interactive_selected_image_index,
         interactive_restore_button=interactive_restore_button,
         batch_count=batch_count,
@@ -1607,13 +1611,7 @@ def make_interactive_start_handler(
                     else await preflight_service.check(settings)
                 )
                 if not preflight.is_ready:
-                    return (
-                        None,
-                        gr.Markdown(value="", visible=False),
-                        gr.Gallery(value=[], visible=False),
-                        gr.Button(value="設定を読み込む", visible=False),
-                        preflight_markdown(preflight),
-                    )
+                    return _interactive_idle_outputs(preflight_markdown(preflight))
             view = service.start(
                 settings,
                 batch_count=int(batch_count),
@@ -1629,21 +1627,9 @@ def make_interactive_start_handler(
                     if isinstance(exc, ValidationError)
                     else str(exc)
                 )
-            return (
-                None,
-                gr.Markdown(value="", visible=False),
-                gr.Gallery(value=[], visible=False),
-                gr.Button(value="設定を読み込む", visible=False),
-                message,
-            )
+            return _interactive_idle_outputs(message)
         except Exception:  # noqa: BLE001 - hide adapter details at the UI boundary
-            return (
-                None,
-                gr.Markdown(value="", visible=False),
-                gr.Gallery(value=[], visible=False),
-                gr.Button(value="設定を読み込む", visible=False),
-                "生成を開始できませんでした。",
-            )
+            return _interactive_idle_outputs("生成を開始できませんでした。")
         if form_state_saver is not None:
             with suppress(Exception):
                 form_state_saver(
@@ -1681,11 +1667,12 @@ def make_interactive_start_handler(
 
 def make_interactive_refresh_handler(
     service: InteractiveGenerationService,
-) -> Callable[[str | None, object], tuple[object, ...]]:
+) -> Callable[[str | None, str | None, object], tuple[object, ...]]:
     """Create a reload/timer handler that restores the active run from SQLite."""
 
     def handler(
         run_id: str | None = None,
+        selected_generation_id: str | None = None,
         selected_index: object = None,
     ) -> tuple[object, ...]:
         try:
@@ -1693,30 +1680,18 @@ def make_interactive_refresh_handler(
             if identifier is not None:
                 if not service.is_current_run(identifier):
                     # A poll queued before a newer start must not overwrite the new run.
-                    return gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
+                    return (gr.skip(),) * 8
                 view = service.refresh(identifier)
             else:
                 view = service.restore()
         except InteractiveGenerationError as exc:
             del exc
-            return (
-                None,
-                gr.Markdown(value="", visible=True),
-                gr.Gallery(value=[], visible=False),
-                gr.Button(value="設定を読み込む", visible=False),
-                "生成状態を取得できませんでした。",
-            )
+            return _interactive_idle_outputs("生成状態を取得できませんでした。")
         except ValueError:
-            return (
-                None,
-                gr.Markdown(value="", visible=True),
-                gr.Gallery(value=[], visible=False),
-                gr.Button(value="設定を読み込む", visible=False),
-                "生成状態を取得できませんでした。",
-            )
+            return _interactive_idle_outputs("生成状態を取得できませんでした。")
         if view is None:
             return _interactive_idle_outputs()
-        return _interactive_view_outputs(view, selected_index)
+        return _interactive_view_outputs(view, selected_generation_id, selected_index)
 
     return handler
 
@@ -1732,11 +1707,8 @@ def make_interactive_cancel_handler(
             view = await service.cancel(identifier)
         except (ValueError, InteractiveGenerationError) as exc:
             del exc
-            return (
+            return _interactive_cancel_outputs(
                 run_id,
-                gr.Markdown(value="キャンセル中…", visible=True),
-                gr.Gallery(value=[], visible=False),
-                gr.Button(value="設定を読み込む", visible=False),
                 "キャンセル処理を継続しています。",
             )
         if view is None:
@@ -1748,6 +1720,7 @@ def make_interactive_cancel_handler(
 
 def _interactive_view_outputs(
     view: InteractiveRunView,
+    selected_generation_id: object = None,
     selected_index: object = None,
 ) -> tuple[object, ...]:
     run = view.run
@@ -1772,23 +1745,34 @@ def _interactive_view_outputs(
     else:
         detail = "キャンセルしました"
     paths = list(view.result_image_paths)
+    gallery_generation_id = run.last_completed_generation_id
+    if gallery_generation_id not in view.run.completed_generation_ids and completed_count:
+        gallery_generation_id = view.run.completed_generation_ids[-1]
+    gallery_generation_value = (
+        str(gallery_generation_id) if gallery_generation_id is not None and paths else None
+    )
     selected = (
         selected_index
         if isinstance(selected_index, int)
         and not isinstance(selected_index, bool)
         and 0 <= selected_index < len(paths)
+        and selected_generation_id == gallery_generation_value
         else None
     )
+    selected_generation_value = gallery_generation_value if selected is not None else None
     return (
         str(run.id),
         gr.Markdown(value=detail, visible=True),
         gr.Gallery(value=paths, visible=bool(paths)),
         gr.Button(value="設定を読み込む", visible=selected is not None),
         "",
+        gallery_generation_value,
+        selected_generation_value,
+        selected,
     )
 
 
-def _interactive_idle_outputs() -> tuple[object, ...]:
+def _interactive_idle_outputs(message: str = "") -> tuple[object, ...]:
     """Return the hidden initial state for the user-facing status surface."""
 
     return (
@@ -1796,7 +1780,25 @@ def _interactive_idle_outputs() -> tuple[object, ...]:
         gr.Markdown(value="", visible=False),
         gr.Gallery(value=[], visible=False),
         gr.Button(value="設定を読み込む", visible=False),
-        "",
+        message,
+        None,
+        None,
+        None,
+    )
+
+
+def _interactive_cancel_outputs(run_id: str | None, message: str) -> tuple[object, ...]:
+    """Keep cancellation visible while invalidating any Gallery selection."""
+
+    return (
+        run_id,
+        gr.Markdown(value="キャンセル中…", visible=True),
+        gr.Gallery(value=[], visible=False),
+        gr.Button(value="設定を読み込む", visible=False),
+        message,
+        None,
+        None,
+        None,
     )
 
 
@@ -1817,17 +1819,31 @@ def interactive_action_updates(status: str | None) -> tuple[object, object]:
     )
 
 
-def make_interactive_gallery_select_handler() -> Callable[[object], tuple[object, object]]:
-    """Store the index and reveal restore only after a valid gallery selection."""
+def make_interactive_gallery_select_handler(
+    service: InteractiveGenerationService,
+) -> Callable[..., tuple[object, object, gr.Button]]:
+    """Validate and store the displayed Generation identity with the image index."""
 
-    def handler(selection: object = None) -> tuple[int | None, gr.Button]:
+    def handler(
+        selection: gr.SelectData,
+        run_id: str | None = None,
+        displayed_generation_id: str | None = None,
+    ) -> tuple[str | None, int | None, gr.Button]:
         index = getattr(selection, "index", selection)
         if isinstance(index, tuple):
             index = index[0] if index else None
         selected = (
             index if isinstance(index, int) and not isinstance(index, bool) and index >= 0 else None
         )
-        return selected, gr.Button(value="設定を読み込む", visible=selected is not None)
+        if selected is None or not run_id or not displayed_generation_id:
+            return None, None, gr.Button(value="設定を読み込む", visible=False)
+        try:
+            generation_id = service.resolve_gallery_generation(
+                UUID(run_id), UUID(displayed_generation_id), selected
+            )
+        except (InteractiveGenerationError, ValueError):
+            return None, None, gr.Button(value="設定を読み込む", visible=False)
+        return str(generation_id), selected, gr.Button(value="設定を読み込む", visible=True)
 
     return handler
 
@@ -1840,6 +1856,7 @@ def make_interactive_gallery_restore_handler(
 
     def handler(
         run_id: str | None,
+        selected_generation_id: object,
         selected_index: object,
         checkpoint_choices: object = None,
         vae_choices: object = None,
@@ -1848,11 +1865,14 @@ def make_interactive_gallery_restore_handler(
         try:
             if (
                 run_id is None
+                or not isinstance(selected_generation_id, str)
                 or not isinstance(selected_index, int)
                 or isinstance(selected_index, bool)
             ):
                 raise InteractiveGenerationError("今回の生成結果から画像を選択してください。")
-            generation_id = service.resolve_gallery_generation(UUID(run_id), selected_index)
+            generation_id = service.resolve_gallery_generation(
+                UUID(run_id), UUID(selected_generation_id), selected_index
+            )
             return restore_handler(
                 str(generation_id), checkpoint_choices, vae_choices, lora_choices
             )
@@ -1921,10 +1941,10 @@ def disable_generate_button() -> gr.Button:
     )
 
 
-def disable_generate_button_and_clear_gallery_selection() -> tuple[gr.Button, None]:
-    """Disable Generate and discard a selection from the previous result batch."""
+def disable_generate_button_and_clear_gallery_selection() -> tuple[gr.Button, None, None, None]:
+    """Disable Generate and discard all state from the previous result batch."""
 
-    return disable_generate_button(), None
+    return disable_generate_button(), None, None, None
 
 
 def disable_enqueue_button() -> gr.Button:

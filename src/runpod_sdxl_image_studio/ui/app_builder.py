@@ -164,10 +164,6 @@ from runpod_sdxl_image_studio.ui.components.lora_editor import (
     render_state_updates,
     update_lora_row,
 )
-from runpod_sdxl_image_studio.ui.components.mobile_actions import (
-    make_mobile_status_poll_handler,
-    make_mobile_status_refresh_handler,
-)
 from runpod_sdxl_image_studio.ui.mobile_styles import mobile_ui_css
 from runpod_sdxl_image_studio.ui.tabs.drive_sync_tab import (
     build_drive_sync_tab,
@@ -656,15 +652,6 @@ def build_app(
         limit=app_settings.recent_settings_limit,
     )
     generation_diff_service = GenerationDiffService()
-    mobile_status_handler = make_mobile_status_refresh_handler(
-        queue_service,
-        history_service,
-    )
-    mobile_status_poll_handler = make_mobile_status_poll_handler(
-        queue_service,
-        history_service,
-    )
-
     try:
         initial_custom_size_choices = custom_size_service.selector_options()
     except GenerationCustomSizeError:
@@ -788,37 +775,6 @@ def build_app(
             concurrency_limit=1,
         )
 
-        mobile_status_inputs = [
-            generation.active_generation_id,
-            generation.status_card,
-            generation.result_image,
-            generation.result_details,
-            generation.result_seed,
-            generation.result_favorite,
-        ]
-        mobile_status_outputs = [
-            generation.active_generation_id,
-            generation.status_card,
-            generation.result_image,
-            generation.result_details,
-            generation.result_seed,
-            generation.result_favorite,
-            generation.result_message,
-            generation.status_surface,
-        ]
-        mobile_status_poll_outputs = mobile_status_outputs[1:]
-        generation.status_poll_timer.tick(
-            fn=mobile_status_poll_handler,
-            inputs=mobile_status_inputs,
-            outputs=mobile_status_poll_outputs,
-            concurrency_limit=1,
-        )
-        demo.load(
-            fn=mobile_status_handler,
-            inputs=mobile_status_inputs,
-            outputs=mobile_status_outputs,
-            concurrency_limit=1,
-        )
         demo.load(
             fn=make_refresh_handler(
                 comfyui_service,
@@ -1317,11 +1273,6 @@ def build_app(
                 generation.batch_message,
             ],
             concurrency_limit=1,
-        ).then(
-            fn=mobile_status_poll_handler,
-            inputs=mobile_status_inputs,
-            outputs=mobile_status_poll_outputs,
-            concurrency_limit=1,
         )
         demo.load(
             fn=None,
@@ -1370,7 +1321,12 @@ def build_app(
         ]
         interactive_disable_event = generation.generate_button.click(
             fn=disable_generate_button_and_clear_gallery_selection,
-            outputs=[generation.generate_button, generation.interactive_selected_image_index],
+            outputs=[
+                generation.generate_button,
+                generation.active_generation_id,
+                generation.interactive_selected_generation_id,
+                generation.interactive_selected_image_index,
+            ],
             queue=False,
             api_name="disable_generate_button",
         )
@@ -1402,6 +1358,9 @@ def build_app(
                 generation.interactive_result_gallery,
                 generation.interactive_restore_button,
                 generation.batch_message,
+                generation.interactive_gallery_generation_id,
+                generation.interactive_selected_generation_id,
+                generation.interactive_selected_image_index,
             ],
             concurrency_limit=1,
             concurrency_id="interactive-generation",
@@ -1434,6 +1393,9 @@ def build_app(
                 generation.interactive_result_gallery,
                 generation.interactive_restore_button,
                 generation.batch_message,
+                generation.interactive_gallery_generation_id,
+                generation.interactive_selected_generation_id,
+                generation.interactive_selected_image_index,
             ],
             concurrency_limit=1,
             concurrency_id="interactive-generation",
@@ -1448,6 +1410,7 @@ def build_app(
             fn=make_interactive_refresh_handler(interactive_generation_service),
             inputs=[
                 generation.interactive_run_id,
+                generation.interactive_selected_generation_id,
                 generation.interactive_selected_image_index,
             ],
             outputs=[
@@ -1456,6 +1419,9 @@ def build_app(
                 generation.interactive_result_gallery,
                 generation.interactive_restore_button,
                 generation.batch_message,
+                generation.interactive_gallery_generation_id,
+                generation.interactive_selected_generation_id,
+                generation.interactive_selected_image_index,
             ],
             concurrency_limit=1,
             concurrency_id="interactive-generation",
@@ -1478,6 +1444,7 @@ def build_app(
             fn=make_interactive_refresh_handler(interactive_generation_service),
             inputs=[
                 generation.interactive_run_id,
+                generation.interactive_selected_generation_id,
                 generation.interactive_selected_image_index,
             ],
             outputs=[
@@ -1486,6 +1453,9 @@ def build_app(
                 generation.interactive_result_gallery,
                 generation.interactive_restore_button,
                 generation.batch_message,
+                generation.interactive_gallery_generation_id,
+                generation.interactive_selected_generation_id,
+                generation.interactive_selected_image_index,
             ],
             concurrency_limit=1,
             concurrency_id="interactive-generation",
@@ -1505,8 +1475,13 @@ def build_app(
             concurrency_limit=1,
         )
         generation.interactive_result_gallery.select(
-            fn=make_interactive_gallery_select_handler(),
+            fn=make_interactive_gallery_select_handler(interactive_generation_service),
+            inputs=[
+                generation.interactive_run_id,
+                generation.interactive_gallery_generation_id,
+            ],
             outputs=[
+                generation.interactive_selected_generation_id,
                 generation.interactive_selected_image_index,
                 generation.interactive_restore_button,
             ],
@@ -2549,6 +2524,7 @@ def build_app(
             ),
             inputs=[
                 generation.interactive_run_id,
+                generation.interactive_selected_generation_id,
                 generation.interactive_selected_image_index,
                 generation.checkpoint_choices,
                 generation.vae_choices,
@@ -2631,10 +2607,6 @@ def build_app(
         regeneration_generation_event.then(
             fn=enable_regeneration_button,
             outputs=[history.regenerate_button],
-        ).then(
-            fn=mobile_status_poll_handler,
-            inputs=mobile_status_inputs,
-            outputs=mobile_status_poll_outputs,
         )
         generation.result_edit_button.click(
             fn=make_restore_handler(history_service, app_settings.max_loras),
@@ -2696,11 +2668,6 @@ def build_app(
         result_regenerate_enqueue_event.then(
             fn=lambda: gr.Button(value="同条件で再生成", interactive=True),
             outputs=[generation.result_regenerate_button],
-        ).then(
-            fn=mobile_status_poll_handler,
-            inputs=mobile_status_inputs,
-            outputs=mobile_status_poll_outputs,
-            concurrency_limit=1,
         )
     demo.generation_queue_runtime = queue_runtime
     demo.drive_sync_runtime = drive_sync_runtime
