@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -132,7 +136,15 @@ class _FakeEnqueueService:
             return None
         return self.item if self.item.generation.id == generation_id else None
 
-    def enqueue(self, _settings: object, *, parent_generation_id: UUID | None = None) -> object:
+    def enqueue(
+        self,
+        _settings: object,
+        *,
+        parent_generation_id: UUID | None = None,
+        admission_check: Callable[[], None] | None = None,
+    ) -> object:
+        if admission_check is not None:
+            admission_check()
         self.enqueue_calls += 1
         self.parent_generation_ids.append(parent_generation_id)
         if self.enqueue_item is None:
@@ -635,7 +647,10 @@ def test_result_regeneration_returns_new_active_generation_id_after_completed_pa
     assert result[5] == str(new_id)
 
 
-@pytest.mark.parametrize("active_status", ["active", "cancelling", None])
+@pytest.mark.parametrize(
+    "active_status",
+    ["active", "cancelling", "completed", "failed", "cancelled", None],
+)
 def test_legacy_regeneration_is_admitted_only_without_active_interactive_run(
     active_status: str | None,
 ) -> None:
@@ -647,7 +662,7 @@ def test_legacy_regeneration_is_admitted_only_without_active_interactive_run(
 
     class _InteractiveAdmission:
         def ensure_no_active_run(self) -> None:
-            if active_status is not None:
+            if active_status in {"active", "cancelling"}:
                 raise InteractiveGenerationError(
                     f"interactive run is {active_status}; regeneration is blocked"
                 )
@@ -668,13 +683,161 @@ def test_legacy_regeneration_is_admitted_only_without_active_interactive_run(
         )
     )
 
-    if active_status is None:
+    if active_status not in {"active", "cancelling"}:
         assert service.enqueue_calls == 1
         assert result[5] == str(new_id)
     else:
         assert service.enqueue_calls == 0
         assert active_status in result[3]
         assert result[5] is None or isinstance(result[5], dict)
+
+
+class _SharedAdmissionGate:
+    def __init__(self, *, hold_first_admission: bool = False) -> None:
+        self.lock = threading.RLock()
+        self.hold_first_admission = hold_first_admission
+        self.first_admission_entered = threading.Event()
+        self.release_first_admission = threading.Event()
+        self._first_admission_seen = False
+
+    def ensure_work_allowed(self) -> None:
+        return
+
+    @contextmanager
+    def admit_work(self) -> Iterator[None]:
+        with self.lock:
+            if self.hold_first_admission and not self._first_admission_seen:
+                self._first_admission_seen = True
+                self.first_admission_entered.set()
+                if not self.release_first_admission.wait(timeout=5):
+                    raise AssertionError("the first admission did not get released")
+            yield
+
+
+class _AdmissionDispatchRepository:
+    def __init__(self) -> None:
+        self.enqueue_calls = 0
+        self.item = _queue_item(uuid4(), sequence=1, status=GenerationStatus.PENDING)
+
+    def enqueue_single(self, _snapshot: object, **_kwargs: object) -> object:
+        self.enqueue_calls += 1
+        return self.item
+
+
+class _RaceInteractiveAdmission:
+    def __init__(self, gate: _SharedAdmissionGate) -> None:
+        self._gate = gate
+        self.active = False
+        self.start_called = threading.Event()
+        self.active_confirmed = threading.Event()
+
+    def ensure_no_active_run(self) -> None:
+        if self.active:
+            raise InteractiveGenerationError(
+                "generation is unavailable while an interactive run is active or cancelling"
+            )
+
+    def start(self) -> None:
+        self.start_called.set()
+        with self._gate.admit_work():
+            self.active = True
+            self.active_confirmed.set()
+
+
+class _BlockingPreflight:
+    def __init__(self, *, block: bool) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.block = block
+
+    async def check(self, *_args: object, **_kwargs: object) -> object:
+        self.entered.set()
+        if self.block and not self.release.wait(timeout=5):
+            raise AssertionError("preflight did not get released")
+        return SimpleNamespace(is_ready=True, warnings=())
+
+
+def test_legacy_enqueue_rechecks_inside_shared_admission_after_interactive_start() -> None:
+    gate = _SharedAdmissionGate()
+    dispatch = _AdmissionDispatchRepository()
+    queue = GenerationQueueService(  # type: ignore[arg-type]
+        dispatch,
+        Settings(_env_file=None),
+        lifecycle_gate=gate,
+    )
+    interactive = _RaceInteractiveAdmission(gate)
+    preflight = _BlockingPreflight(block=True)
+    handler = make_enqueue_handler(
+        queue,
+        max_loras=2,
+        preflight_service=preflight,  # type: ignore[arg-type]
+        interactive_service=interactive,  # type: ignore[arg-type]
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        legacy_future = executor.submit(
+            lambda: asyncio.run(
+                handler(
+                    *_enqueue_inputs(
+                        None,
+                        regeneration_valid=False,
+                        regeneration_requested=False,
+                    )
+                )
+            )
+        )
+        assert preflight.entered.wait(timeout=5)
+        interactive_future = executor.submit(interactive.start)
+        assert interactive.active_confirmed.wait(timeout=5)
+        preflight.release.set()
+        result = legacy_future.result(timeout=5)
+        interactive_future.result(timeout=5)
+
+    assert dispatch.enqueue_calls == 0
+    assert result[5] is None or isinstance(result[5], dict)
+    assert "active" in result[3]
+
+
+def test_legacy_enqueue_admission_wins_before_interactive_start() -> None:
+    gate = _SharedAdmissionGate(hold_first_admission=True)
+    dispatch = _AdmissionDispatchRepository()
+    queue = GenerationQueueService(  # type: ignore[arg-type]
+        dispatch,
+        Settings(_env_file=None),
+        lifecycle_gate=gate,
+    )
+    interactive = _RaceInteractiveAdmission(gate)
+    preflight = _BlockingPreflight(block=False)
+    handler = make_enqueue_handler(
+        queue,
+        max_loras=2,
+        preflight_service=preflight,  # type: ignore[arg-type]
+        interactive_service=interactive,  # type: ignore[arg-type]
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        legacy_future = executor.submit(
+            lambda: asyncio.run(
+                handler(
+                    *_enqueue_inputs(
+                        None,
+                        regeneration_valid=False,
+                        regeneration_requested=False,
+                    )
+                )
+            )
+        )
+        assert gate.first_admission_entered.wait(timeout=5)
+        interactive_future = executor.submit(interactive.start)
+        assert interactive.start_called.wait(timeout=5)
+        assert not interactive.active_confirmed.wait(timeout=0.1)
+        gate.release_first_admission.set()
+        result = legacy_future.result(timeout=5)
+        interactive_future.result(timeout=5)
+
+    assert dispatch.enqueue_calls == 1
+    assert result[1] == "Queued"
+    assert interactive.active is True
 
 
 def test_recent_lora_shortcut_fills_the_first_empty_middle_row() -> None:

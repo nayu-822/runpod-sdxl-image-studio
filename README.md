@@ -717,8 +717,10 @@ Generation、Batch進捗をバッチAccordionの外側で表示します。Gener
 active runとQueue状態を再取得し、送信済みComfyUI promptを再送信しません。
 
 現在の対話的結果は最新completed batchだけを2×2までのGalleryで表示します。保存済みの
-Customサイズは、ユーザーが`Custom`プリセットを選択して正常に1枚以上完了した場合だけ
-`generation_custom_sizes`（migration `0020_phase_b_custom_generation_sizes`）へ別管理されます。
+Customサイズはブラウザの現在のプリセット値ではなく、completed runのdurable snapshotを
+判定します。固定built-in寸法（1024×1024、832×1216、1216×832、896×1152、1152×896）
+以外で1枚以上完了したrunだけ`generation_custom_sizes`（migration
+`0020_phase_b_custom_generation_sizes`）へ別管理されるため、reload後も判定が変わりません。
 組み込みサイズは登録・削除できず、同じ寸法のpollはDB mutationやdirty通知を繰り返しません。
 保存済みCustomサイズの削除は履歴・snapshot・sidecarを変更しません。
 
@@ -731,7 +733,10 @@ Positive/Negative promptにはブラウザ側ClipboardのPaste/Copyを用意し�
 `UpscaleModelLoader` / `ImageUpscaleWithModel`不足の場合はpreflightで停止し、既定モデルを
 暗黙選択しません。Interactive runがactiveまたはcancellingの間は、Historyや旧resultからの
 通常Generation再生成もserver-side admission guardで拒否し、完了・失敗・キャンセル後に
-だけ再度許可します。
+だけ再度許可します。active判定とlegacy enqueueはInteractive startと共有するadmission
+lock内で一体化し、preflight中の並行開始によるTOCTOUを残しません。旧snapshotの
+`final_upscale=true`かつ`final_upscale_model=null`は、snapshot JSONを書き換えず、復元時だけ
+`4x-UltraSharp.pth`を明示値として再構成します。新規入力のupscaler必須化は維持します。
 
 Phase Bのbrowser確認:
 

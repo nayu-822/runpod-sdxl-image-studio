@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from io import BytesIO
@@ -160,6 +161,22 @@ def test_phase_a_snapshot_round_trip_preserves_new_generation_options() -> None:
     assert restored.final_upscale_model == "4x-UltraSharp.pth"
     assert restored.client_local_date == "2026-08-13"
     assert restored.workflow_template_version == CURRENT_WORKFLOW_TEMPLATE_VERSION
+
+
+def test_phase_a_legacy_final_upscale_snapshot_restores_its_old_default_model() -> None:
+    settings = _settings(final_upscale=True, final_upscale_model="4x-UltraSharp.pth")
+    legacy_payload = GenerationSettingsSnapshot.from_settings(settings).model_dump(mode="json")
+    legacy_payload["final_upscale_model"] = None
+    legacy_json = json.dumps(legacy_payload)
+
+    legacy_snapshot = GenerationSettingsSnapshot.from_json(legacy_json)
+    restored = legacy_snapshot.to_generation_settings()
+
+    assert legacy_snapshot.final_upscale is True
+    assert legacy_snapshot.final_upscale_model is None
+    assert restored.final_upscale is True
+    assert restored.final_upscale_model == "4x-UltraSharp.pth"
+    assert json.loads(legacy_json)["final_upscale_model"] is None
 
 
 def test_phase_a_legacy_hires_version_survives_snapshot_reload_and_retry_rebuild() -> None:

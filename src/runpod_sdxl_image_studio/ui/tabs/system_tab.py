@@ -1205,11 +1205,6 @@ def make_enqueue_handler(
                 gr.skip(),
             )
 
-        if interactive_service is not None:
-            try:
-                interactive_service.ensure_no_active_run()
-            except InteractiveGenerationError as exc:
-                return failure(str(exc))
         try:
             loras = lora_settings_from_state(lora_state, max_loras=max_loras)
             generation_settings = GenerationSettings(
@@ -1274,10 +1269,24 @@ def make_enqueue_handler(
             if preflight.warnings:
                 preflight_warning = preflight_markdown(preflight)
         try:
-            queued = service.enqueue(
-                generation_settings,
-                parent_generation_id=parent_id,
-            )
+            if interactive_service is None:
+                queued = service.enqueue(
+                    generation_settings,
+                    parent_generation_id=parent_id,
+                )
+            else:
+
+                def check_interactive_admission() -> None:
+                    try:
+                        interactive_service.ensure_no_active_run()
+                    except InteractiveGenerationError as exc:
+                        raise GenerationQueueServiceError(str(exc)) from exc
+
+                queued = service.enqueue(
+                    generation_settings,
+                    parent_generation_id=parent_id,
+                    admission_check=check_interactive_admission,
+                )
         except GenerationQueueServiceError as exc:
             return failure(str(exc))
         details = (
@@ -1851,6 +1860,17 @@ def size_preset_values(preset: str) -> tuple[int, int]:
     }.get(preset, (1024, 1024))
 
 
+BUILTIN_SIZE_DIMENSIONS = frozenset(
+    {
+        (1024, 1024),
+        (832, 1216),
+        (1216, 832),
+        (896, 1152),
+        (1152, 896),
+    }
+)
+
+
 def make_size_preset_handler(
     custom_size_service: GenerationCustomSizeService,
 ) -> Callable[[str | None], tuple[object, ...]]:
@@ -1916,9 +1936,10 @@ def make_custom_size_refresh_handler(
             view = None
             if run_id:
                 view = interactive_service.refresh(UUID(run_id))
-            if current_preset == "Custom" and view is not None and view.completed_count > 0:
+            if view is not None and view.completed_count > 0:
                 settings = view.run.settings_snapshot
-                custom_size_service.add(settings.width, settings.height)
+                if (settings.width, settings.height) not in BUILTIN_SIZE_DIMENSIONS:
+                    custom_size_service.add(settings.width, settings.height)
             choices: list[object] = [
                 "1024 × 1024",
                 "832 × 1216",

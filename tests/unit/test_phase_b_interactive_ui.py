@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -26,22 +27,30 @@ from runpod_sdxl_image_studio.ui.tabs.system_tab import (
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_custom_generation_sizes_are_idempotent_and_delete_only_the_preference() -> None:
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+def test_custom_generation_sizes_are_idempotent_and_delete_only_the_preference(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(
+        f"sqlite:///{(tmp_path / 'custom-sizes.sqlite3').as_posix()}",
+        connect_args={"check_same_thread": False},
+    )
     Base.metadata.create_all(engine)
+    notifications: list[str] = []
     service = GenerationCustomSizeService(
         GenerationCustomSizeRepository(create_session_factory(engine)),
         Settings(_env_file=None, max_width=2048, max_height=2048, max_pixels=4_194_304),
+        state_changed_callback=lambda: notifications.append("changed"),
     )
 
-    first = service.add(768, 1024)
-    duplicate = service.add(768, 1024)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(executor.map(lambda _index: service.add(768, 1024), range(4)))
 
-    assert duplicate.id == first.id
+    assert {item.id for item in results} == {results[0].id}
     assert [(item.width, item.height) for item in service.list()] == [(768, 1024)]
-    assert service.selector_options() == [("Custom 768 × 1024", f"custom:{first.id}")]
+    assert service.selector_options() == [("Custom 768 × 1024", f"custom:{results[0].id}")]
+    assert notifications == ["changed"]
 
-    service.delete(first.id)
+    service.delete(results[0].id)
     assert service.list() == ()
     engine.dispose()
 
@@ -67,7 +76,7 @@ def test_custom_generation_size_validation_does_not_register_invalid_values() ->
     engine.dispose()
 
 
-def test_custom_size_refresh_only_registers_custom_selection_and_notifies_once() -> None:
+def test_custom_size_refresh_uses_durable_dimensions_and_notifies_once() -> None:
     engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
     notifications: list[str] = []
@@ -79,27 +88,41 @@ def test_custom_size_refresh_only_registers_custom_selection_and_notifies_once()
 
     class _Interactive:
         completed_count = 0
+        dimensions = (1024, 1024)
 
         def refresh(self, _run_id: object) -> object:
             return SimpleNamespace(
                 completed_count=self.completed_count,
-                run=SimpleNamespace(settings_snapshot=SimpleNamespace(width=768, height=1024)),
+                run=SimpleNamespace(
+                    settings_snapshot=SimpleNamespace(
+                        width=self.dimensions[0], height=self.dimensions[1]
+                    )
+                ),
             )
 
     interactive = _Interactive()
     handler = make_custom_size_refresh_handler(service, interactive)  # type: ignore[arg-type]
     run_id = str(uuid4())
 
-    handler(run_id, "1024 × 1024")
-    assert service.list() == ()
-
     interactive.completed_count = 1
     handler(run_id, "Custom")
+    assert service.list() == ()
+
+    interactive.dimensions = (768, 1024)
+    handler(run_id, "1024 × 1024")
     assert [(item.width, item.height) for item in service.list()] == [(768, 1024)]
     assert notifications == ["changed"]
 
-    interactive.completed_count = 0
     handler(run_id, "Custom")
+    assert notifications == ["changed"]
+
+    interactive.dimensions = (832, 1216)
+    handler(run_id, "Custom")
+    assert notifications == ["changed"]
+
+    interactive.dimensions = (768, 1024)
+    interactive.completed_count = 0
+    handler(run_id, "1024 × 1024")
     assert notifications == ["changed"]
     engine.dispose()
 

@@ -112,18 +112,23 @@ class GenerationQueueService:
         settings: GenerationSettings,
         *,
         parent_generation_id: UUID | None = None,
+        admission_check: Callable[[], None] | None = None,
     ) -> QueueEnqueueResult:
         self._ensure_work_allowed()
         resolved = settings.model_copy(update={"seed": _resolve_seed(settings.seed)})
         try:
             snapshot = GenerationSettingsSnapshot.from_settings(resolved)
-            item = self._run_with_admission(
-                lambda: self._repository.enqueue_single(
+
+            def enqueue_single() -> GenerationQueueItem:
+                if admission_check is not None:
+                    admission_check()
+                return self._repository.enqueue_single(
                     snapshot,
                     parent_generation_id=parent_generation_id,
                     pending_limit=self._settings.queue_max_pending_jobs,
                 )
-            )
+
+            item = self._run_with_admission(enqueue_single)
             return QueueEnqueueResult(item=item, queue_position=item.entry.sequence)
         except (GenerationDispatchQueueRepositoryError, ValueError) as exc:
             raise GenerationQueueServiceError(_enqueue_error_message(exc, "生成")) from exc

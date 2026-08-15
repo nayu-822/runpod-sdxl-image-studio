@@ -7,7 +7,11 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from runpod_sdxl_image_studio.domain.generation_settings import MAX_SEED, GenerationSettings
+from runpod_sdxl_image_studio.domain.generation_settings import (
+    LEGACY_DEFAULT_FINAL_UPSCALE_MODEL,
+    MAX_SEED,
+    GenerationSettings,
+)
 
 CURRENT_SNAPSHOT_SCHEMA_VERSION = 1
 
@@ -120,6 +124,9 @@ class GenerationSettingsSnapshot(BaseModel):
 
     def to_generation_settings(self) -> GenerationSettings:
         try:
+            final_upscale_model = self.final_upscale_model
+            if self.final_upscale and final_upscale_model is None:
+                final_upscale_model = LEGACY_DEFAULT_FINAL_UPSCALE_MODEL
             return GenerationSettings(
                 positive_prompt=self.positive_prompt,
                 negative_prompt=self.negative_prompt,
@@ -139,7 +146,7 @@ class GenerationSettingsSnapshot(BaseModel):
                 hires_sampler_name=self.hires_sampler_name,
                 hires_scheduler_name=self.hires_scheduler_name,
                 final_upscale=self.final_upscale,
-                final_upscale_model=self.final_upscale_model,
+                final_upscale_model=final_upscale_model,
                 client_local_date=self.client_local_date,
                 sampler_name=self.sampler_name,
                 scheduler_name=self.scheduler_name,

@@ -683,20 +683,25 @@ start、cancel、restoreは同じGradio concurrency groupで直列化し、古�
 新しいrunの表示を上書きしないようserver側でrun IDを検証します。結果Galleryは
 最新completed batchだけをdisplay orderで表示し、2×2までのモバイル向け配置にします。
 
-生成成功後のサイズは、ユーザーが`Custom`プリセットを選択し、1枚以上のGenerationが
-完了した場合だけGeneration snapshotとは別の`generation_custom_sizes`へ保存し、
-`0020_phase_b_custom_generation_sizes`のunique制約で重複寸法を排除します。pollによる
-既存寸法の再確認ではDB mutationやdirty通知を発生させません。保存済みサイズは選択・
+生成成功後のサイズはブラウザの現在値ではなく、completed runのdurable snapshotで判定します。
+1024×1024、832×1216、1216×832、896×1152、1152×896の固定built-in寸法以外で、1枚以上の
+Generationが完了した場合だけGeneration snapshotとは別の`generation_custom_sizes`へ保存し、
+reload後も同じ判定になります。`0020_phase_b_custom_generation_sizes`のunique制約で重複寸法を
+排除し、pollによる既存寸法の再確認ではDB mutationやdirty通知を発生させません。保存済みサイズは選択・
 削除でき、組み込みプリセットや既存履歴には影響しません。Positive/Negative prompt
 にはブラウザ側のClipboard Paste/Copyを用意し、権限エラー時は入力を保持したまま
 安全なメッセージを表示します。Galleryから選択した画像の設定復元では、server側で
 runとArtifactを検証してから、prompt、LoRA、Hires/final upscale、元のbatch size、
 workflow template versionを復元します。新規手入力はworkflow 2.1を既定とし、既存の
-legacy snapshotは2.0のまま扱います。Final 4x upscaleは明示したupscalerを必須とし、
+legacy snapshotは2.0のまま扱います。旧snapshotの`final_upscale=true`かつ
+`final_upscale_model=null`は、元JSONを変更せず復元時だけ`4x-UltraSharp.pth`を明示値へ変換し、
+新規GenerationSettingsのモデル必須化は維持します。Final 4x upscaleは明示したupscalerを必須とし、
 未選択・capability外のモデルや`UpscaleModelLoader` / `ImageUpscaleWithModel`不足はpreflightで
 拒否します。既定の`4x-UltraSharp.pth`は暗黙選択しません。Interactive runがactiveまたは
 cancellingの間は、History・旧resultからの通常Generation再生成もserver-side admission guard
-で拒否し、完了・失敗・キャンセル後だけ再度許可します。
+で拒否し、完了・失敗・キャンセル後だけ再度許可します。active判定とlegacy enqueueは
+Interactive startと共有するadmission lock内で一体化し、preflight中の並行開始によるTOCTOUを
+残しません。
 
 Phase Bで追加したUI・Repository・Alembic・Fake/SQLiteテストは、実GPU、実ComfyUI、
 実RunPod、実Google Driveを使わず検証します。新しいHistory UI、全過去画像のGallery、

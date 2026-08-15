@@ -596,6 +596,40 @@ def test_restore_distinguishes_unverified_capabilities_from_empty_lists(tmp_path
     engine.dispose()
 
 
+def test_history_restore_and_regeneration_keep_legacy_final_upscale_semantics(
+    tmp_path: Path,
+) -> None:
+    settings, engine, repository, artifacts, _, _ = _repositories(tmp_path)
+    source = GenerationSettingsSnapshot.from_settings(
+        _settings().model_copy(
+            update={"final_upscale": True, "final_upscale_model": "4x-UltraSharp.pth"}
+        )
+    )
+    legacy_snapshot = source.model_copy(update={"final_upscale_model": None})
+    generation = repository.create_pending(legacy_snapshot)
+    service = GenerationHistoryService(repository, artifacts, settings)
+
+    restored = service.restore_settings(
+        generation.id,
+        checkpoints=("sdxl.safetensors",),
+        vaes=("vae.safetensors",),
+        loras=(),
+        max_loras=8,
+    )
+    plan = service.prepare_regeneration(
+        generation.id,
+        checkpoints=("sdxl.safetensors",),
+        vaes=("vae.safetensors",),
+        loras=(),
+        max_loras=8,
+    )
+
+    assert restored.settings.final_upscale is True
+    assert restored.settings.final_upscale_model == "4x-UltraSharp.pth"
+    assert plan.settings.final_upscale_model == "4x-UltraSharp.pth"
+    engine.dispose()
+
+
 @pytest.mark.asyncio
 async def test_generation_service_persists_pending_failure_before_prompt(tmp_path: Path) -> None:
     settings, engine, repository, artifacts, completion, jobs = _repositories(tmp_path)
