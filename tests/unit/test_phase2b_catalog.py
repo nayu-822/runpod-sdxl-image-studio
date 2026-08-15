@@ -38,6 +38,7 @@ from runpod_sdxl_image_studio.services.lora_catalog_service import (
 )
 from runpod_sdxl_image_studio.ui.components.lora_editor import (
     build_lora_editor,
+    component_output_count_for_rows,
     component_outputs,
 )
 from runpod_sdxl_image_studio.ui.tabs.lora_management_tab import (
@@ -276,7 +277,7 @@ def test_metadata_changes_refresh_catalog_and_generation_views(tmp_path: Path) -
         None,
         [],
     )
-    assert len(save_result) == 7 + 7 * 2
+    assert len(save_result) == 7 + component_output_count_for_rows(2)
     assert "Updated Style" in save_result[1]
     assert save_result[2].choices[0][0] == "Updated Style — style.safetensors"
     assert ("character", "character") in save_result[3].choices
@@ -293,7 +294,7 @@ def test_metadata_save_preserve_updates_follow_editor_output_structure() -> None
         updates = metadata_save_preserve_updates(lora_editor=editor)
 
     assert len(updates) == 6 + len(component_outputs(editor))
-    assert 1 + len(updates) == 7 + 7 * 2
+    assert 1 + len(updates) == 7 + component_output_count_for_rows(2)
 
 
 def _assert_skip_updates(updates: tuple[object, ...]) -> None:
@@ -306,7 +307,7 @@ def test_save_handler_returns_matching_output_count_when_no_selection(
 ) -> None:
     result = make_save_handler(object(), max_loras)(None, "", "", False, "", None, None, "", "")
 
-    assert len(result) == 7 + 7 * max_loras
+    assert len(result) == 7 + component_output_count_for_rows(max_loras)
     assert result[0] == "LoRAを選択してください。"
     _assert_skip_updates(result[1:])
 
@@ -332,7 +333,7 @@ def test_save_handler_returns_matching_output_count_on_validation_error(
         "",
     )
 
-    assert len(result) == 7 + 7 * max_loras
+    assert len(result) == 7 + component_output_count_for_rows(max_loras)
     assert result[0] == "入力値を確認してください。"
     _assert_skip_updates(result[1:])
     assert "3.0" not in str(result)
@@ -359,7 +360,7 @@ def test_save_handler_returns_matching_output_count_on_catalog_error(
         "",
     )
 
-    assert len(result) == 7 + 7 * max_loras
+    assert len(result) == 7 + component_output_count_for_rows(max_loras)
     assert result[0] == "入力値を確認してください。"
     _assert_skip_updates(result[1:])
     assert "database details" not in str(result)

@@ -35,6 +35,7 @@ from runpod_sdxl_image_studio.services.generation_recovery_service import (
     GenerationRecoveryService,
 )
 from runpod_sdxl_image_studio.ui.components.lora_editor import (
+    component_output_count_for_rows,
     render_state_updates,
 )
 
@@ -633,7 +634,7 @@ def make_restore_handler(
 def component_output_count(max_loras: int) -> int:
     """Return state, row, and add-button outputs for the restore handler."""
 
-    return 2 + 7 * max(1, max_loras)
+    return 2 + component_output_count_for_rows(max_loras)
 
 
 def _string_choices(value: object) -> tuple[str, ...] | None:

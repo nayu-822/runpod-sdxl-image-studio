@@ -254,7 +254,8 @@ async def test_startup_handler_applies_exact_form_and_visible_lora_rows_after_re
     component_count = len(component_outputs(generation.lora_editor))
     component_start = 2 + capability_count - component_count - 2
     first_row = component_start
-    second_row = component_start + 7
+    row_output_count = component_count // len(generation.lora_editor.rows)
+    second_row = component_start + row_output_count
     assert result[2].value == "checkpoints/A.safetensors"
     assert result[3].value == "vae/V.safetensors"
     assert result[first_row + 1].value == "loras/one.safetensors"

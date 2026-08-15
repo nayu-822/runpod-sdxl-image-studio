@@ -196,10 +196,14 @@ from runpod_sdxl_image_studio.ui.tabs.history_tab import (
 )
 from runpod_sdxl_image_studio.ui.tabs.lora_management_tab import (
     build_lora_management_tab,
+    make_add_to_generation_handler,
     make_favorite_handler,
+    make_gallery_handler,
+    make_gallery_select_handler,
     make_save_handler,
     make_search_handler,
     make_select_handler,
+    make_sync_gallery_handler,
     make_sync_handler,
     make_thumbnail_delete_handler,
     make_thumbnail_save_handler,
@@ -1235,6 +1239,7 @@ def build_app(
                 app_settings.max_loras,
                 preflight_service,
                 form_state_service.save,
+                lora_catalog_service=catalog_service,
             ),
             inputs=[
                 generation.checkpoint,
@@ -1350,6 +1355,7 @@ def build_app(
                 app_settings.max_loras,
                 preflight_service,
                 form_state_service.save,
+                lora_catalog_service=catalog_service,
             ),
             inputs=interactive_inputs,
             outputs=[
@@ -1942,6 +1948,7 @@ def build_app(
             name: str | None,
             model_strength: object,
             clip_strength: object,
+            auto_trigger: object,
             row_index: int,
         ) -> tuple[object, ...]:
             rows = normalize_lora_state(state, app_settings.max_loras)
@@ -1960,7 +1967,15 @@ def build_app(
                     if metadata and metadata.recommended_clip_strength is not None
                     else 1.0
                 )
-            updated = update_lora_row(state, row_index, name, model, clip, app_settings.max_loras)
+            updated = update_lora_row(
+                state,
+                row_index,
+                name,
+                model,
+                clip,
+                app_settings.max_loras,
+                auto_trigger,
+            )
             return updated, model, clip
 
         generation.lora_editor.add_button.click(
@@ -1978,14 +1993,15 @@ def build_app(
         )
         for index, row in enumerate(generation.lora_editor.rows):
             row.name.change(
-                fn=lambda state, name, model, clip, row_index=index: handle_lora_name_change(
-                    state, name, model, clip, row_index
+                fn=lambda state, name, model, clip, auto, row_index=index: handle_lora_name_change(
+                    state, name, model, clip, auto, row_index
                 ),
                 inputs=[
                     generation.lora_editor.state,
                     row.name,
                     row.model_strength,
                     row.clip_strength,
+                    row.auto_trigger,
                 ],
                 outputs=[generation.lora_editor.state, row.model_strength, row.clip_strength],
             )
@@ -2010,6 +2026,25 @@ def build_app(
                     row.name,
                     row.model_strength,
                     row.clip_strength,
+                ],
+                outputs=[generation.lora_editor.state],
+            )
+            row.auto_trigger.change(
+                fn=lambda state, name, model, clip, auto, row_index=index: update_lora_row(
+                    state,
+                    row_index,
+                    name,
+                    model,
+                    clip,
+                    app_settings.max_loras,
+                    auto,
+                ),
+                inputs=[
+                    generation.lora_editor.state,
+                    row.name,
+                    row.model_strength,
+                    row.clip_strength,
+                    row.auto_trigger,
                 ],
                 outputs=[generation.lora_editor.state],
             )
@@ -2093,6 +2128,14 @@ def build_app(
             lora_management.category_filter,
         ]
         search_handler = make_search_handler(catalog_service)
+        gallery_handler = make_gallery_handler(catalog_service)
+        gallery_inputs = search_inputs[:5]
+        demo.load(
+            fn=gallery_handler,
+            inputs=gallery_inputs,
+            outputs=[lora_management.result_gallery, lora_management.gallery_items],
+            concurrency_limit=1,
+        )
         for source in (
             lora_management.search,
             lora_management.category_filter,
@@ -2100,11 +2143,23 @@ def build_app(
             lora_management.include_missing,
             lora_management.sort,
         ):
-            source.change(fn=search_handler, inputs=search_inputs, outputs=search_outputs)
-        lora_management.search.submit(
+            search_event = source.change(
+                fn=search_handler, inputs=search_inputs, outputs=search_outputs
+            )
+            search_event.then(
+                fn=gallery_handler,
+                inputs=gallery_inputs,
+                outputs=[lora_management.result_gallery, lora_management.gallery_items],
+            )
+        search_event = lora_management.search.submit(
             fn=search_handler, inputs=search_inputs, outputs=search_outputs
         )
-        lora_management.sync_button.click(
+        search_event.then(
+            fn=gallery_handler,
+            inputs=gallery_inputs,
+            outputs=[lora_management.result_gallery, lora_management.gallery_items],
+        )
+        sync_event = lora_management.sync_button.click(
             fn=make_sync_handler(comfyui_service, catalog_service),
             outputs=[
                 lora_management.message,
@@ -2112,6 +2167,16 @@ def build_app(
                 lora_management.selected,
                 lora_management.category_filter,
             ],
+        )
+        sync_event.then(
+            fn=make_sync_gallery_handler(catalog_service),
+            outputs=[lora_management.result_gallery, lora_management.gallery_items],
+        )
+        lora_management.result_gallery.select(
+            fn=make_gallery_select_handler(),
+            inputs=[lora_management.gallery_items],
+            outputs=[lora_management.selected],
+            queue=False,
         )
         lora_management.selected.change(
             fn=make_select_handler(catalog_service),
@@ -2201,6 +2266,20 @@ def build_app(
             fn=make_thumbnail_delete_handler(catalog_service),
             inputs=[lora_management.selected],
             outputs=[lora_management.message, lora_management.thumbnail_preview],
+        )
+        lora_management.add_to_generation_button.click(
+            fn=make_add_to_generation_handler(catalog_service, app_settings.max_loras),
+            inputs=[
+                lora_management.selected,
+                generation.lora_editor.state,
+                generation.lora_editor.choices,
+            ],
+            outputs=[
+                lora_management.message,
+                generation.lora_editor.state,
+                *component_outputs(generation.lora_editor),
+                generation.lora_editor.add_button,
+            ],
         )
         history.refresh_button.click(
             fn=make_history_refresh_handler(history_service, recovery_service, reset_page=True),
@@ -2592,6 +2671,7 @@ def build_app(
                 preflight_service,
                 form_state_service.save,
                 interactive_service=interactive_generation_service,
+                lora_catalog_service=catalog_service,
             ),
             inputs=generation_inputs,
             outputs=[
@@ -2653,6 +2733,7 @@ def build_app(
                 preflight_service,
                 form_state_service.save,
                 interactive_service=interactive_generation_service,
+                lora_catalog_service=catalog_service,
             ),
             inputs=generation_inputs,
             outputs=[

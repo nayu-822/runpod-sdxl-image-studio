@@ -774,3 +774,20 @@ LoRA編集も初期状態では閉じています。最近使った設定は「�
 
 本PhaseではDB schema、Alembic migration、Generation Service、Queue worker、保存先、
 再送信防止の意味を変更していません。browser確認には起動済みGradio URLが必要です。
+
+## Phase D-A: LoRA選択UIとトリガーワード
+
+LoRAタブはmetadata管理フォームを初期画面の主役にせず、サムネイル、表示名、カテゴリ、
+お気に入り、利用可否をカード/Galleryで探す画面に変更しました。カードを選ぶと閉じた
+「選択中LoRAの詳細・管理」からトリガーワードや推奨強度を確認でき、「生成に追加」で既存の
+Generation LoRA editorへ順序を保って追加できます。missing LoRA、重複、`max_loras`超過は追加前に
+拒否し、サムネイルがない場合は軽量placeholderを使います。metadata UUIDや利用回数などの内部情報は
+通常カードへ表示しません。
+
+Generation側の各LoRAには「トリガーワードを自動追加」を追加しました。既定はOFFです。ONの場合だけ
+生成開始時に正規化済み相対`file_name`でmetadataをexact lookupし、既存の`append_trigger_words()`で
+LoRAの順序どおりにPositiveへ一度だけ追加します。Negativeや入力中のTextboxは変更しません。
+lookupできない場合は生成を開始せず安全なメッセージを表示します。実際にComfyUIへ送ったeffective
+positive promptはGeneration snapshot、sidecar、Historyの正本です。retryは保存済みsnapshotを使い、
+現在のmetadataを再解決しません。Form Stateにはcheckboxの選択をadditiveに保存し、旧stateではOFFとして
+復元します。Alembic migrationは追加していません。

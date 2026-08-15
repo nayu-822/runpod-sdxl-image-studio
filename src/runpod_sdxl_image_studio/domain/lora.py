@@ -29,6 +29,7 @@ class LoraSetting(BaseModel):
     model_strength: float = Field(default=1.0, ge=-2.0, le=2.0)
     clip_strength: float = Field(default=1.0, ge=-2.0, le=2.0)
     order: int = Field(default=0, ge=0)
+    auto_add_trigger_words: bool = False
 
     @field_validator("name")
     @classmethod

@@ -221,12 +221,13 @@ def test_restore_render_keeps_unavailable_lora_and_all_row_values() -> None:
 
     updates = render_state_updates(state, ["available.safetensors"], 3)
 
-    assert updates[0] == state
+    assert updates[0][0]["auto_add_trigger_words"] is False
+    assert updates[0][1]["auto_add_trigger_words"] is False
     assert updates[2].value == "removed.safetensors"
     assert ("removed.safetensors（現在利用不可）", "removed.safetensors") in updates[2].choices
     assert updates[3].value == 0.4
     assert updates[4].value == 0.8
-    assert updates[9].value == "available.safetensors"
+    assert updates[10].value == "available.safetensors"
 
 
 @pytest.mark.asyncio

@@ -517,6 +517,19 @@ RunPod bootstrap/Docker image、RunPod API、自動Terminate、複数Pod、モ�
 推奨情報、トリガーワード、プレビュー、検索、安全な失敗処理、生成フォームとの同期を実装しました。
 LoRA プリセットは引き続き延期しています。
 
+## Phase D-Aの完了状況
+
+LoRAトップ画面をcard/Gallery中心へ変更し、thumbnail placeholder、検索、カテゴリ、favorites/recent
+表示、利用不可表示、閉じた詳細・管理surfaceを実装しました。カードから既存Generation editorへ
+利用可能なLoRAを直接追加し、重複・上限超過・missingを拒否します。metadataの推奨model/CLIP strengthは
+新規追加時だけ適用し、既存行の強度や順序は変更しません。
+
+各LoRAのauto-trigger checkboxはOFFを既定とし、生成開始時だけexact `file_name` lookupを行います。
+trigger wordsはLoRA順にPositiveへdedupe付きで解決し、Negativeと入力Textboxは変更しません。lookup失敗は
+生成開始前に安全に停止します。解決後のeffective positive promptをGeneration snapshotとForm Stateへ
+保存するため、retryは現在のmetadataを再読込せず保存済みpromptを使用します。旧Form Stateはcheckboxを
+OFFとして読めるadditive設計です。Alembic migrationはありません。
+
 ## フェーズ3Aの状況
 
 フェーズ3Aの初期履歴基盤は完了しています。Generation、Job、Artifact レコードを Alembic 対応の

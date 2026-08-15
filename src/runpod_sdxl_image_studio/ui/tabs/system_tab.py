@@ -49,6 +49,10 @@ from runpod_sdxl_image_studio.services.lora_catalog_service import (
     LoraCatalogError,
     LoraCatalogService,
 )
+from runpod_sdxl_image_studio.services.lora_trigger_service import (
+    LoraTriggerResolutionError,
+    resolve_effective_positive_prompt,
+)
 from runpod_sdxl_image_studio.services.pod_lifecycle_service import PodLifecycleService
 from runpod_sdxl_image_studio.services.state_sync_service import StateSyncService
 from runpod_sdxl_image_studio.services.system_health_service import SystemHealthService
@@ -982,6 +986,7 @@ def make_startup_restore_handler(
                 "lora_name": item.name,
                 "model_strength": item.model_strength,
                 "clip_strength": item.clip_strength,
+                "auto_add_trigger_words": item.name in snapshot.auto_trigger_lora_names,
             }
             for index, item in enumerate(snapshot.loras)
         ]
@@ -1020,6 +1025,7 @@ def make_startup_restore_handler(
 def make_generate_handler(
     service: GenerationService,
     max_loras: int,
+    lora_catalog_service: LoraCatalogService | None = None,
 ) -> Callable[..., Awaitable[tuple[object, ...]]]:
     """Create the UI boundary that constructs typed GenerationSettings."""
 
@@ -1057,6 +1063,17 @@ def make_generate_handler(
         del size_preset
         try:
             loras = lora_settings_from_state(lora_state, max_loras=max_loras)
+            effective_positive_prompt = resolve_effective_positive_prompt(
+                positive_prompt or "", loras, lora_catalog_service
+            )
+        except LoraTriggerResolutionError as exc:
+            return (
+                gr.Button("Generate", interactive=True),
+                "",
+                None,
+                str(exc),
+                False,
+            )
         except (TypeError, ValueError, ValidationError):
             return (
                 gr.Button("Generate", interactive=True),
@@ -1067,7 +1084,7 @@ def make_generate_handler(
             )
         try:
             generation_settings = GenerationSettings(
-                positive_prompt=positive_prompt or "",
+                positive_prompt=effective_positive_prompt,
                 negative_prompt=negative_prompt or "",
                 checkpoint_name=checkpoint or "",
                 sampler_name=sampler or "",
@@ -1185,6 +1202,7 @@ def make_enqueue_handler(
     preflight_service: GenerationPreflightService | None = None,
     form_state_saver: Callable[[GenerationFormStateSnapshot], object] | None = None,
     interactive_service: InteractiveGenerationService | None = None,
+    lora_catalog_service: LoraCatalogService | None = None,
 ) -> Callable[..., Awaitable[tuple[object, object, object, object, object, object]]]:
     """Create the non-blocking UI boundary that only persists queue work."""
 
@@ -1232,8 +1250,11 @@ def make_enqueue_handler(
 
         try:
             loras = lora_settings_from_state(lora_state, max_loras=max_loras)
+            effective_positive_prompt = resolve_effective_positive_prompt(
+                positive_prompt or "", loras, lora_catalog_service
+            )
             generation_settings = GenerationSettings(
-                positive_prompt=positive_prompt or "",
+                positive_prompt=effective_positive_prompt,
                 negative_prompt=negative_prompt or "",
                 checkpoint_name=checkpoint or "",
                 sampler_name=sampler or "",
@@ -1257,6 +1278,8 @@ def make_enqueue_handler(
                 final_upscale=bool(final_upscale),
                 final_upscale_model=upscaler if final_upscale else None,
             )
+        except LoraTriggerResolutionError as exc:
+            return failure(str(exc))
         except (TypeError, ValueError, ValidationError):
             return failure(
                 final_upscale_validation_message(bool(final_upscale), upscaler)
@@ -1324,7 +1347,7 @@ def make_enqueue_handler(
             try:
                 form_state_saver(
                     GenerationFormStateSnapshot.from_ui(
-                        positive_prompt=positive_prompt,
+                        positive_prompt=effective_positive_prompt,
                         negative_prompt=negative_prompt,
                         seed_mode=seed_mode,
                         seed=-1 if seed_mode == "Random" else int(seed),
@@ -1338,6 +1361,9 @@ def make_enqueue_handler(
                         vae_name=vae,
                         upscaler_name=upscaler,
                         loras=loras,
+                        auto_trigger_lora_names=tuple(
+                            lora.name for lora in loras if lora.auto_add_trigger_words
+                        ),
                         clip_skip=int(clip_skip),
                         hires_fix=bool(hires_fix),
                         hires_scale=float(hires_scale),
@@ -1383,6 +1409,7 @@ def make_batch_enqueue_handler(
     max_loras: int,
     preflight_service: GenerationPreflightService | None = None,
     form_state_saver: Callable[[GenerationFormStateSnapshot], object] | None = None,
+    lora_catalog_service: LoraCatalogService | None = None,
 ) -> Callable[..., Awaitable[tuple[object, ...]]]:
     """Create the UI boundary for one atomic batch enqueue."""
 
@@ -1418,14 +1445,18 @@ def make_batch_enqueue_handler(
         final_upscale: bool = False,
     ) -> tuple[object, ...]:
         try:
+            loras = lora_settings_from_state(lora_state, max_loras=max_loras)
+            effective_positive_prompt = resolve_effective_positive_prompt(
+                positive_prompt or "", loras, lora_catalog_service
+            )
             settings = GenerationSettings(
-                positive_prompt=positive_prompt or "",
+                positive_prompt=effective_positive_prompt,
                 negative_prompt=negative_prompt or "",
                 checkpoint_name=checkpoint or "",
                 sampler_name=sampler or "",
                 scheduler_name=scheduler or "",
                 vae_name=vae,
-                loras=lora_settings_from_state(lora_state, max_loras=max_loras),
+                loras=loras,
                 width=int(width),
                 height=int(height),
                 seed=-1 if seed_mode == "Random" else int(seed),
@@ -1477,6 +1508,12 @@ def make_batch_enqueue_handler(
                 seed_step=int(seed_step),
                 name=name or "Batch",
             )
+        except LoraTriggerResolutionError as exc:
+            return (
+                gr.Button("バッチをキューへ追加", interactive=True),
+                "",
+                str(exc),
+            )
         except (TypeError, ValueError, ValidationError, GenerationQueueServiceError) as exc:
             return (
                 gr.Button("バッチをキューへ追加", interactive=True),
@@ -1490,7 +1527,7 @@ def make_batch_enqueue_handler(
             try:
                 form_state_saver(
                     GenerationFormStateSnapshot.from_ui(
-                        positive_prompt=positive_prompt,
+                        positive_prompt=effective_positive_prompt,
                         negative_prompt=negative_prompt,
                         seed_mode=seed_mode,
                         seed=-1 if seed_mode == "Random" else int(seed),
@@ -1503,7 +1540,10 @@ def make_batch_enqueue_handler(
                         checkpoint_name=checkpoint or "",
                         vae_name=vae,
                         upscaler_name=upscaler,
-                        loras=lora_settings_from_state(lora_state, max_loras=max_loras),
+                        loras=loras,
+                        auto_trigger_lora_names=tuple(
+                            lora.name for lora in loras if lora.auto_add_trigger_words
+                        ),
                         clip_skip=int(clip_skip),
                         hires_fix=bool(hires_fix),
                         hires_scale=float(hires_scale),
@@ -1535,6 +1575,7 @@ def make_interactive_start_handler(
     max_loras: int,
     preflight_service: GenerationPreflightService | None = None,
     form_state_saver: Callable[[GenerationFormStateSnapshot], object] | None = None,
+    lora_catalog_service: LoraCatalogService | None = None,
 ) -> Callable[..., Awaitable[tuple[object, ...]]]:
     """Create the small UI boundary for one durable interactive run."""
 
@@ -1572,14 +1613,18 @@ def make_interactive_start_handler(
     ) -> tuple[object, ...]:
         del size_preset
         try:
+            loras = lora_settings_from_state(lora_state, max_loras=max_loras)
+            effective_positive_prompt = resolve_effective_positive_prompt(
+                positive_prompt or "", loras, lora_catalog_service
+            )
             settings = GenerationSettings(
-                positive_prompt=positive_prompt or "",
+                positive_prompt=effective_positive_prompt,
                 negative_prompt=negative_prompt or "",
                 checkpoint_name=checkpoint or "",
                 sampler_name=sampler or "",
                 scheduler_name=scheduler or "",
                 vae_name=vae,
-                loras=lora_settings_from_state(lora_state, max_loras=max_loras),
+                loras=loras,
                 width=int(width),
                 height=int(height),
                 seed=-1 if seed_mode == "Random" else int(seed),
@@ -1618,6 +1663,8 @@ def make_interactive_start_handler(
                 batch_size=int(batch_size),
                 client_local_date=client_local_date or "",
             )
+        except LoraTriggerResolutionError as exc:
+            return _interactive_idle_outputs(str(exc))
         except (TypeError, ValueError, ValidationError, InteractiveGenerationError) as exc:
             if bool(final_upscale) and not upscaler:
                 message = final_upscale_validation_message(True, upscaler)
@@ -1634,7 +1681,7 @@ def make_interactive_start_handler(
             with suppress(Exception):
                 form_state_saver(
                     GenerationFormStateSnapshot.from_ui(
-                        positive_prompt=positive_prompt,
+                        positive_prompt=effective_positive_prompt,
                         negative_prompt=negative_prompt,
                         seed_mode=seed_mode,
                         seed=-1 if seed_mode == "Random" else int(seed),
@@ -1647,7 +1694,10 @@ def make_interactive_start_handler(
                         checkpoint_name=checkpoint or "",
                         vae_name=vae,
                         upscaler_name=upscaler if final_upscale else None,
-                        loras=lora_settings_from_state(lora_state, max_loras=max_loras),
+                        loras=loras,
+                        auto_trigger_lora_names=tuple(
+                            lora.name for lora in loras if lora.auto_add_trigger_words
+                        ),
                         clip_skip=int(clip_skip),
                         hires_fix=bool(hires_fix),
                         hires_scale=float(hires_scale),

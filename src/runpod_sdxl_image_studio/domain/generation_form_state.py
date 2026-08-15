@@ -71,6 +71,7 @@ class GenerationFormStateSnapshot(BaseModel):
     vae_name: str | None = Field(default=None, max_length=500)
     upscaler_name: str | None = Field(default=None, max_length=500)
     loras: tuple[LoraSettingSnapshot, ...] = ()
+    auto_trigger_lora_names: tuple[str, ...] = ()
     updated_at: datetime
 
     @field_validator("seed_mode", mode="before")
@@ -111,6 +112,7 @@ class GenerationFormStateSnapshot(BaseModel):
         vae_name: str | None,
         upscaler_name: str | None = None,
         loras: tuple[LoraSetting, ...] | list[LoraSetting] = (),
+        auto_trigger_lora_names: tuple[str, ...] | list[str] = (),
         clip_skip: int = 1,
         hires_fix: bool = False,
         hires_scale: float = 1.5,
@@ -156,6 +158,11 @@ class GenerationFormStateSnapshot(BaseModel):
                 )
                 for item in loras
             ),
+            auto_trigger_lora_names=tuple(
+                dict.fromkeys(
+                    str(name).strip() for name in auto_trigger_lora_names if str(name).strip()
+                )
+            ),
             updated_at=updated_at or datetime.now(UTC),
         )
 
@@ -194,6 +201,7 @@ class GenerationFormStateSnapshot(BaseModel):
             vae_name=snapshot.vae_name,
             upscaler_name=upscaler_name,
             loras=snapshot.loras,
+            auto_trigger_lora_names=(),
             updated_at=generation.updated_at,
         )
 

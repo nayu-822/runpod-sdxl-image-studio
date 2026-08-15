@@ -564,4 +564,4 @@ def test_recent_lora_shortcut_appends_and_rejects_duplicate_limit_and_missing() 
     assert "上限" in over_limit[-1]
     duplicate_again = handler("one.safetensors", full, choices)
     assert "重複" in duplicate_again[-1]
-    assert len(over_limit) == 3 + 7 * 2
+    assert len(over_limit) == 3 + 8 * 2

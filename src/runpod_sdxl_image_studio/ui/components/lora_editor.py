@@ -24,6 +24,7 @@ class LoraRowComponents:
     name: gr.Dropdown
     model_strength: gr.Number
     clip_strength: gr.Number
+    auto_trigger: gr.Checkbox
     up_button: gr.Button
     down_button: gr.Button
     remove_button: gr.Button
@@ -64,6 +65,7 @@ def normalize_lora_state(state: object, max_loras: int) -> LoraEditorState:
                 "lora_name": _optional_string(item.get("lora_name")),
                 "model_strength": item.get("model_strength", 1.0),
                 "clip_strength": item.get("clip_strength", 1.0),
+                "auto_add_trigger_words": bool(item.get("auto_add_trigger_words", False)),
             }
         )
     return rows or empty_lora_state()[:max_loras]
@@ -82,9 +84,20 @@ def lora_settings_from_state(state: object, max_loras: int) -> tuple[LoraSetting
             model_strength=_parse_strength(row.get("model_strength"), 1.0),
             clip_strength=_parse_strength(row.get("clip_strength"), 1.0),
             order=order,
+            auto_add_trigger_words=bool(row.get("auto_add_trigger_words", False)),
         )
         for order, row in enumerate(rows)
         if row["lora_name"]
+    )
+
+
+def auto_trigger_lora_names(state: object, max_loras: int) -> tuple[str, ...]:
+    """Return selected LoRA names whose trigger checkbox is enabled, in row order."""
+
+    return tuple(
+        str(row["lora_name"])
+        for row in normalize_lora_state(state, max_loras)
+        if row.get("lora_name") and bool(row.get("auto_add_trigger_words", False))
     )
 
 
@@ -115,6 +128,7 @@ def update_lora_row(
     model_strength: object,
     clip_strength: object,
     max_loras: int,
+    auto_add_trigger_words: object | None = None,
 ) -> LoraEditorState:
     rows = normalize_lora_state(state, max_loras)
     if 0 <= index < len(rows):
@@ -123,6 +137,11 @@ def update_lora_row(
             "lora_name": _optional_string(lora_name),
             "model_strength": model_strength,
             "clip_strength": clip_strength,
+            "auto_add_trigger_words": (
+                rows[index].get("auto_add_trigger_words", False)
+                if auto_add_trigger_words is None
+                else bool(auto_add_trigger_words)
+            ),
         }
     return rows
 
@@ -161,6 +180,11 @@ def build_lora_editor(max_loras: int) -> LoraEditorComponents:
                     step=0.1,
                     label="CLIP強度",
                 )
+            auto_trigger = gr.Checkbox(
+                value=False,
+                label="トリガーワードを自動追加",
+                elem_classes=["lora-auto-trigger"],
+            )
             with gr.Row(elem_classes=["lora-actions"]):
                 up_button = gr.Button("↑ 上へ", min_width=44)
                 down_button = gr.Button("↓ 下へ", min_width=44)
@@ -171,6 +195,7 @@ def build_lora_editor(max_loras: int) -> LoraEditorComponents:
                 name,
                 model_strength,
                 clip_strength,
+                auto_trigger,
                 up_button,
                 down_button,
                 remove_button,
@@ -197,6 +222,7 @@ def component_outputs(editor: LoraEditorComponents) -> list[Any]:
                 row.name,
                 row.model_strength,
                 row.clip_strength,
+                row.auto_trigger,
                 row.up_button,
                 row.down_button,
                 row.remove_button,
@@ -263,6 +289,7 @@ def render_state_updates(
                 ),
                 gr.Number(value=_display_strength(row.get("model_strength")), visible=visible),
                 gr.Number(value=_display_strength(row.get("clip_strength")), visible=visible),
+                gr.Checkbox(value=bool(row.get("auto_add_trigger_words", False)), visible=visible),
                 gr.Button(interactive=visible and index > 0),
                 gr.Button(interactive=visible and index + 1 < len(rows)),
                 gr.Button(interactive=visible),
@@ -283,6 +310,7 @@ def _new_row() -> LoraRowState:
         "lora_name": None,
         "model_strength": 1.0,
         "clip_strength": 1.0,
+        "auto_add_trigger_words": False,
     }
 
 

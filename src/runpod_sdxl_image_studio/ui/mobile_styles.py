@@ -251,6 +251,45 @@ body {
   width: 100% !important;
 }
 
+.lora-catalog-gallery,
+.lora-catalog-gallery .grid-wrap,
+.lora-catalog-gallery .gallery-item {
+  min-width: 0 !important;
+  max-width: 100% !important;
+}
+
+.lora-catalog-gallery .grid-wrap {
+  display: grid !important;
+  grid-template-columns: repeat(5, minmax(0, 1fr)) !important;
+  gap: 0.75rem !important;
+  overflow: clip !important;
+}
+
+.lora-catalog-gallery .gallery-item {
+  min-height: 44px !important;
+  overflow: hidden !important;
+  border: 1px solid var(--studio-border) !important;
+  border-radius: 14px !important;
+  background: var(--studio-surface-secondary) !important;
+}
+
+.lora-catalog-gallery img {
+  aspect-ratio: 1 / 1 !important;
+  width: 100% !important;
+  object-fit: cover !important;
+}
+
+.lora-catalog-gallery figcaption {
+  min-height: 44px !important;
+  padding: 0.45rem !important;
+  color: var(--studio-text) !important;
+  white-space: pre-line !important;
+}
+
+.lora-detail {
+  margin-top: 0.75rem !important;
+}
+
 .lora-actions button,
 .mobile-tap-button button,
 .history-actions button,
@@ -424,6 +463,10 @@ select:focus-visible {
     grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
   }
 
+  .lora-catalog-gallery .grid-wrap {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  }
+
   .comparison-gallery .grid-wrap {
     grid-template-columns: minmax(0, 1fr) !important;
   }
@@ -436,6 +479,10 @@ select:focus-visible {
   .lora-strengths,
   .result-actions {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .lora-catalog-gallery .grid-wrap {
+    grid-template-columns: minmax(0, 1fr) !important;
   }
 }
 """
