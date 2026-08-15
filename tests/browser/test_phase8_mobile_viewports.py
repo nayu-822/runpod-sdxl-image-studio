@@ -22,15 +22,22 @@ VIEWPORTS = (
 )
 TAB_CONTROLS = {
     "生成": (
-        "Positive prompt",
+        "モデル",
+        "Positive",
+        "Negative",
+        "サイズ",
+        "1回の枚数",
+        "回数",
+        "Hires.fix",
+        "4x upscale",
+        "LoRA",
         "生成",
-        "キャンセル",
-        "Positiveへ貼り付け",
-        "Negativeへ貼り付け",
-        "対話的生成: 待機中",
-        "今回の生成結果",
-        "選択画像の設定を読み込む",
     ),
+    "履歴": ("履歴を検索", "実使用seed（選択してコピー）"),
+    "LoRA": ("ComfyUI一覧と同期", "検索"),
+    "設定": ("システム", "キュー", "アップスケール", "プリセット"),
+}
+SETTINGS_TAB_CONTROLS = {
     "システム": (
         "System Health",
         "Refresh system status",
@@ -43,12 +50,10 @@ TAB_CONTROLS = {
         "今すぐ状態をバックアップ",
     ),
     "キュー": ("キューを更新", "選択ジョブをキャンセル"),
-    "LoRA管理": ("ComfyUI一覧と同期", "検索"),
-    "履歴": ("履歴を検索", "実使用seed（選択してコピー）"),
     "アップスケール": ("親Generation ID", "アップスケールをキューへ追加"),
     "プリセット": ("Preset検索", "現在設定から保存"),
     "外部metadata": ("metadataを解析", "画像（PNG / WebP）"),
-    "同期・設定": ("同期状態を更新", "Manifest再構築を登録"),
+    "同期": ("同期状態を更新", "Manifest再構築を登録"),
     "モデル準備": (
         "Google Driveモデル",
         "Remote一覧を更新",
@@ -155,6 +160,16 @@ def test_phase8_mobile_viewports_have_no_horizontal_overflow_or_missing_controls
                         assert _has_visible_text(page, control), (
                             f"{control!r} is not visible in {tab_label!r} at {width}x{height}"
                         )
+                    if tab_label == "設定":
+                        for settings_label, settings_controls in SETTINGS_TAB_CONTROLS.items():
+                            overflow_menu_used = (
+                                _click_tab(page, settings_label) or overflow_menu_used
+                            )
+                            for control in settings_controls:
+                                assert _has_visible_text(page, control), (
+                                    f"{control!r} is not visible in settings tab "
+                                    f"{settings_label!r} at {width}x{height}"
+                                )
                     _assert_no_horizontal_overflow(page)
                 if needs_overflow_menu:
                     assert overflow_menu_used, "320x568 did not exercise the overflow tab menu"
@@ -162,7 +177,7 @@ def test_phase8_mobile_viewports_have_no_horizontal_overflow_or_missing_controls
             browser.close()
 
 
-def test_phase9_system_tab_is_usable_at_all_required_viewports() -> None:
+def test_phase_c_settings_system_tab_is_usable_at_all_required_viewports() -> None:
     """Keep the System Health surface visible even when tabs collapse."""
 
     from playwright.sync_api import sync_playwright
@@ -178,6 +193,7 @@ def test_phase9_system_tab_is_usable_at_all_required_viewports() -> None:
                 page.set_viewport_size({"width": width, "height": height})
                 page.goto(url, wait_until="domcontentloaded")
                 page.wait_for_selector("button", state="visible")
+                _click_tab(page, "設定")
                 _click_tab(page, system_tab_label)
                 for control in ("System Health", "Refresh system status", "Recent errors"):
                     assert _has_visible_text(page, control), (
@@ -188,7 +204,7 @@ def test_phase9_system_tab_is_usable_at_all_required_viewports() -> None:
             browser.close()
 
 
-def test_phase_a_batch_controls_are_present_at_mobile_viewport() -> None:
+def test_phase_c_batch_controls_are_present_at_mobile_viewport() -> None:
     """The batch semantics remain reachable while legacy enqueue controls stay hidden."""
 
     from playwright.sync_api import sync_playwright
@@ -201,12 +217,77 @@ def test_phase_a_batch_controls_are_present_at_mobile_viewport() -> None:
         try:
             page.goto(url, wait_until="domcontentloaded")
             page.wait_for_selector("button", state="visible")
+            assert _has_visible_text(page, "1回の枚数")
+            assert _has_visible_text(page, "回数")
             accordion = page.get_by_text("バッチ生成", exact=True)
             assert _click_visible(page, accordion), "batch accordion is not reachable"
-            assert _has_visible_text(page, "Batch size")
-            assert _has_visible_text(page, "Batch count")
+            assert _has_visible_text(page, "Seed方式")
+            assert _has_visible_text(page, "バッチ名")
             assert not _has_visible_text(page, "対話的生成を開始")
             assert not _has_visible_text(page, "バッチをキューへ追加")
+            _assert_no_horizontal_overflow(page)
+        finally:
+            browser.close()
+
+
+def test_phase_c_initial_generation_surface_is_dark_and_progressive() -> None:
+    """The initial generation view keeps the task surface visible and details collapsed."""
+
+    from playwright.sync_api import sync_playwright
+
+    url = os.environ["IMAGE_STUDIO_BROWSER_URL"]
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page(viewport={"width": 390, "height": 844})
+        try:
+            page.goto(url, wait_until="domcontentloaded")
+            page.wait_for_selector("button", state="visible")
+            _click_tab(page, "生成")
+            for control in (
+                "モデル",
+                "Positive",
+                "Negative",
+                "サイズ",
+                "1回の枚数",
+                "回数",
+                "Hires.fix",
+                "4x upscale",
+                "生成",
+            ):
+                assert _has_visible_text(page, control)
+            for hidden_control in (
+                "Seed",
+                "Steps",
+                "CFG",
+                "CLIP skip",
+                "Sampler",
+                "Scheduler",
+                "VAE",
+                "Hires Steps",
+                "最近の設定を更新",
+                "生成結果",
+                "キャンセル",
+            ):
+                assert not _has_visible_text(page, hidden_control), hidden_control
+            assert _has_visible_text(page, "最近使った設定")
+            colors = page.evaluate(
+                """() => {
+                    const body = getComputedStyle(document.body);
+                    const container = getComputedStyle(document.querySelector('.gradio-container'));
+                    const button = getComputedStyle(document.querySelector('button'));
+                    return {
+                        bodyBackground: body.backgroundColor,
+                        containerBackground: container.backgroundColor,
+                        buttonBackground: button.backgroundColor,
+                        colorScheme: body.colorScheme,
+                    };
+                }"""
+            )
+            assert colors["colorScheme"] == "dark"
+            assert colors["bodyBackground"] not in {"rgb(255, 255, 255)", "white"}
+            assert colors["containerBackground"] not in {"rgb(255, 255, 255)", "white"}
+            assert colors["buttonBackground"] not in {"rgb(255, 255, 255)", "white"}
             _assert_no_horizontal_overflow(page)
         finally:
             browser.close()

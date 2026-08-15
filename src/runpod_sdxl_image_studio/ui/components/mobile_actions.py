@@ -23,7 +23,16 @@ from runpod_sdxl_image_studio.ui.view_models import (
     generation_status_card_markdown,
 )
 
-MobileStatusOutputs = tuple[object, object, object, object, object, object, object]
+MobileStatusOutputs = tuple[
+    object,
+    object,
+    object,
+    object,
+    object,
+    object,
+    object,
+    object,
+]
 
 
 def make_mobile_status_refresh_handler(
@@ -56,6 +65,7 @@ def make_mobile_status_refresh_handler(
                     "",
                     False,
                     "",
+                    gr.Group(visible=False),
                 )
 
             card = generation_status_card_markdown(_status_view(item))
@@ -68,6 +78,7 @@ def make_mobile_status_refresh_handler(
                     gr.skip() if current_seed else "",
                     gr.skip() if current_favorite else False,
                     "",
+                    gr.Group(visible=True),
                 )
             detail = history_service.get_detail(item.generation.id)
             return _completed_detail_outputs(history_service, detail)
@@ -80,6 +91,7 @@ def make_mobile_status_refresh_handler(
                 gr.skip(),
                 gr.skip(),
                 "最新状態を取得できませんでした。",
+                gr.Group(visible=bool(current_card)),
             )
 
     return handler
@@ -97,7 +109,7 @@ def _resolve_item(
 def make_mobile_status_poll_handler(
     queue_service: GenerationQueueService,
     history_service: GenerationHistoryService,
-) -> Callable[..., tuple[object, object, object, object, object, object]]:
+) -> Callable[..., tuple[object, object, object, object, object, object, object]]:
     """Create a poll handler that never writes the active Generation state."""
 
     refresh_handler = make_mobile_status_refresh_handler(queue_service, history_service)
@@ -109,7 +121,7 @@ def make_mobile_status_poll_handler(
         current_details: str | None = None,
         current_seed: str | None = None,
         current_favorite: bool = False,
-    ) -> tuple[object, object, object, object, object, object]:
+    ) -> tuple[object, object, object, object, object, object, object]:
         if not active_generation_id or not active_generation_id.strip():
             return _idle_or_preserved_poll_outputs(
                 current_card,
@@ -136,7 +148,7 @@ def _idle_or_preserved_poll_outputs(
     current_details: str | None,
     current_seed: str | None,
     current_favorite: bool,
-) -> tuple[object, object, object, object, object, object]:
+) -> tuple[object, object, object, object, object, object, object]:
     """Keep a timer poll from selecting an unrelated Generation."""
 
     return (
@@ -146,6 +158,7 @@ def _idle_or_preserved_poll_outputs(
         gr.skip() if current_seed else "",
         gr.skip() if current_favorite else False,
         "",
+        gr.Group(visible=bool(current_card)),
     )
 
 
@@ -166,7 +179,7 @@ def _status_view(item: GenerationQueueItem) -> GenerationStatusCardView:
         GenerationStatus.QUEUED: "キューで待機中です。",
         GenerationStatus.RUNNING: "生成中です。",
         GenerationStatus.COMPLETED: "生成が完了しました。",
-        GenerationStatus.FAILED: item.generation.error_summary or "生成に失敗しました。",
+        GenerationStatus.FAILED: "生成に失敗しました。再度お試しください。",
         GenerationStatus.CANCELLED: "生成をキャンセルしました。",
     }[status]
     return GenerationStatusCardView(
@@ -193,11 +206,7 @@ def _completed_detail_outputs(
         current_step=None,
         message="生成が完了しました。",
     )
-    result_details = (
-        f"Generation ID: `{generation_id}`\n"
-        f"実使用seed: `{detail.snapshot.seed}`\n"
-        f"状態: `{detail.status_text}`"
-    )
+    result_details = f"実使用seed: `{detail.snapshot.seed}`\n生成条件を復元できます。"
     return (
         generation_id,
         generation_status_card_markdown(status),
@@ -206,6 +215,7 @@ def _completed_detail_outputs(
         str(detail.snapshot.seed),
         detail.favorite,
         "",
+        gr.Group(visible=True),
     )
 
 

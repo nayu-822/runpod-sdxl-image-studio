@@ -256,8 +256,9 @@ from runpod_sdxl_image_studio.ui.tabs.system_tab import (
     build_system_tab,
     capability_refresh_outputs,
     disable_batch_enqueue_button,
-    disable_generate_button,
+    disable_generate_button_and_clear_gallery_selection,
     final_upscale_validation_message,
+    final_upscaler_visibility,
     interactive_action_updates,
     make_batch_enqueue_handler,
     make_check_connection_handler,
@@ -290,7 +291,12 @@ from runpod_sdxl_image_studio.ui.tabs.upscale_tab import (
     make_upscale_result_handler,
     make_upscale_visibility_handler,
 )
-from runpod_sdxl_image_studio.ui.view_models import initial_status_markdown, state_sync_markdown
+from runpod_sdxl_image_studio.ui.theme import modern_dark_theme
+from runpod_sdxl_image_studio.ui.view_models import (
+    initial_status_markdown,
+    selected_lora_summary_markdown,
+    state_sync_markdown,
+)
 from runpod_sdxl_image_studio.workflows.loader import load_txt2img_template, load_workflow_template
 
 APP_TITLE = "RunPod SDXL Image Studio"
@@ -665,50 +671,52 @@ def build_app(
         # An older database is still usable until the normal startup migration runs.
         initial_custom_size_choices = []
 
-    with gr.Blocks(title=APP_TITLE, css=APP_CSS) as demo:
-        gr.Markdown(f"# {APP_TITLE}")
-        with gr.Tab("生成"):
-            generation = build_generation_tab(
-                app_settings.max_loras,
-                custom_size_choices=initial_custom_size_choices,
-            )
-        with gr.Tab("システム"):
-            system = build_system_tab(
-                app_settings.comfyui_base_url,
-                initial_status_markdown(),
-                initial_state_sync_markdown=state_sync_markdown(
-                    state_sync_service.get_status(), app_settings.timezone
-                ),
-            )
-        with gr.Tab("キュー"):
-            (
-                queue_refresh,
-                queue_status,
-                queue_batch_filter,
-                queue_jobs,
-                queue_detail,
-                queue_cancel,
-                queue_retry,
-                queue_retry_batch,
-                queue_message,
-                queue_ambiguous_prompt_id,
-                queue_ambiguous_link,
-                queue_ambiguous_fail,
-            ) = build_queue_tab()
-        with gr.Tab("LoRA管理"):
-            lora_management = build_lora_management_tab(catalog_service)
-        with gr.Tab("履歴"):
-            history = build_history_tab()
-        with gr.Tab("アップスケール"):
-            upscale = build_upscale_tab(upscale_catalog)
-        with gr.Tab("プリセット"):
-            presets = build_preset_tab()
-        with gr.Tab("外部metadata"):
-            metadata_import = build_metadata_import_tab(app_settings.max_loras)
-        with gr.Tab("同期・設定"):
-            drive_sync = build_drive_sync_tab()
-        with gr.Tab("モデル準備"):
-            model_preparation = build_model_preparation_tab(app_settings.max_loras)
+    with gr.Blocks(title=APP_TITLE, theme=modern_dark_theme(), css=APP_CSS) as demo:
+        gr.Markdown("## Image Studio", elem_classes=["studio-header"])
+        with gr.Tabs(elem_classes=["top-level-tabs"]):
+            with gr.Tab("生成"):
+                generation = build_generation_tab(
+                    app_settings.max_loras,
+                    custom_size_choices=initial_custom_size_choices,
+                )
+            with gr.Tab("履歴"):
+                history = build_history_tab()
+            with gr.Tab("LoRA"):
+                lora_management = build_lora_management_tab(catalog_service)
+            with gr.Tab("設定"), gr.Tabs(elem_classes=["settings-tabs"]):
+                with gr.Tab("システム"):
+                    system = build_system_tab(
+                        app_settings.comfyui_base_url,
+                        initial_status_markdown(),
+                        initial_state_sync_markdown=state_sync_markdown(
+                            state_sync_service.get_status(), app_settings.timezone
+                        ),
+                    )
+                with gr.Tab("キュー"):
+                    (
+                        queue_refresh,
+                        queue_status,
+                        queue_batch_filter,
+                        queue_jobs,
+                        queue_detail,
+                        queue_cancel,
+                        queue_retry,
+                        queue_retry_batch,
+                        queue_message,
+                        queue_ambiguous_prompt_id,
+                        queue_ambiguous_link,
+                        queue_ambiguous_fail,
+                    ) = build_queue_tab()
+                with gr.Tab("アップスケール"):
+                    upscale = build_upscale_tab(upscale_catalog)
+                with gr.Tab("プリセット"):
+                    presets = build_preset_tab()
+                with gr.Tab("外部metadata"):
+                    metadata_import = build_metadata_import_tab(app_settings.max_loras)
+                with gr.Tab("同期"):
+                    drive_sync = build_drive_sync_tab()
+                with gr.Tab("モデル準備"):
+                    model_preparation = build_model_preparation_tab(app_settings.max_loras)
 
         capability_inputs = [
             generation.checkpoint,
@@ -719,6 +727,7 @@ def build_app(
             generation.lora_editor.state,
             generation.lora_editor.choices,
             generation.lora_category_filter,
+            generation.final_upscale,
         ]
         capability_outputs = capability_refresh_outputs(generation)
 
@@ -795,6 +804,7 @@ def build_app(
             generation.result_seed,
             generation.result_favorite,
             generation.result_message,
+            generation.status_surface,
         ]
         mobile_status_poll_outputs = mobile_status_outputs[1:]
         generation.status_poll_timer.tick(
@@ -825,6 +835,7 @@ def build_app(
                 generation.lora_editor.state,
                 generation.lora_editor.choices,
                 generation.lora_category_filter,
+                generation.final_upscale,
             ],
             outputs=[system.capability_message, *capability_outputs],
             concurrency_limit=1,
@@ -1173,6 +1184,12 @@ def build_app(
                 outputs=[generation.final_upscale_message],
                 queue=False,
             )
+        generation.final_upscale.change(
+            fn=final_upscaler_visibility,
+            inputs=[generation.final_upscale],
+            outputs=[generation.upscaler],
+            queue=False,
+        )
         generation.positive_paste_button.click(
             fn=None,
             inputs=[generation.positive_prompt],
@@ -1352,9 +1369,10 @@ def build_app(
             generation.workflow_template_version,
         ]
         interactive_disable_event = generation.generate_button.click(
-            fn=disable_generate_button,
-            outputs=[generation.generate_button],
+            fn=disable_generate_button_and_clear_gallery_selection,
+            outputs=[generation.generate_button, generation.interactive_selected_image_index],
             queue=False,
+            api_name="disable_generate_button",
         )
         interactive_date_event = interactive_disable_event.then(
             fn=lambda value: value,
@@ -1382,6 +1400,7 @@ def build_app(
                 generation.interactive_run_id,
                 generation.interactive_status,
                 generation.interactive_result_gallery,
+                generation.interactive_restore_button,
                 generation.batch_message,
             ],
             concurrency_limit=1,
@@ -1413,6 +1432,7 @@ def build_app(
                 generation.interactive_run_id,
                 generation.interactive_status,
                 generation.interactive_result_gallery,
+                generation.interactive_restore_button,
                 generation.batch_message,
             ],
             concurrency_limit=1,
@@ -1426,11 +1446,15 @@ def build_app(
         )
         restore_interactive_event = demo.load(
             fn=make_interactive_refresh_handler(interactive_generation_service),
-            inputs=[generation.interactive_run_id],
+            inputs=[
+                generation.interactive_run_id,
+                generation.interactive_selected_image_index,
+            ],
             outputs=[
                 generation.interactive_run_id,
                 generation.interactive_status,
                 generation.interactive_result_gallery,
+                generation.interactive_restore_button,
                 generation.batch_message,
             ],
             concurrency_limit=1,
@@ -1452,11 +1476,15 @@ def build_app(
         )
         interactive_poll_event = generation.interactive_poll_timer.tick(
             fn=make_interactive_refresh_handler(interactive_generation_service),
-            inputs=[generation.interactive_run_id],
+            inputs=[
+                generation.interactive_run_id,
+                generation.interactive_selected_image_index,
+            ],
             outputs=[
                 generation.interactive_run_id,
                 generation.interactive_status,
                 generation.interactive_result_gallery,
+                generation.interactive_restore_button,
                 generation.batch_message,
             ],
             concurrency_limit=1,
@@ -1478,7 +1506,10 @@ def build_app(
         )
         generation.interactive_result_gallery.select(
             fn=make_interactive_gallery_select_handler(),
-            outputs=[generation.interactive_selected_image_index],
+            outputs=[
+                generation.interactive_selected_image_index,
+                generation.interactive_restore_button,
+            ],
             queue=False,
         )
         queue_refresh.click(
@@ -2065,6 +2096,12 @@ def build_app(
                 *component_outputs(generation.lora_editor),
                 generation.lora_editor.add_button,
             ],
+        )
+        generation.lora_editor.state.change(
+            fn=lambda state: selected_lora_summary_markdown(state, app_settings.max_loras),
+            inputs=[generation.lora_editor.state],
+            outputs=[generation.lora_summary],
+            queue=False,
         )
 
         search_inputs = [

@@ -708,3 +708,27 @@ Phase Bで追加したUI・Repository・Alembic・Fake/SQLiteテストは、実G
 複数Interactive run、複数worker、queue reorder、workflow editor、自動retryは引き続き
 対象外です。実環境での生成、ブラウザClipboard権限、実ComfyUIとの再読込復旧は手動確認
 として残ります。
+
+## Phase C: ユーザー中心のモダンダーク生成画面
+
+Phase Cは、既存のPhase A / Bの生成・Queue・履歴機能を維持したUI再構成です。
+生成タブの初期表示をモデル、LoRA要約、Positive / Negative prompt、サイズ、1回の枚数、
+回数、Hires.fix、4x upscale、生成ボタンに絞り、Seed、Steps、CFG、Sampler、Scheduler、
+VAE、Hires詳細、バッチseed戦略、最近使った設定、LoRA編集は閉じたAccordionへ移します。
+upscalerは4x upscale選択時だけ表示し、Customサイズ時だけ幅・高さ編集を表示します。
+
+トップレベルは「生成」「履歴」「LoRA」「設定」の4タブとし、既存のシステム、キュー、
+アップスケール、プリセット、外部metadata、同期、モデル準備は「設定」内へネストします。
+初期状態では結果Gallery、選択画像の設定復元、キャンセル操作を隠し、完了結果やactive runが
+ある場合だけ表示します。状態表示は利用者向けの短い日本語へ投影し、Generation ID、Queue
+position、worker、prompt IDなどの運用識別子を通常表示から除外します。
+
+`ui/theme.py` と `ui/mobile_styles.py` で常時ダークのsurface / text / accent token、
+focus outline、responsive 2カラム / 1カラム、52px sticky Generate、safe-area paddingを
+定義します。320、375、390、430、768、1280pxのPlaywright viewport testでは、主要操作の
+可視性、設定内タブ、横overflow、初期のprogressive disclosure、dark computed styleを
+確認します。DB schema、Alembic migration、Generation / Queue / Driveのサービス意味、
+workflow templateは変更しません。
+
+Phase Cのbrowser testは`IMAGE_STUDIO_BROWSER_URL`で起動済みGradio URLを指定した場合に
+実行します。実GPU、実ComfyUI、実RunPod、実Google Driveを使う手動確認は引き続き残ります。

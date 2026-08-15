@@ -32,24 +32,51 @@ class GenerationStatusCardView:
 
 
 def generation_status_card_markdown(view: GenerationStatusCardView) -> str:
-    """Render a short status card without exposing prompt text or local paths."""
+    """Render a user-facing status without exposing operational identifiers."""
 
-    generation_id = _short_generation_id(view.generation_id)
-    queue_position = str(view.queue_position) if view.queue_position is not None else "-"
-    progress = f"{view.progress_percentage:.0f}%" if view.progress_percentage is not None else "-"
-    current_step = html.escape((view.current_step or "-")[:120])
-    message = html.escape((view.message or "-")[:500])
-    return "\n".join(
-        (
-            "### 生成ステータス",
-            f"**状態:** `{html.escape(view.status)}`",
-            f"**Generation ID:** `{html.escape(generation_id)}`",
-            f"**Queue position:** `{queue_position}`",
-            f"**進捗:** `{progress}`",
-            f"**現在処理:** `{current_step}`",
-            f"**メッセージ:** {message}",
-        )
-    )
+    status = view.status.strip().lower()
+    if status == "idle":
+        return "### 生成待機中"
+    if status in {"pending", "queued"}:
+        return "### 生成待機中"
+    if status == "running":
+        if view.progress_percentage is not None:
+            percentage = min(100.0, max(0.0, view.progress_percentage))
+            return f"### 生成中 · {percentage:.0f}%"
+        return "### 生成中"
+    if status == "completed":
+        return "### 完了"
+    if status == "cancelled":
+        return "### キャンセルしました"
+    if status == "failed":
+        return "### 生成に失敗しました\n再度お試しください。"
+    return "### 状態を確認中"
+
+
+def selected_lora_summary_markdown(state: object, max_loras: int) -> str:
+    """Render a compact selected-LoRA summary for the primary generation surface."""
+
+    if max_loras <= 0 or not isinstance(state, (list, tuple)):
+        return "**LoRA**\nLoRA なし"
+    labels: list[str] = []
+    for row in state[:max_loras]:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("lora_name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        strength = row.get("model_strength", 1.0)
+        try:
+            strength_text = f"{float(strength):.1f}"
+        except (TypeError, ValueError):
+            strength_text = "1.0"
+        labels.append(f"{html.escape(name.strip())} {strength_text}")
+    if not labels:
+        return "**LoRA**\nLoRA なし"
+    visible = " ".join(f"`{label}`" for label in labels[:2])
+    if len(labels) > 2:
+        visible += f" `+{len(labels) - 2}`"
+    return f"**LoRA**\n{visible}"
 
 
 def _short_generation_id(value: str | None) -> str:

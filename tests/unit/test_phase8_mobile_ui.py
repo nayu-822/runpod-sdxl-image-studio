@@ -40,9 +40,16 @@ from runpod_sdxl_image_studio.ui.tabs.history_tab import render_history_thumbnai
 from runpod_sdxl_image_studio.ui.tabs.preset_tab import make_recent_lora_add_handler
 from runpod_sdxl_image_studio.ui.tabs.system_tab import (
     build_generation_tab,
+    final_upscaler_visibility,
     make_batch_enqueue_handler,
     make_enqueue_handler,
+    make_interactive_gallery_select_handler,
     make_interactive_start_handler,
+)
+from runpod_sdxl_image_studio.ui.view_models import (
+    GenerationStatusCardView,
+    generation_status_card_markdown,
+    selected_lora_summary_markdown,
 )
 
 
@@ -216,9 +223,92 @@ def test_generation_tab_exposes_mobile_status_and_prompt_controls() -> None:
     assert generation.status_poll_timer.value == 5
     assert generation.generate_button.elem_classes == ["mobile-tap-button"]
     assert generation.final_upscale_message.value == ""
+    assert generation.checkpoint.label == "モデル"
+    assert generation.positive_prompt.label == "Positive"
+    assert generation.negative_prompt.label == "Negative"
+    assert generation.batch_size.label == "1回の枚数"
+    assert generation.batch_count.label == "回数"
+    assert generation.width.visible is False
+    assert generation.height.visible is False
+    assert generation.upscaler.visible is False
+    assert generation.interactive_cancel_button.visible is False
+    assert generation.interactive_result_gallery.visible is False
+    assert generation.interactive_restore_button.visible is False
+    assert generation.status_surface.visible is False
     assert ".interactive-result-gallery" in MOBILE_UI_CSS
     assert generation.lora_editor.rows[0].container.elem_classes == ["lora-card-row"]
     assert generation.lora_editor.rows[0].name.label == "LoRA名"
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    (
+        ("idle", "生成待機中"),
+        ("queued", "生成待機中"),
+        ("running", "生成中"),
+        ("completed", "完了"),
+        ("failed", "生成に失敗しました"),
+        ("cancelled", "キャンセルしました"),
+    ),
+)
+def test_generation_status_projection_hides_internal_identifiers(
+    status: str,
+    expected: str,
+) -> None:
+    generation_id = str(uuid4())
+    rendered = generation_status_card_markdown(
+        GenerationStatusCardView(
+            generation_id,
+            status,
+            3,
+            50.0 if status == "running" else None,
+            "KSampler",
+            "internal detail",
+        )
+    )
+
+    assert expected in rendered
+    assert generation_id not in rendered
+    assert "Generation ID" not in rendered
+    assert "Queue position" not in rendered
+    assert "KSampler" not in rendered
+
+
+def test_selected_lora_summary_is_compact_and_bounded() -> None:
+    rendered = selected_lora_summary_markdown(
+        [
+            {"lora_name": "one.safetensors", "model_strength": 0.8},
+            {"lora_name": "two.safetensors", "model_strength": 1.0},
+            {"lora_name": "three.safetensors", "model_strength": 0.5},
+        ],
+        8,
+    )
+
+    assert "one.safetensors 0.8" in rendered
+    assert "two.safetensors 1.0" in rendered
+    assert "+1" in rendered
+    assert "three.safetensors" not in rendered
+    assert selected_lora_summary_markdown([], 8) == "**LoRA**\nLoRA なし"
+
+
+def test_final_upscaler_visibility_follows_the_final_upscale_toggle() -> None:
+    hidden = final_upscaler_visibility(False)
+    shown = final_upscaler_visibility(True)
+
+    assert hidden.visible is False
+    assert shown.visible is True
+
+
+def test_gallery_restore_button_is_revealed_only_after_selection() -> None:
+    handler = make_interactive_gallery_select_handler()
+
+    no_selection, hidden_button = handler(None)
+    selected, shown_button = handler(SimpleNamespace(index=1))
+
+    assert no_selection is None
+    assert hidden_button.visible is False
+    assert selected == 1
+    assert shown_button.visible is True
 
 
 def test_interactive_final_upscale_without_model_does_not_create_a_run() -> None:
@@ -267,7 +357,7 @@ def test_interactive_final_upscale_without_model_does_not_create_a_run() -> None
 
     assert service.start_calls == 0
     assert result[0] is None
-    assert "アップスケーラーを選択" in result[3]
+    assert "アップスケーラーを選択" in result[4]
 
 
 def test_lora_editor_uses_fixed_state_rows_and_mobile_card_actions() -> None:
@@ -297,10 +387,10 @@ def test_mobile_status_handler_uses_bounded_queue_lookup_and_completed_detail() 
 
     result = handler(None, "old card", "old.png", "old details", "1", False)
 
-    assert len(result) == 7
+    assert len(result) == 8
     assert queue.list_limit is None
     assert result[0] == str(generation_id)
-    assert "completed" in result[1]
+    assert "完了" in result[1]
     assert result[2] == str(history.image_path)
     assert "123" in result[3]
     assert result[4] == "123"
@@ -315,7 +405,7 @@ def test_mobile_status_handler_preserves_last_state_on_queue_failure() -> None:
 
     result = handler(None, "### old status", "old.png", "old details", "123", True)
 
-    assert len(result) == 7
+    assert len(result) == 8
     assert isinstance(result[0], dict)
     assert "old status" in result[1]
     assert "最新状態を取得できませんでした" in result[1]
@@ -339,11 +429,13 @@ def test_mobile_status_handler_reports_running_progress_without_exposing_prompt(
 
     result = handler(None, None, None, None, None, False)
 
-    assert len(result) == 7
+    assert len(result) == 8
     assert result[0] == str(generation_id)
     assert "50%" in result[1]
-    assert "KSampler" in result[1]
+    assert "生成中" in result[1]
     assert "prompt" not in result[1].lower()
+    assert "KSampler" not in result[1]
+    assert str(generation_id) not in result[1]
     assert history.detail_calls == 0
 
 
@@ -356,8 +448,9 @@ def test_mobile_status_poll_does_not_overwrite_active_generation_id() -> None:
 
     result = handler(str(generation_id), "old card", None, "", "", False)
 
-    assert len(result) == 6
-    assert "running" in result[0]
+    assert len(result) == 7
+    assert "生成中" in result[0]
+    assert str(generation_id) not in result[0]
     assert history.detail_calls == 0
 
 
@@ -371,17 +464,17 @@ def test_mobile_status_poll_without_active_generation_stays_idle_without_latest_
 
     result = handler(None, None, None, None, None, False)
 
-    assert len(result) == 6
+    assert len(result) == 7
     assert queue.latest_candidate_calls == 0
     assert queue.detail_calls == 0
     assert str(generation_id) not in result[0]
-    assert "idle" in result[0]
     assert "生成待機中" in result[0]
     assert result[1] is None
     assert result[2] == ""
     assert result[3] == ""
     assert result[4] is False
     assert result[5] == ""
+    assert result[6].visible is False
     assert history.detail_calls == 0
 
     preserved = handler(None, "old card", "old.png", "old details", "123", True)
@@ -390,6 +483,7 @@ def test_mobile_status_poll_without_active_generation_stays_idle_without_latest_
     assert preserved[0] == "old card"
     assert all(isinstance(preserved[index], dict) for index in (1, 2, 3, 4))
     assert preserved[5] == ""
+    assert preserved[6].visible is True
 
 
 def test_mobile_status_reload_uses_latest_candidate_only_for_full_refresh() -> None:
@@ -404,7 +498,8 @@ def test_mobile_status_reload_uses_latest_candidate_only_for_full_refresh() -> N
     assert queue.latest_candidate_calls == 1
     assert queue.detail_calls == 0
     assert result[0] == str(generation_id)
-    assert "running" in result[1]
+    assert "生成中" in result[1]
+    assert str(generation_id) not in result[1]
 
 
 def test_mobile_status_poll_keeps_active_generation_when_newer_generation_exists() -> None:
@@ -422,8 +517,9 @@ def test_mobile_status_poll_keeps_active_generation_when_newer_generation_exists
 
     assert queue.latest_candidate_calls == 0
     assert queue.detail_calls == 1
-    assert str(active_id)[:12] in result[0]
-    assert str(newer_id)[:12] not in result[0]
+    assert "生成中" in result[0]
+    assert str(active_id) not in result[0]
+    assert str(newer_id) not in result[0]
 
 
 def test_batch_enqueue_and_timer_poll_keep_active_generation_state() -> None:
@@ -471,7 +567,8 @@ def test_batch_enqueue_and_timer_poll_keep_active_generation_state() -> None:
 
     assert queue.latest_candidate_calls == 0
     assert fresh_result[0] != str(newer_id)
-    assert str(active_id)[:12] in active_result[0]
+    assert "生成中" in active_result[0]
+    assert str(active_id) not in active_result[0]
     assert str(newer_id)[:12] not in active_result[0]
 
 

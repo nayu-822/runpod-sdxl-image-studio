@@ -747,3 +747,27 @@ IMAGE_STUDIO_BROWSER_URL=http://127.0.0.1:7860 pytest -q tests/browser/test_phas
 実ComfyUI・実GPU・実RunPod・実Google Driveを使う手動生成は未実施です。新しいHistory UI、
 全過去画像のGallery、複数Interactive run、複数worker、queue reorder、workflow editor、
 自動retryはPhase Bの対象外です。
+
+## Phase C: ユーザー中心のモダンダーク生成画面
+
+Phase Cでは、既存のGeneration / Queue / History / Driveの処理を変更せず、生成タブを
+画像作成に集中したユーザー向けの初期画面へ再構成しました。最初に表示するのはモデル、
+選択中LoRAの要約、Positive / Negative prompt、サイズ、1回の枚数、回数、Hires.fix、
+4x upscale、生成ボタンです。Seed、Steps、CFG、Sampler、Scheduler、VAE、Hires詳細、
+バッチのseed戦略などは「詳細設定」または「バッチ生成」へ段階的に格納し、最近使った設定と
+LoRA編集も初期状態では閉じています。
+
+トップナビゲーションは「生成」「履歴」「LoRA」「設定」の4項目に整理し、システム、キュー、
+アップスケール、プリセット、外部metadata、同期、モデル準備は設定内のネストしたタブから
+開きます。生成前は結果Galleryと設定復元を非表示にし、結果が利用可能な場合だけ表示します。
+生成状態は「生成中」「キャンセル中…」「完了」「生成に失敗しました」などの利用者向け表現へ
+変換し、Generation ID、Queue position、worker、prompt IDなどの運用情報は通常画面へ出しません。
+
+配色は常時ダークテーマとし、`#0B0D12` の背景、`#12151C` / `#181C24` のsurface、
+`#F5F7FB` / `#9AA4B2` の文字、`#7C5CFF` のaccentをCSS tokenとして定義しています。
+デスクトップはGalleryを広くした2カラム、639px以下は1カラムへ切り替え、生成ボタンは
+52px以上のsticky actionとsafe-area paddingを持ちます。320 / 375 / 390 / 430 / 768 /
+1280pxのviewport、初期表示、dark computed style、横overflowをbrowser testで確認できます。
+
+本PhaseではDB schema、Alembic migration、Generation Service、Queue worker、保存先、
+再送信防止の意味を変更していません。browser確認には起動済みGradio URLが必要です。

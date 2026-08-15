@@ -769,7 +769,10 @@ def _apply_outputs(
         settings.cfg_scale,
         gr.Dropdown(value=settings.sampler_name),
         gr.Dropdown(value=settings.scheduler_name),
-        gr.Dropdown(value=settings.final_upscale_model),
+        gr.Dropdown(
+            value=settings.final_upscale_model,
+            visible=settings.final_upscale,
+        ),
         settings.clip_skip,
         settings.hires_fix,
         settings.hires_scale,

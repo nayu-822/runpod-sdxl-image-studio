@@ -4,7 +4,7 @@ from runpod_sdxl_image_studio.config import Settings
 from runpod_sdxl_image_studio.ui.app_builder import build_app
 
 
-def test_phase8_generation_surface_is_mobile_ready_and_status_poll_is_wired() -> None:
+def test_phase_c_generation_surface_is_mobile_ready_and_status_poll_is_wired() -> None:
     demo = build_app(Settings(_env_file=None, environment="phase8-ui-test"))
     components = demo.config["components"]
 
@@ -25,6 +25,12 @@ def test_phase8_generation_surface_is_mobile_ready_and_status_poll_is_wired() ->
 
     assert len(generate_buttons) == 1
     assert timers and timers[0]["props"].get("value") == 5
+    tab_labels = {
+        component["props"].get("label")
+        for component in components
+        if component["type"] == "tabitem"
+    }
+    assert {"生成", "履歴", "LoRA", "設定"}.issubset(tab_labels)
     assert {"生成", "キャンセル", "同条件で再生成", "設定を編集", "アップスケール"}.issubset(
         action_labels
     )
@@ -41,19 +47,29 @@ def test_phase8_generation_surface_is_mobile_ready_and_status_poll_is_wired() ->
     }
     assert any(
         component["type"] == "button"
-        and component["props"].get("value") == "選択画像の設定を読み込む"
-        and component["props"].get("visible") is not False
+        and component["props"].get("value") == "設定を読み込む"
+        and component["props"].get("visible") is False
         for component in components
     )
-    assert any(
-        component["type"] == "markdown"
-        and component["props"].get("value") == "対話的生成: 待機中"
-        and component["props"].get("visible") is not False
+    assert not any(
+        component["type"] == "markdown" and component["props"].get("value") == "対話的生成: 待機中"
         for component in components
     )
     assert any(
         component["type"] == "gallery"
-        and component["props"].get("label") == "今回の生成結果"
+        and component["props"].get("label") == "生成結果"
+        and component["props"].get("visible") is False
+        for component in components
+    )
+    assert any(
+        component["type"] == "group"
+        and "generation-status-surface" in component["props"].get("elem_classes", [])
+        and component["props"].get("visible") is False
+        for component in components
+    )
+    assert any(
+        component["type"] == "markdown"
+        and component["props"].get("value") == "**LoRA**\nLoRA なし"
         and component["props"].get("visible") is not False
         for component in components
     )
@@ -96,7 +112,7 @@ def test_phase8_generation_surface_is_mobile_ready_and_status_poll_is_wired() ->
         if (timer_id, "tick") in dependency["targets"]
     ]
     assert len(timer_dependencies) == 1
-    assert len(timer_dependencies[0]["outputs"]) == 6
+    assert len(timer_dependencies[0]["outputs"]) == 7
 
     result_regenerate_id = next(
         component["id"]
@@ -141,7 +157,7 @@ def test_phase8_generation_surface_is_mobile_ready_and_status_poll_is_wired() ->
     assert action_input_sets[0] & action_input_sets[1]
 
 
-def test_phase8_batch_enqueue_does_not_mutate_active_generation_state() -> None:
+def test_phase_c_batch_enqueue_does_not_mutate_active_generation_state() -> None:
     demo = build_app(Settings(_env_file=None, environment="phase8-ui-test"))
     components = demo.config["components"]
     dependencies = demo.config["dependencies"]
@@ -181,5 +197,5 @@ def test_phase8_batch_enqueue_does_not_mutate_active_generation_state() -> None:
 
     assert len(batch_dependency["outputs"]) == 3
     assert active_state_id not in batch_dependency["outputs"]
-    assert len(poll_dependency["outputs"]) == 6
+    assert len(poll_dependency["outputs"]) == 7
     assert active_state_id not in poll_dependency["outputs"]

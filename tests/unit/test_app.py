@@ -76,7 +76,7 @@ def test_startup_restore_event_wires_all_hires_form_outputs() -> None:
         component_id("Hires sampler"),
         component_id("Hires scheduler"),
         component_id("Hires denoise"),
-        component_id("Final 4x upscale"),
+        component_id("4x upscale"),
     ]
 
     assert dependency["outputs"][-(len(hires_output_ids) + 2) : -2] == hires_output_ids

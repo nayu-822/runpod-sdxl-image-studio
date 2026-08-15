@@ -68,6 +68,7 @@ from runpod_sdxl_image_studio.ui.view_models import (
     lora_markdown,
     preflight_markdown,
     preserve_selection,
+    selected_lora_summary_markdown,
     state_sync_markdown,
     status_markdown,
     system_error_history_markdown,
@@ -113,6 +114,7 @@ class GenerationTabComponents:
     scheduler: gr.Dropdown
     upscaler: gr.Dropdown
     lora_list: gr.Markdown
+    lora_summary: gr.Markdown
     lora_editor: LoraEditorComponents
     lora_category_filter: gr.Dropdown
     positive_prompt: gr.Textbox
@@ -184,6 +186,7 @@ class GenerationTabComponents:
     recent_lora_presets: gr.Dropdown
     recent_preset_apply: gr.Button
     recent_message: gr.Markdown
+    status_surface: gr.Group
     status_card: gr.Markdown
     active_generation_id: gr.State
     status_poll_timer: gr.Timer
@@ -366,9 +369,9 @@ def build_generation_tab(
     max_loras: int = 8,
     custom_size_choices: Sequence[tuple[str, str]] = (),
 ) -> GenerationTabComponents:
-    """Build a mobile-friendly fixed-workflow SDXL generation form."""
+    """Build the image-first, progressive-disclosure SDXL generation form."""
 
-    gr.Markdown("## 画像生成")
+    gr.Markdown("## 画像を作る")
     checkpoint_choices = gr.State(None)
     vae_choices = gr.State(None)
     sampler_choices = gr.State(None)
@@ -376,65 +379,59 @@ def build_generation_tab(
     upscaler_choices = gr.State(None)
     with gr.Row(elem_classes=["generation-layout"]):
         with gr.Column(elem_classes=["generation-primary"]):
-            with gr.Accordion("最近使った項目", open=True, elem_classes=["recent-settings"]):
-                recent_refresh = gr.Button(
-                    "生成の最近項目を更新", elem_classes=["mobile-tap-button"]
-                )
-                recent_checkpoints = gr.Dropdown([], label="最近のcheckpoint")
+            with gr.Accordion("最近使った設定", open=False, elem_classes=["recent-settings"]):
+                recent_refresh = gr.Button("最近の設定を更新", elem_classes=["mobile-tap-button"])
+                recent_checkpoints = gr.Dropdown([], label="最近のモデル")
                 recent_checkpoint_apply = gr.Button(
-                    "checkpointを反映", elem_classes=["mobile-tap-button"]
+                    "モデルを反映", elem_classes=["mobile-tap-button"]
                 )
                 recent_vaes = gr.Dropdown([], label="最近のVAE")
                 recent_vae_apply = gr.Button("VAEを反映", elem_classes=["mobile-tap-button"])
                 recent_loras = gr.Dropdown([], label="最近のLoRA")
-                recent_lora_add = gr.Button("最近のLoRAを追加", elem_classes=["mobile-tap-button"])
+                recent_lora_add = gr.Button("LoRAを追加", elem_classes=["mobile-tap-button"])
                 recent_generation_presets = gr.Dropdown([], label="最近のPreset")
-                recent_preset_apply = gr.Button(
-                    "最近のPresetを適用", elem_classes=["mobile-tap-button"]
-                )
+                recent_preset_apply = gr.Button("Presetを適用", elem_classes=["mobile-tap-button"])
                 recent_prompt_presets = gr.Dropdown([], visible=False)
                 recent_lora_presets = gr.Dropdown([], visible=False)
                 recent_message = gr.Markdown("")
 
-            checkpoint = gr.Dropdown([], label="checkpoint", interactive=False)
+            checkpoint = gr.Dropdown([], label="モデル", interactive=False)
+            lora_summary = gr.Markdown(
+                selected_lora_summary_markdown([], max_loras),
+                elem_classes=["lora-summary"],
+            )
             with gr.Column(elem_classes=["prompt-editor"]):
+                gr.Markdown("### Prompt")
                 positive_prompt = gr.Textbox(
-                    label="Positive prompt",
+                    label="Positive",
                     lines=6,
                     max_lines=16,
                     elem_classes=["prompt-editor"],
                 )
                 with gr.Row(elem_classes=["prompt-actions"]):
                     positive_paste_button = gr.Button(
-                        "Positiveへ貼り付け", elem_classes=["mobile-tap-button"]
+                        "貼り付け", elem_classes=["mobile-tap-button"]
                     )
-                    positive_copy_button = gr.Button(
-                        "Positiveをコピー", elem_classes=["mobile-tap-button"]
-                    )
-                    positive_clear_button = gr.Button(
-                        "Positive promptをクリア", elem_classes=["mobile-tap-button"]
-                    )
+                    positive_copy_button = gr.Button("コピー", elem_classes=["mobile-tap-button"])
+                    positive_clear_button = gr.Button("クリア", elem_classes=["mobile-tap-button"])
                 positive_clipboard_message = gr.Markdown("")
                 negative_prompt = gr.Textbox(
-                    label="Negative prompt",
+                    label="Negative",
                     lines=4,
                     max_lines=12,
                     elem_classes=["prompt-editor", "negative"],
                 )
                 with gr.Row(elem_classes=["prompt-actions"]):
                     negative_paste_button = gr.Button(
-                        "Negativeへ貼り付け", elem_classes=["mobile-tap-button"]
+                        "貼り付け", elem_classes=["mobile-tap-button"]
                     )
-                    negative_copy_button = gr.Button(
-                        "Negativeをコピー", elem_classes=["mobile-tap-button"]
-                    )
-                    negative_clear_button = gr.Button(
-                        "Negative promptをクリア", elem_classes=["mobile-tap-button"]
-                    )
+                    negative_copy_button = gr.Button("コピー", elem_classes=["mobile-tap-button"])
+                    negative_clear_button = gr.Button("クリア", elem_classes=["mobile-tap-button"])
                 negative_clipboard_message = gr.Markdown("")
-            lora_list = gr.Markdown("**LoRA一覧:** 未取得")
-            lora_editor = build_lora_editor(max_loras)
-            lora_category_filter = gr.Dropdown([], label="LoRAカテゴリ", interactive=False)
+            lora_list = gr.Markdown("**LoRA一覧:** 未取得", visible=False)
+            with gr.Accordion("LoRAを編集", open=False, elem_classes=["lora-editor-section"]):
+                lora_editor = build_lora_editor(max_loras)
+                lora_category_filter = gr.Dropdown([], label="LoRAカテゴリ", interactive=False)
             size_preset = gr.Dropdown(
                 [
                     "1024 × 1024",
@@ -446,22 +443,37 @@ def build_generation_tab(
                     "Custom",
                 ],
                 value="1024 × 1024",
-                label="サイズプリセット",
+                label="サイズ",
             )
             with gr.Row(elem_classes=["size-dimensions"]):
-                width = gr.Number(value=1024, precision=0, label="幅")
-                height = gr.Number(value=1024, precision=0, label="高さ")
+                width = gr.Number(value=1024, precision=0, label="幅", visible=False)
+                height = gr.Number(value=1024, precision=0, label="高さ", visible=False)
             custom_size_delete_button = gr.Button(
-                "保存したCustomサイズを削除",
+                "削除",
                 interactive=False,
+                visible=False,
                 elem_classes=["mobile-tap-button"],
             )
             custom_size_message = gr.Markdown("")
-            with gr.Row(elem_classes=["seed-controls"]):
-                seed_mode = gr.Radio(
-                    ["Random", "Fixed", "Previous seed"], value="Random", label="Seed方式"
+            with gr.Row(elem_classes=["compact-controls"]):
+                batch_size = gr.Number(
+                    value=1,
+                    precision=0,
+                    minimum=1,
+                    maximum=4,
+                    label="1回の枚数",
                 )
-                seed = gr.Number(value=-1, precision=0, label="Seed")
+                batch_count = gr.Number(value=2, precision=0, label="回数")
+            with gr.Row(elem_classes=["compact-controls"]):
+                hires_fix = gr.Checkbox(value=False, label="Hires.fix")
+                final_upscale = gr.Checkbox(value=False, label="4x upscale")
+            upscaler = gr.Dropdown(
+                [],
+                label="アップスケーラー",
+                interactive=False,
+                visible=False,
+            )
+            final_upscale_message = gr.Markdown("", elem_classes=["validation-message"])
             with gr.Column(elem_classes=["generation-sticky-action"]):
                 generate_button = gr.Button(
                     "生成",
@@ -473,6 +485,7 @@ def build_generation_tab(
                 interactive_cancel_button = gr.Button(
                     "キャンセル",
                     interactive=False,
+                    visible=False,
                     elem_classes=["mobile-tap-button"],
                 )
 
@@ -480,18 +493,20 @@ def build_generation_tab(
             status_components = build_generation_status_card()
             startup_restore_timer = gr.Timer(value=1.0, active=True)
             startup_restore_applied = gr.State(False)
-            interactive_status = gr.Markdown("対話的生成: 待機中")
+            interactive_status = gr.Markdown("", visible=False)
             progress = gr.Markdown("")
             batch_message = gr.Markdown("")
             interactive_result_gallery = gr.Gallery(
-                label="今回の生成結果",
+                label="生成結果",
                 columns=2,
                 rows=2,
                 object_fit="contain",
+                visible=False,
                 elem_classes=["interactive-result-gallery"],
             )
             interactive_restore_button = gr.Button(
-                "選択画像の設定を読み込む",
+                "設定を読み込む",
+                visible=False,
                 elem_classes=["mobile-tap-button"],
             )
             # Keep the legacy result components as hidden state targets for old handlers.
@@ -517,12 +532,16 @@ def build_generation_tab(
             result_message = gr.Markdown("", visible=False)
 
     with gr.Accordion("高度な設定", open=False, elem_classes=["generation-advanced"]):
+        with gr.Row(elem_classes=["seed-controls"]):
+            seed_mode = gr.Radio(
+                ["Random", "Fixed", "Previous seed"], value="Random", label="Seed方式"
+            )
+            seed = gr.Number(value=-1, precision=0, label="Seed")
         with gr.Row(elem_classes=["size-dimensions"]):
             steps = gr.Number(value=28, precision=0, label="Steps")
             cfg_scale = gr.Number(value=5.5, label="CFG")
             clip_skip = gr.Number(value=1, precision=0, minimum=1, maximum=12, label="CLIP skip")
         with gr.Row(elem_classes=["size-dimensions"]):
-            hires_fix = gr.Checkbox(value=False, label="Hires.fix")
             hires_scale = gr.Number(value=1.5, minimum=1.0, maximum=4.0, label="Hires倍率")
             hires_resize_method = gr.Dropdown(
                 ["lanczos", "nearest-exact", "bilinear", "bicubic"],
@@ -542,9 +561,6 @@ def build_generation_tab(
                 ["normal"], value="normal", label="Hires scheduler", interactive=False
             )
         with gr.Row(elem_classes=["size-dimensions"]):
-            final_upscale = gr.Checkbox(value=False, label="Final 4x upscale")
-        final_upscale_message = gr.Markdown("", elem_classes=["validation-message"])
-        with gr.Row(elem_classes=["size-dimensions"]):
             sampler = gr.Dropdown([], label="Sampler", interactive=False)
             scheduler = gr.Dropdown([], label="Scheduler", interactive=False)
         with gr.Row(elem_classes=["size-dimensions"]):
@@ -554,11 +570,8 @@ def build_generation_tab(
                 label="VAE",
                 interactive=True,
             )
-            upscaler = gr.Dropdown([], label="アップスケーラー", interactive=False)
 
     with gr.Accordion("バッチ生成", open=False, elem_classes=["generation-batch"]):
-        batch_count = gr.Number(value=2, precision=0, label="Batch count")
-        batch_size = gr.Number(value=1, precision=0, minimum=1, maximum=4, label="Batch size")
         batch_seed_strategy = gr.Radio(
             [("ランダム", "random"), ("連番", "sequential")],
             value="random",
@@ -594,6 +607,7 @@ def build_generation_tab(
         scheduler=scheduler,
         upscaler=upscaler,
         lora_list=lora_list,
+        lora_summary=lora_summary,
         lora_editor=lora_editor,
         lora_category_filter=lora_category_filter,
         positive_prompt=positive_prompt,
@@ -665,6 +679,7 @@ def build_generation_tab(
         recent_prompt_presets=recent_prompt_presets,
         recent_lora_presets=recent_lora_presets,
         recent_message=recent_message,
+        status_surface=status_components.surface,
         status_card=status_components.card,
         active_generation_id=status_components.active_generation_id,
         status_poll_timer=status_components.poll_timer,
@@ -821,6 +836,7 @@ def make_check_connection_handler(
         lora_state: object = None,
         lora_choices: object = None,
         lora_category: str | None = None,
+        final_upscale: bool = False,
     ) -> tuple[object, ...]:
         status = await service.get_status()
         if capabilities_callback is not None:
@@ -835,6 +851,7 @@ def make_check_connection_handler(
             catalog_choices,
             lora_category,
             catalog_categories,
+            final_upscale=bool(final_upscale),
         )
         return (
             status_markdown(status, timezone_name),
@@ -862,6 +879,7 @@ def make_refresh_handler(
         lora_state: object = None,
         lora_choices: object = None,
         lora_category: str | None = None,
+        final_upscale: bool = False,
     ) -> tuple[object, ...]:
         refresh_result = await service.refresh_capabilities()
         if not refresh_result.is_success or refresh_result.capabilities is None:
@@ -878,6 +896,7 @@ def make_refresh_handler(
             _catalog_choices(catalog_service, refresh_result.capabilities),
             lora_category,
             _catalog_categories(catalog_service),
+            final_upscale=bool(final_upscale),
         )
         return (refresh_result.message, *updates)
 
@@ -914,6 +933,7 @@ def make_startup_restore_handler(
         lora_state: object = None,
         lora_choices: object = None,
         lora_category: str | None = None,
+        final_upscale: bool = False,
         startup_restore_applied: bool = False,
     ) -> tuple[object, ...]:
         del checkpoint, vae, sampler, scheduler, upscaler
@@ -976,6 +996,7 @@ def make_startup_restore_handler(
             lora_category,
             _catalog_categories(catalog_service),
             preserve_unavailable=True,
+            final_upscale=bool(snapshot.final_upscale),
         )
         message = status.message
         if status.missing:
@@ -1347,6 +1368,12 @@ def final_upscale_validation_message(final_upscale: bool, upscaler: str | None) 
     return ""
 
 
+def final_upscaler_visibility(final_upscale: bool) -> gr.Dropdown:
+    """Show the upscaler selector only while final upscale is enabled."""
+
+    return gr.Dropdown(visible=bool(final_upscale))
+
+
 def make_batch_enqueue_handler(
     service: GenerationQueueService,
     max_loras: int,
@@ -1582,8 +1609,9 @@ def make_interactive_start_handler(
                 if not preflight.is_ready:
                     return (
                         None,
-                        "対話的生成: 生成前チェックに失敗",
-                        [],
+                        gr.Markdown(value="", visible=False),
+                        gr.Gallery(value=[], visible=False),
+                        gr.Button(value="設定を読み込む", visible=False),
                         preflight_markdown(preflight),
                     )
             view = service.start(
@@ -1603,12 +1631,19 @@ def make_interactive_start_handler(
                 )
             return (
                 None,
-                "対話的生成: 開始できません",
-                [],
+                gr.Markdown(value="", visible=False),
+                gr.Gallery(value=[], visible=False),
+                gr.Button(value="設定を読み込む", visible=False),
                 message,
             )
         except Exception:  # noqa: BLE001 - hide adapter details at the UI boundary
-            return None, "対話的生成: 生成前チェックに失敗", [], "生成を開始できませんでした。"
+            return (
+                None,
+                gr.Markdown(value="", visible=False),
+                gr.Gallery(value=[], visible=False),
+                gr.Button(value="設定を読み込む", visible=False),
+                "生成を開始できませんでした。",
+            )
         if form_state_saver is not None:
             with suppress(Exception):
                 form_state_saver(
@@ -1646,26 +1681,42 @@ def make_interactive_start_handler(
 
 def make_interactive_refresh_handler(
     service: InteractiveGenerationService,
-) -> Callable[[str | None], tuple[object, ...]]:
+) -> Callable[[str | None, object], tuple[object, ...]]:
     """Create a reload/timer handler that restores the active run from SQLite."""
 
-    def handler(run_id: str | None = None) -> tuple[object, ...]:
+    def handler(
+        run_id: str | None = None,
+        selected_index: object = None,
+    ) -> tuple[object, ...]:
         try:
             identifier = UUID(run_id) if run_id else None
             if identifier is not None:
                 if not service.is_current_run(identifier):
                     # A poll queued before a newer start must not overwrite the new run.
-                    return gr.skip(), gr.skip(), gr.skip(), gr.skip()
+                    return gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
                 view = service.refresh(identifier)
             else:
                 view = service.restore()
         except InteractiveGenerationError as exc:
-            return (None, "対話的生成: 状態を復元できません", [], str(exc))
+            del exc
+            return (
+                None,
+                gr.Markdown(value="", visible=True),
+                gr.Gallery(value=[], visible=False),
+                gr.Button(value="設定を読み込む", visible=False),
+                "生成状態を取得できませんでした。",
+            )
         except ValueError:
-            return (None, "対話的生成: 状態を復元できません", [], "run IDが不正です。")
+            return (
+                None,
+                gr.Markdown(value="", visible=True),
+                gr.Gallery(value=[], visible=False),
+                gr.Button(value="設定を読み込む", visible=False),
+                "生成状態を取得できませんでした。",
+            )
         if view is None:
-            return (None, "対話的生成: 待機中", [], "")
-        return _interactive_view_outputs(view)
+            return _interactive_idle_outputs()
+        return _interactive_view_outputs(view, selected_index)
 
     return handler
 
@@ -1680,15 +1731,25 @@ def make_interactive_cancel_handler(
             identifier = UUID(run_id) if run_id else None
             view = await service.cancel(identifier)
         except (ValueError, InteractiveGenerationError) as exc:
-            return (run_id, "対話的生成: キャンセル処理を継続中", [], str(exc))
+            del exc
+            return (
+                run_id,
+                gr.Markdown(value="キャンセル中…", visible=True),
+                gr.Gallery(value=[], visible=False),
+                gr.Button(value="設定を読み込む", visible=False),
+                "キャンセル処理を継続しています。",
+            )
         if view is None:
-            return (None, "対話的生成: 待機中", [], "")
+            return _interactive_idle_outputs()
         return _interactive_view_outputs(view)
 
     return handler
 
 
-def _interactive_view_outputs(view: InteractiveRunView) -> tuple[object, ...]:
+def _interactive_view_outputs(
+    view: InteractiveRunView,
+    selected_index: object = None,
+) -> tuple[object, ...]:
     run = view.run
     status = run.status.value
     completed_count = view.completed_count
@@ -1699,37 +1760,74 @@ def _interactive_view_outputs(view: InteractiveRunView) -> tuple[object, ...]:
         if status in {"active", "cancelling"}
         else completed_count
     )
-    detail = f"Interactive run `{run.id}`: {status}; Batch {current_batch} / {batch_count}"
-    if current_status:
-        detail += f"; current Generation={current_status}"
-    return str(run.id), detail, list(view.result_image_paths), ""
+    del current_status
+    if status == "active":
+        detail = f"生成中 · {current_batch} / {batch_count}"
+    elif status == "cancelling":
+        detail = "キャンセル中…"
+    elif status == "completed":
+        detail = "完了"
+    elif status == "failed":
+        detail = "生成に失敗しました"
+    else:
+        detail = "キャンセルしました"
+    paths = list(view.result_image_paths)
+    selected = (
+        selected_index
+        if isinstance(selected_index, int)
+        and not isinstance(selected_index, bool)
+        and 0 <= selected_index < len(paths)
+        else None
+    )
+    return (
+        str(run.id),
+        gr.Markdown(value=detail, visible=True),
+        gr.Gallery(value=paths, visible=bool(paths)),
+        gr.Button(value="設定を読み込む", visible=selected is not None),
+        "",
+    )
+
+
+def _interactive_idle_outputs() -> tuple[object, ...]:
+    """Return the hidden initial state for the user-facing status surface."""
+
+    return (
+        None,
+        gr.Markdown(value="", visible=False),
+        gr.Gallery(value=[], visible=False),
+        gr.Button(value="設定を読み込む", visible=False),
+        "",
+    )
 
 
 def interactive_action_updates(status: str | None) -> tuple[object, object]:
     """Derive button state from the durable run projection, not browser state."""
 
     value = status or ""
-    if ": cancelling" in value:
+    if ": cancelling" in value or "キャンセル中" in value:
         return gr.Button(value="生成", interactive=False), gr.Button(
-            value="キャンセル中...", interactive=False
+            value="キャンセル中…", interactive=False, visible=True
         )
-    if ": active" in value:
+    if ": active" in value or value.startswith("生成中"):
         return gr.Button(value="生成", interactive=False), gr.Button(
-            value="キャンセル", interactive=True
+            value="キャンセル", interactive=True, visible=True
         )
     return gr.Button(value="生成", interactive=True), gr.Button(
-        value="キャンセル", interactive=False
+        value="キャンセル", interactive=False, visible=False
     )
 
 
-def make_interactive_gallery_select_handler() -> Callable[[object], object]:
-    """Store only the gallery index; the server validates it again on restore."""
+def make_interactive_gallery_select_handler() -> Callable[[object], tuple[object, object]]:
+    """Store the index and reveal restore only after a valid gallery selection."""
 
-    def handler(selection: object = None) -> int | None:
+    def handler(selection: object = None) -> tuple[int | None, gr.Button]:
         index = getattr(selection, "index", selection)
         if isinstance(index, tuple):
             index = index[0] if index else None
-        return index if isinstance(index, int) and index >= 0 else None
+        selected = (
+            index if isinstance(index, int) and not isinstance(index, bool) and index >= 0 else None
+        )
+        return selected, gr.Button(value="設定を読み込む", visible=selected is not None)
 
     return handler
 
@@ -1823,6 +1921,12 @@ def disable_generate_button() -> gr.Button:
     )
 
 
+def disable_generate_button_and_clear_gallery_selection() -> tuple[gr.Button, None]:
+    """Disable Generate and discard a selection from the previous result batch."""
+
+    return disable_generate_button(), None
+
+
 def disable_enqueue_button() -> gr.Button:
     """Disable the queue button while the atomic enqueue request is running."""
 
@@ -1881,16 +1985,28 @@ def make_size_preset_handler(
             try:
                 saved = custom_size_service.resolve(preset)
             except GenerationCustomSizeError as exc:
-                return gr.skip(), gr.skip(), gr.Button(interactive=False), str(exc)
+                return gr.skip(), gr.skip(), gr.Button(interactive=False, visible=False), str(exc)
             if saved is not None:
                 return (
-                    saved.width,
-                    saved.height,
-                    gr.Button(interactive=True),
+                    gr.Number(value=saved.width, visible=True),
+                    gr.Number(value=saved.height, visible=True),
+                    gr.Button(interactive=True, visible=True),
                     f"保存済みサイズ: {saved.width} × {saved.height}",
                 )
+        if preset == "Custom":
+            return (
+                gr.Number(value=1024, visible=True),
+                gr.Number(value=1024, visible=True),
+                gr.Button(interactive=False, visible=False),
+                "幅と高さを入力してください。",
+            )
         width, height = size_preset_values(preset or "")
-        return width, height, gr.Button(interactive=False), ""
+        return (
+            gr.Number(value=width, visible=False),
+            gr.Number(value=height, visible=False),
+            gr.Button(interactive=False, visible=False),
+            "",
+        )
 
     return handler
 
@@ -1902,11 +2018,15 @@ def make_custom_size_delete_handler(
 
     def handler(preset: str | None) -> tuple[object, ...]:
         if not preset or not preset.startswith("custom:"):
-            return gr.skip(), gr.Button(interactive=False), "組み込みサイズは削除できません。"
+            return (
+                gr.skip(),
+                gr.Button(interactive=False, visible=False),
+                "組み込みサイズは削除できません。",
+            )
         try:
             custom_size_service.delete(preset.removeprefix("custom:"))
         except GenerationCustomSizeError as exc:
-            return gr.skip(), gr.Button(interactive=True), str(exc)
+            return gr.skip(), gr.Button(interactive=True, visible=True), str(exc)
         choices = [
             "1024 × 1024",
             "832 × 1216",
@@ -1918,7 +2038,7 @@ def make_custom_size_delete_handler(
         ]
         return (
             gr.Dropdown(choices=choices, value="Custom"),
-            gr.Button(interactive=False),
+            gr.Button(interactive=False, visible=False),
             "保存済みサイズを削除しました。",
         )
 
@@ -1978,6 +2098,7 @@ def _capability_updates(
     category_options: Sequence[str] = (),
     *,
     preserve_unavailable: bool = False,
+    final_upscale: bool = False,
 ) -> tuple[object, ...]:
     if capabilities is None:
         return _empty_updates(generation)
@@ -2034,6 +2155,7 @@ def _capability_updates(
                     ),
                     label=component.label,
                     interactive=bool(display_choices),
+                    visible=(final_upscale if component is generation.upscaler else True),
                 )
             )
     can_generate = bool(
@@ -2102,7 +2224,7 @@ def _empty_updates(generation: GenerationTabComponents) -> tuple[object, ...]:
         gr.Dropdown([], label=generation.scheduler.label, interactive=False),
         gr.Dropdown([], label=generation.hires_sampler.label, interactive=False),
         gr.Dropdown([], label=generation.hires_scheduler.label, interactive=False),
-        gr.Dropdown([], label=generation.upscaler.label, interactive=False),
+        gr.Dropdown([], label=generation.upscaler.label, interactive=False, visible=False),
         None,
         None,
         None,
