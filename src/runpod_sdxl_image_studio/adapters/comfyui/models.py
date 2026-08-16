@@ -89,6 +89,7 @@ class ComfyUICapabilities:
     upscale_models: tuple[str, ...]
     available_node_classes: frozenset[str]
     warnings: tuple[str, ...]
+    detector_models: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

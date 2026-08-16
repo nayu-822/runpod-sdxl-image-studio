@@ -654,7 +654,7 @@ def test_sidecar_model_mapping_is_explicit_and_exact(tmp_path: Path) -> None:
 
     assert mapped.status is MetadataImportStatus.READY
     assert service.build_generation_settings(mapped.id).checkpoint_name == "model.safetensors"
-    assert repository.get_by_id(mapped.id).normalized_snapshot_schema_version == 1
+    assert repository.get_by_id(mapped.id).normalized_snapshot_schema_version == 2
 
 
 def test_model_catalog_none_and_empty_are_distinct(tmp_path: Path) -> None:

@@ -19,9 +19,13 @@ from runpod_sdxl_image_studio.adapters.storage.disk_usage import (
     DiskUsageAdapterProtocol,
 )
 from runpod_sdxl_image_studio.config import Settings
+from runpod_sdxl_image_studio.domain.detailer import (
+    DEFAULT_DETAILER_REGISTRY,
+    DetailerKind,
+)
 from runpod_sdxl_image_studio.domain.generation_settings import (
-    CURRENT_WORKFLOW_TEMPLATE_VERSION,
     LEGACY_WORKFLOW_TEMPLATE_VERSION,
+    PIXEL_HIRES_WORKFLOW_VERSIONS,
     GenerationSettings,
 )
 from runpod_sdxl_image_studio.domain.preflight import (
@@ -316,6 +320,21 @@ class GenerationPreflightService:
                 "Selected upscaler is not available",
                 errors,
             )
+        for detailer in generation_settings.detailers:
+            if not detailer.enabled:
+                continue
+            definition = DEFAULT_DETAILER_REGISTRY.get(detailer.kind)
+            if definition is None:
+                errors.append(_error("detailer_unsupported", "Selected Detailer is not supported"))
+                continue
+            if detailer.kind is DetailerKind.FACE:
+                _require_choice(
+                    detailer.detector_model,
+                    capabilities.detector_models,
+                    "face_detector_missing",
+                    "顔検出モデルが見つかりません",
+                    errors,
+                )
 
     def _check_required_nodes(
         self,
@@ -339,7 +358,7 @@ class GenerationPreflightService:
         if generation_settings is not None and generation_settings.hires_fix:
             if generation_settings.workflow_template_version == LEGACY_WORKFLOW_TEMPLATE_VERSION:
                 required.add("LatentUpscale")
-            elif generation_settings.workflow_template_version == CURRENT_WORKFLOW_TEMPLATE_VERSION:
+            elif generation_settings.workflow_template_version in PIXEL_HIRES_WORKFLOW_VERSIONS:
                 required.update({"ImageScaleBy", "VAEEncode"})
             else:
                 errors.append(
@@ -350,12 +369,32 @@ class GenerationPreflightService:
                 )
         if generation_settings is not None and generation_settings.final_upscale:
             required.update({"UpscaleModelLoader", "ImageUpscaleWithModel"})
+        detailer_required: set[str] = set()
+        if generation_settings is not None:
+            for detailer in generation_settings.detailers:
+                if not detailer.enabled:
+                    continue
+                definition = DEFAULT_DETAILER_REGISTRY.get(detailer.kind)
+                if definition is not None:
+                    detailer_required.update(
+                        {definition.node_class, definition.detector_provider_class}
+                    )
+        required.update(detailer_required)
         missing = sorted(required.difference(capabilities.available_node_classes))
-        if missing:
+        missing_detailer = sorted(set(missing).intersection(detailer_required))
+        if missing_detailer:
+            errors.append(
+                _error(
+                    "face_detailer_nodes_missing",
+                    "顔補正機能を利用できません（必要なComfyUIノードがありません）",
+                )
+            )
+        missing_non_detailer = sorted(set(missing).difference(detailer_required))
+        if missing_non_detailer:
             errors.append(
                 _error(
                     "required_node_missing",
-                    "Required ComfyUI node types are missing: " + ", ".join(missing),
+                    "Required ComfyUI node types are missing: " + ", ".join(missing_non_detailer),
                 )
             )
 

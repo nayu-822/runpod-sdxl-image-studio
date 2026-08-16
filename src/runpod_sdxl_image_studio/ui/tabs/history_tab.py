@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 import gradio as gr
 
+from runpod_sdxl_image_studio.domain.detailer import DetailerKind
 from runpod_sdxl_image_studio.domain.generation import GenerationKind, GenerationStatus
 from runpod_sdxl_image_studio.domain.generation_diff import GenerationDiff, PromptTokenChange
 from runpod_sdxl_image_studio.domain.generation_history import (
@@ -43,6 +44,7 @@ _HistoryEnum = TypeVar("_HistoryEnum", bound=StrEnum)
 _THUMBNAIL_PLACEHOLDER = (
     Path(__file__).resolve().parents[1] / "assets" / "thumbnail_placeholder.svg"
 )
+_FACE_RESTORE_OUTPUT_COUNT = 16
 
 
 @dataclass(frozen=True)
@@ -550,7 +552,8 @@ def make_restore_handler(
         if not selected:
             return (
                 ("履歴を選択してください。",)
-                + (gr.skip(),) * (23 + component_output_count(max_loras))
+                + (gr.skip(),)
+                * (23 + _FACE_RESTORE_OUTPUT_COUNT + component_output_count(max_loras))
                 + (None, False)
             )
         try:
@@ -562,6 +565,10 @@ def make_restore_handler(
                 max_loras=max_loras,
             )
             settings = restored.settings
+            face_detailer = next(
+                (item for item in settings.detailers if item.kind is DetailerKind.FACE),
+                None,
+            )
             lora_state = [
                 {
                     "row_id": f"restored-{index}",
@@ -617,6 +624,22 @@ def make_restore_handler(
                 settings.hires_scheduler_name,
                 settings.hires_denoise,
                 settings.final_upscale,
+                bool(face_detailer and face_detailer.enabled),
+                face_detailer.detector_model if face_detailer else None,
+                face_detailer.positive_prompt if face_detailer else "",
+                face_detailer.negative_prompt if face_detailer else "",
+                face_detailer.denoise if face_detailer else 0.22,
+                face_detailer.steps if face_detailer else 20,
+                face_detailer.cfg_scale if face_detailer else 5.0,
+                face_detailer.sampler_name if face_detailer else "euler_ancestral",
+                face_detailer.scheduler_name if face_detailer else "normal",
+                face_detailer.guide_size if face_detailer else 768,
+                face_detailer.max_size if face_detailer else 1024,
+                face_detailer.bbox_threshold if face_detailer else 0.5,
+                face_detailer.bbox_dilation if face_detailer else 10,
+                face_detailer.bbox_crop_factor if face_detailer else 2.0,
+                face_detailer.feather if face_detailer else 5,
+                gr.Accordion(visible=bool(face_detailer and face_detailer.enabled)),
                 *lora_updates,
                 str(restored.parent_generation_id),
                 not blocking,
@@ -624,7 +647,8 @@ def make_restore_handler(
         except (GenerationHistoryError, ValueError):
             return (
                 ("設定を復元できませんでした。",)
-                + (gr.skip(),) * (23 + component_output_count(max_loras))
+                + (gr.skip(),)
+                * (23 + _FACE_RESTORE_OUTPUT_COUNT + component_output_count(max_loras))
                 + (None, False)
             )
 

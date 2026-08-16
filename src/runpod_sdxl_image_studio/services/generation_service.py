@@ -63,6 +63,7 @@ from runpod_sdxl_image_studio.adapters.storage.imported_image_storage import (
 )
 from runpod_sdxl_image_studio.adapters.storage.local_storage import LocalStorageAdapter
 from runpod_sdxl_image_studio.config import Settings, get_settings
+from runpod_sdxl_image_studio.domain.detailer import DEFAULT_DETAILER_REGISTRY, DetailerKind
 from runpod_sdxl_image_studio.domain.generation import (
     GenerationErrorCode,
     GenerationKind,
@@ -77,9 +78,9 @@ from runpod_sdxl_image_studio.domain.generation_queue import (
     ReconciliationOutcome,
 )
 from runpod_sdxl_image_studio.domain.generation_settings import (
-    CURRENT_WORKFLOW_TEMPLATE_VERSION,
     LEGACY_WORKFLOW_TEMPLATE_VERSION,
     MAX_SEED,
+    PIXEL_HIRES_WORKFLOW_VERSIONS,
     RANDOM_SEED,
     GenerationSettings,
 )
@@ -1581,7 +1582,7 @@ def _validate_generation(
     if settings.hires_fix:
         if settings.workflow_template_version == LEGACY_WORKFLOW_TEMPLATE_VERSION:
             required_hires_nodes = {"LatentUpscale", "VAEDecode"}
-        elif settings.workflow_template_version == CURRENT_WORKFLOW_TEMPLATE_VERSION:
+        elif settings.workflow_template_version in PIXEL_HIRES_WORKFLOW_VERSIONS:
             required_hires_nodes = {"ImageScaleBy", "VAEEncode", "VAEDecode"}
         else:
             raise WorkflowError("Hires.fix workflow version is unsupported")
@@ -1612,6 +1613,23 @@ def _validate_generation(
     if missing_loras:
         logger.warning("Unavailable LoRAs selected: %s", ", ".join(missing_loras))
         raise WorkflowError("One or more selected LoRAs are unavailable")
+    detector_models = getattr(capabilities, "detector_models", ())
+    for detailer in settings.detailers:
+        if not detailer.enabled:
+            continue
+        definition = DEFAULT_DETAILER_REGISTRY.get(detailer.kind)
+        if definition is None:
+            raise WorkflowError("Selected Detailer is unsupported")
+        required_detailer_nodes = {
+            definition.node_class,
+            definition.detector_provider_class,
+        }
+        if not required_detailer_nodes.issubset(node_classes):
+            if detailer.kind is DetailerKind.FACE:
+                raise WorkflowError("FaceDetailer is unavailable in ComfyUI")
+            raise WorkflowError("Selected Detailer is unavailable in ComfyUI")
+        if detailer.kind is DetailerKind.FACE and detailer.detector_model not in detector_models:
+            raise WorkflowError("Selected face detector is unavailable")
     if settings.width > limits.max_width or settings.height > limits.max_height:
         raise WorkflowError("Requested image dimensions exceed the configured limit")
     if settings.width * settings.height > limits.max_pixels:

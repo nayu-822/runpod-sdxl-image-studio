@@ -669,7 +669,7 @@ exclusive createして、generated/upscaledをまたいだ同時実行時の衝�
 通常のサーバー日付保存はgenerated/upscaledを分離します。不正な日付、保存先外の
 パス、同名上書きは受け付けません。Hires.fixは画像スケール、resize method、
 steps、CFG、sampler、scheduler、denoiseをtyped snapshotとsidecarへ含めます。
-新規生成はworkflow version 2.1のpixel-space graphを使い、version 2.0の既存snapshotは
+新規生成はworkflow version 2.2のpixel-space graphを使い、version 2.0の既存snapshotは
 LatentUpscale graphとして再現します。
 Phase AはFake/SQLite/Alembicと
 Playwright viewport testで検証し、実GPU・実ComfyUI・実RunPod・実Driveは引き続き
@@ -705,7 +705,7 @@ reload後も同じ判定になります。`0020_phase_b_custom_generation_sizes`
 にはブラウザ側のClipboard Paste/Copyを用意し、権限エラー時は入力を保持したまま
 安全なメッセージを表示します。Galleryから選択した画像の設定復元では、server側で
 runとArtifactを検証してから、prompt、LoRA、Hires/final upscale、元のbatch size、
-workflow template versionを復元します。新規手入力はworkflow 2.1を既定とし、既存の
+workflow template versionを復元します。新規手入力はworkflow 2.2を既定とし、既存の
 legacy snapshotは2.0のまま扱います。旧snapshotの`final_upscale=true`かつ
 `final_upscale_model=null`は、元JSONを変更せず復元時だけ`4x-UltraSharp.pth`を明示値へ変換し、
 新規GenerationSettingsのモデル必須化は維持します。Final 4x upscaleは明示したupscalerを必須とし、
@@ -749,3 +749,19 @@ workflow templateは変更しません。
 
 Phase Cのbrowser testは`IMAGE_STUDIO_BROWSER_URL`で起動済みGradio URLを指定した場合に
 実行します。実GPU、実ComfyUI、実RunPod、実Google Driveを使う手動確認は引き続き残ります。
+
+## Phase D-B: Detailer共通基盤とFaceDetailer
+
+Detailerを`DetailerKind`、typed `DetailerSettings`、registry、順序付きpipelineとして追加し、
+初期実装はFaceDetailerに限定します。Faceを有効にした場合だけ、repository-controlled workflow
+2.2へ`UltralyticsDetectorProvider`、Face専用conditioning、FaceDetailer stageを安全に挿入します。
+workflowはBase → Hires.fix → Detailer → Final upscale → SaveImageの画像リンクを返す構成とし、
+LoRA chain後のMODEL、CLIP skip後のCLIP、外部VAEをFace側でも共有します。batch sizeは変更せず、
+FaceDetailerの補助出力は通常Artifactに保存しません。
+
+ComfyUI `/object_info`からdetector choicesを抽出し、detectorは安全なrelative pathだけを受け付けます。
+Face有効時のnode class、detector model、workflow compatibilityはpreflightと実行直前の両方で
+fail-closedに確認します。Face OFFではImpact Pack等のcustom nodeを要求しません。旧workflow 2.0
+latent Hires、2.1 pixel Hires、旧Generation snapshot schema 1は維持し、新規snapshot schema 2に
+Detailer設定を保存します。Form Stateはadditive defaultで、旧stateはFace OFFとして復元します。
+Hand、Foot、SAM、detector自動download、migration、debug Artifactは対象外です。

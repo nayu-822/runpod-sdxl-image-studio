@@ -13,6 +13,11 @@ import gradio as gr
 from pydantic import ValidationError
 
 from runpod_sdxl_image_studio.adapters.comfyui.models import ComfyUICapabilities
+from runpod_sdxl_image_studio.domain.detailer import (
+    DEFAULT_DETAILER_REGISTRY,
+    DetailerKind,
+    DetailerSettings,
+)
 from runpod_sdxl_image_studio.domain.generation import (
     GenerationKind,
     GenerationProgress,
@@ -117,6 +122,7 @@ class GenerationTabComponents:
     sampler: gr.Dropdown
     scheduler: gr.Dropdown
     upscaler: gr.Dropdown
+    face_detector_model: gr.Dropdown
     lora_list: gr.Markdown
     lora_summary: gr.Markdown
     lora_editor: LoraEditorComponents
@@ -149,6 +155,21 @@ class GenerationTabComponents:
     hires_denoise: gr.Number
     final_upscale: gr.Checkbox
     final_upscale_message: gr.Markdown
+    face_detailer_enabled: gr.Checkbox
+    face_positive_prompt: gr.Textbox
+    face_negative_prompt: gr.Textbox
+    face_denoise: gr.Number
+    face_steps: gr.Number
+    face_cfg_scale: gr.Number
+    face_sampler: gr.Dropdown
+    face_scheduler: gr.Dropdown
+    face_guide_size: gr.Number
+    face_max_size: gr.Number
+    face_bbox_threshold: gr.Number
+    face_bbox_dilation: gr.Number
+    face_bbox_crop_factor: gr.Number
+    face_feather: gr.Number
+    face_detailer_details: gr.Accordion
     workflow_template_id: gr.State
     workflow_template_version: gr.State
     generate_button: gr.Button
@@ -229,6 +250,7 @@ def capability_refresh_outputs(generation: GenerationTabComponents) -> tuple[Any
         *component_outputs(generation.lora_editor),
         generation.lora_editor.add_button,
         generation.lora_category_filter,
+        generation.face_detector_model,
     )
 
 
@@ -254,6 +276,21 @@ def startup_restore_form_outputs(generation: GenerationTabComponents) -> tuple[A
         generation.hires_scheduler,
         generation.hires_denoise,
         generation.final_upscale,
+        generation.face_detailer_enabled,
+        generation.face_positive_prompt,
+        generation.face_negative_prompt,
+        generation.face_denoise,
+        generation.face_steps,
+        generation.face_cfg_scale,
+        generation.face_sampler,
+        generation.face_scheduler,
+        generation.face_guide_size,
+        generation.face_max_size,
+        generation.face_bbox_threshold,
+        generation.face_bbox_dilation,
+        generation.face_bbox_crop_factor,
+        generation.face_feather,
+        generation.face_detailer_details,
     )
 
 
@@ -279,6 +316,21 @@ def startup_restore_form_values(snapshot: GenerationFormStateSnapshot) -> tuple[
         snapshot.hires_scheduler_name,
         snapshot.hires_denoise,
         snapshot.final_upscale,
+        snapshot.face_detailer_enabled,
+        snapshot.face_detailer.positive_prompt if snapshot.face_detailer else "",
+        snapshot.face_detailer.negative_prompt if snapshot.face_detailer else "",
+        snapshot.face_detailer.denoise if snapshot.face_detailer else 0.22,
+        snapshot.face_detailer.steps if snapshot.face_detailer else 20,
+        snapshot.face_detailer.cfg_scale if snapshot.face_detailer else 5.0,
+        snapshot.face_detailer.sampler_name if snapshot.face_detailer else "euler_ancestral",
+        snapshot.face_detailer.scheduler_name if snapshot.face_detailer else "normal",
+        snapshot.face_detailer.guide_size if snapshot.face_detailer else 768,
+        snapshot.face_detailer.max_size if snapshot.face_detailer else 1024,
+        snapshot.face_detailer.bbox_threshold if snapshot.face_detailer else 0.5,
+        snapshot.face_detailer.bbox_dilation if snapshot.face_detailer else 10,
+        snapshot.face_detailer.bbox_crop_factor if snapshot.face_detailer else 2.0,
+        snapshot.face_detailer.feather if snapshot.face_detailer else 5,
+        gr.Accordion(visible=bool(snapshot.face_detailer_enabled)),
     )
 
 
@@ -456,6 +508,7 @@ def build_generation_tab(
                 batch_count = gr.Number(value=2, precision=0, label="回数")
             with gr.Row(elem_classes=["compact-controls"]):
                 hires_fix = gr.Checkbox(value=False, label="Hires.fix")
+                face_detailer_enabled = gr.Checkbox(value=False, label="顔を補正")
                 final_upscale = gr.Checkbox(value=False, label="4x upscale")
             upscaler = gr.Dropdown(
                 [],
@@ -560,6 +613,51 @@ def build_generation_tab(
                 label="VAE",
                 interactive=True,
             )
+        with gr.Accordion(
+            "顔補正の詳細",
+            open=False,
+            visible=False,
+            elem_classes=["face-detailer-section"],
+        ) as face_detailer_details:
+            face_detector_model = gr.Dropdown([], label="検出モデル", interactive=False)
+            with gr.Row(elem_classes=["size-dimensions"]):
+                face_positive_prompt = gr.Textbox(
+                    value=DEFAULT_DETAILER_REGISTRY.default_settings(
+                        DetailerKind.FACE
+                    ).positive_prompt,
+                    label="Face Positive",
+                    lines=3,
+                )
+                face_negative_prompt = gr.Textbox(
+                    value=DEFAULT_DETAILER_REGISTRY.default_settings(
+                        DetailerKind.FACE
+                    ).negative_prompt,
+                    label="Face Negative",
+                    lines=3,
+                )
+            with gr.Row(elem_classes=["size-dimensions"]):
+                face_denoise = gr.Number(value=0.22, minimum=0.0, maximum=1.0, label="denoise")
+                face_steps = gr.Number(value=20, precision=0, minimum=1, maximum=150, label="steps")
+                face_cfg_scale = gr.Number(value=5.0, label="Face CFG")
+                face_sampler = gr.Dropdown(
+                    ["euler_ancestral"], value="euler_ancestral", label="sampler"
+                )
+                face_scheduler = gr.Dropdown(["normal"], value="normal", label="scheduler")
+            with gr.Accordion("検出設定", open=False):
+                with gr.Row(elem_classes=["size-dimensions"]):
+                    face_guide_size = gr.Number(value=768, precision=0, label="guide size")
+                    face_max_size = gr.Number(value=1024, precision=0, label="max size")
+                    face_bbox_threshold = gr.Number(
+                        value=0.5, minimum=0.0, maximum=1.0, label="bbox threshold"
+                    )
+                    face_bbox_dilation = gr.Number(
+                        value=10, precision=0, minimum=0, label="bbox dilation"
+                    )
+                with gr.Row(elem_classes=["size-dimensions"]):
+                    face_bbox_crop_factor = gr.Number(
+                        value=2.0, minimum=0.1, label="bbox crop factor"
+                    )
+                    face_feather = gr.Number(value=5, precision=0, minimum=0, label="feather")
 
         with gr.Accordion("最近使った設定", open=False, elem_classes=["recent-settings"]):
             recent_refresh = gr.Button("最近の設定を更新", elem_classes=["mobile-tap-button"])
@@ -612,6 +710,7 @@ def build_generation_tab(
         sampler=sampler,
         scheduler=scheduler,
         upscaler=upscaler,
+        face_detector_model=face_detector_model,
         lora_list=lora_list,
         lora_summary=lora_summary,
         lora_editor=lora_editor,
@@ -644,6 +743,21 @@ def build_generation_tab(
         hires_denoise=hires_denoise,
         final_upscale=final_upscale,
         final_upscale_message=final_upscale_message,
+        face_detailer_enabled=face_detailer_enabled,
+        face_positive_prompt=face_positive_prompt,
+        face_negative_prompt=face_negative_prompt,
+        face_denoise=face_denoise,
+        face_steps=face_steps,
+        face_cfg_scale=face_cfg_scale,
+        face_sampler=face_sampler,
+        face_scheduler=face_scheduler,
+        face_guide_size=face_guide_size,
+        face_max_size=face_max_size,
+        face_bbox_threshold=face_bbox_threshold,
+        face_bbox_dilation=face_bbox_dilation,
+        face_bbox_crop_factor=face_bbox_crop_factor,
+        face_feather=face_feather,
+        face_detailer_details=face_detailer_details,
         workflow_template_id=workflow_template_id,
         workflow_template_version=workflow_template_version,
         generate_button=generate_button,
@@ -998,6 +1112,7 @@ def make_startup_restore_handler(
                 snapshot.sampler_name,
                 snapshot.scheduler_name,
                 snapshot.upscaler_name,
+                snapshot.face_detailer.detector_model if snapshot.face_detailer else None,
             ),
             generation,
             desired_lora_state,
@@ -1020,6 +1135,48 @@ def make_startup_restore_handler(
         )
 
     return handler
+
+
+def _face_detailers_from_ui(
+    enabled: bool,
+    detector_model: str | None,
+    positive_prompt: str | None,
+    negative_prompt: str | None,
+    denoise: float | int,
+    steps: float | int,
+    cfg_scale: float | int,
+    sampler: str | None,
+    scheduler: str | None,
+    guide_size: float | int,
+    max_size: float | int,
+    bbox_threshold: float | int,
+    bbox_dilation: float | int,
+    bbox_crop_factor: float | int,
+    feather: float | int,
+) -> tuple[DetailerSettings, ...]:
+    if not enabled:
+        return ()
+    defaults = DEFAULT_DETAILER_REGISTRY.default_settings(DetailerKind.FACE)
+    detailer_values = defaults.model_dump()
+    detailer_values.update(
+        enabled=True,
+        detector_model=detector_model or defaults.detector_model,
+        positive_prompt=defaults.positive_prompt if positive_prompt is None else positive_prompt,
+        negative_prompt=defaults.negative_prompt if negative_prompt is None else negative_prompt,
+        denoise=float(denoise),
+        steps=int(steps),
+        cfg_scale=float(cfg_scale),
+        sampler_name=sampler or defaults.sampler_name,
+        scheduler_name=scheduler or defaults.scheduler_name,
+        guide_size=int(guide_size),
+        max_size=int(max_size),
+        bbox_threshold=float(bbox_threshold),
+        bbox_dilation=int(bbox_dilation),
+        bbox_crop_factor=float(bbox_crop_factor),
+        feather=int(feather),
+    )
+    detailer = DetailerSettings.model_validate(detailer_values)
+    return (detailer,)
 
 
 def make_generate_handler(
@@ -1059,10 +1216,42 @@ def make_generate_handler(
         final_upscale: bool = False,
         upscaler: str | None = None,
         progress: gr.Progress = _DEFAULT_PROGRESS,
+        face_detailer_enabled: bool = False,
+        face_detector_model: str | None = None,
+        face_positive_prompt: str | None = None,
+        face_negative_prompt: str | None = None,
+        face_denoise: float | int = 0.22,
+        face_steps: float | int = 20,
+        face_cfg_scale: float | int = 5.0,
+        face_sampler: str | None = "euler_ancestral",
+        face_scheduler: str | None = "normal",
+        face_guide_size: float | int = 768,
+        face_max_size: float | int = 1024,
+        face_bbox_threshold: float | int = 0.5,
+        face_bbox_dilation: float | int = 10,
+        face_bbox_crop_factor: float | int = 2.0,
+        face_feather: float | int = 5,
     ) -> tuple[object, ...]:
         del size_preset
         try:
             loras = lora_settings_from_state(lora_state, max_loras=max_loras)
+            detailers = _face_detailers_from_ui(
+                face_detailer_enabled,
+                face_detector_model,
+                face_positive_prompt,
+                face_negative_prompt,
+                face_denoise,
+                face_steps,
+                face_cfg_scale,
+                face_sampler,
+                face_scheduler,
+                face_guide_size,
+                face_max_size,
+                face_bbox_threshold,
+                face_bbox_dilation,
+                face_bbox_crop_factor,
+                face_feather,
+            )
             effective_positive_prompt = resolve_effective_positive_prompt(
                 positive_prompt or "", loras, lora_catalog_service
             )
@@ -1091,6 +1280,7 @@ def make_generate_handler(
                 scheduler_name=scheduler or "",
                 vae_name=vae,
                 loras=loras,
+                detailers=detailers,
                 width=int(width),
                 height=int(height),
                 seed=-1 if seed_mode == "Random" else int(seed),
@@ -1235,6 +1425,21 @@ def make_enqueue_handler(
         hires_scheduler: str | None = "normal",
         hires_denoise: float | int = 0.4,
         final_upscale: bool = False,
+        face_detailer_enabled: bool = False,
+        face_detector_model: str | None = None,
+        face_positive_prompt: str | None = None,
+        face_negative_prompt: str | None = None,
+        face_denoise: float | int = 0.22,
+        face_steps: float | int = 20,
+        face_cfg_scale: float | int = 5.0,
+        face_sampler: str | None = "euler_ancestral",
+        face_scheduler: str | None = "normal",
+        face_guide_size: float | int = 768,
+        face_max_size: float | int = 1024,
+        face_bbox_threshold: float | int = 0.5,
+        face_bbox_dilation: float | int = 10,
+        face_bbox_crop_factor: float | int = 2.0,
+        face_feather: float | int = 5,
     ) -> tuple[object, object, object, object, object, object]:
         del size_preset
 
@@ -1250,6 +1455,23 @@ def make_enqueue_handler(
 
         try:
             loras = lora_settings_from_state(lora_state, max_loras=max_loras)
+            detailers = _face_detailers_from_ui(
+                face_detailer_enabled,
+                face_detector_model,
+                face_positive_prompt,
+                face_negative_prompt,
+                face_denoise,
+                face_steps,
+                face_cfg_scale,
+                face_sampler,
+                face_scheduler,
+                face_guide_size,
+                face_max_size,
+                face_bbox_threshold,
+                face_bbox_dilation,
+                face_bbox_crop_factor,
+                face_feather,
+            )
             effective_positive_prompt = resolve_effective_positive_prompt(
                 positive_prompt or "", loras, lora_catalog_service
             )
@@ -1261,6 +1483,7 @@ def make_enqueue_handler(
                 scheduler_name=scheduler or "",
                 vae_name=vae,
                 loras=loras,
+                detailers=detailers,
                 width=int(width),
                 height=int(height),
                 seed=-1 if seed_mode == "Random" else int(seed),
@@ -1364,6 +1587,8 @@ def make_enqueue_handler(
                         auto_trigger_lora_names=tuple(
                             lora.name for lora in loras if lora.auto_add_trigger_words
                         ),
+                        face_detailer_enabled=bool(face_detailer_enabled),
+                        face_detailer=detailers[0] if detailers else None,
                         clip_skip=int(clip_skip),
                         hires_fix=bool(hires_fix),
                         hires_scale=float(hires_scale),
@@ -1443,9 +1668,41 @@ def make_batch_enqueue_handler(
         hires_scheduler: str | None = "normal",
         hires_denoise: float | int = 0.4,
         final_upscale: bool = False,
+        face_detailer_enabled: bool = False,
+        face_detector_model: str | None = None,
+        face_positive_prompt: str | None = None,
+        face_negative_prompt: str | None = None,
+        face_denoise: float | int = 0.22,
+        face_steps: float | int = 20,
+        face_cfg_scale: float | int = 5.0,
+        face_sampler: str | None = "euler_ancestral",
+        face_scheduler: str | None = "normal",
+        face_guide_size: float | int = 768,
+        face_max_size: float | int = 1024,
+        face_bbox_threshold: float | int = 0.5,
+        face_bbox_dilation: float | int = 10,
+        face_bbox_crop_factor: float | int = 2.0,
+        face_feather: float | int = 5,
     ) -> tuple[object, ...]:
         try:
             loras = lora_settings_from_state(lora_state, max_loras=max_loras)
+            detailers = _face_detailers_from_ui(
+                face_detailer_enabled,
+                face_detector_model,
+                face_positive_prompt,
+                face_negative_prompt,
+                face_denoise,
+                face_steps,
+                face_cfg_scale,
+                face_sampler,
+                face_scheduler,
+                face_guide_size,
+                face_max_size,
+                face_bbox_threshold,
+                face_bbox_dilation,
+                face_bbox_crop_factor,
+                face_feather,
+            )
             effective_positive_prompt = resolve_effective_positive_prompt(
                 positive_prompt or "", loras, lora_catalog_service
             )
@@ -1457,6 +1714,7 @@ def make_batch_enqueue_handler(
                 scheduler_name=scheduler or "",
                 vae_name=vae,
                 loras=loras,
+                detailers=detailers,
                 width=int(width),
                 height=int(height),
                 seed=-1 if seed_mode == "Random" else int(seed),
@@ -1544,6 +1802,8 @@ def make_batch_enqueue_handler(
                         auto_trigger_lora_names=tuple(
                             lora.name for lora in loras if lora.auto_add_trigger_words
                         ),
+                        face_detailer_enabled=bool(face_detailer_enabled),
+                        face_detailer=detailers[0] if detailers else None,
                         clip_skip=int(clip_skip),
                         hires_fix=bool(hires_fix),
                         hires_scale=float(hires_scale),
@@ -1610,10 +1870,42 @@ def make_interactive_start_handler(
         client_local_date: str | None,
         workflow_template_id: str = "sdxl_txt2img",
         workflow_template_version: str = CURRENT_WORKFLOW_TEMPLATE_VERSION,
+        face_detailer_enabled: bool = False,
+        face_detector_model: str | None = None,
+        face_positive_prompt: str | None = None,
+        face_negative_prompt: str | None = None,
+        face_denoise: float | int = 0.22,
+        face_steps: float | int = 20,
+        face_cfg_scale: float | int = 5.0,
+        face_sampler: str | None = "euler_ancestral",
+        face_scheduler: str | None = "normal",
+        face_guide_size: float | int = 768,
+        face_max_size: float | int = 1024,
+        face_bbox_threshold: float | int = 0.5,
+        face_bbox_dilation: float | int = 10,
+        face_bbox_crop_factor: float | int = 2.0,
+        face_feather: float | int = 5,
     ) -> tuple[object, ...]:
         del size_preset
         try:
             loras = lora_settings_from_state(lora_state, max_loras=max_loras)
+            detailers = _face_detailers_from_ui(
+                face_detailer_enabled,
+                face_detector_model,
+                face_positive_prompt,
+                face_negative_prompt,
+                face_denoise,
+                face_steps,
+                face_cfg_scale,
+                face_sampler,
+                face_scheduler,
+                face_guide_size,
+                face_max_size,
+                face_bbox_threshold,
+                face_bbox_dilation,
+                face_bbox_crop_factor,
+                face_feather,
+            )
             effective_positive_prompt = resolve_effective_positive_prompt(
                 positive_prompt or "", loras, lora_catalog_service
             )
@@ -1625,6 +1917,7 @@ def make_interactive_start_handler(
                 scheduler_name=scheduler or "",
                 vae_name=vae,
                 loras=loras,
+                detailers=detailers,
                 width=int(width),
                 height=int(height),
                 seed=-1 if seed_mode == "Random" else int(seed),
@@ -1698,6 +1991,8 @@ def make_interactive_start_handler(
                         auto_trigger_lora_names=tuple(
                             lora.name for lora in loras if lora.auto_add_trigger_words
                         ),
+                        face_detailer_enabled=bool(face_detailer_enabled),
+                        face_detailer=detailers[0] if detailers else None,
                         clip_skip=int(clip_skip),
                         hires_fix=bool(hires_fix),
                         hires_scale=float(hires_scale),
@@ -2228,6 +2523,14 @@ def _capability_updates(
                     visible=(final_upscale if component is generation.upscaler else True),
                 )
             )
+    detector_choices = list(capabilities.detector_models)
+    current_detector = (
+        current_values[5]
+        if len(current_values) > 5 and isinstance(current_values[5], str)
+        else generation.face_detector_model.value
+        if isinstance(generation.face_detector_model.value, str)
+        else None
+    )
     can_generate = bool(
         capabilities.checkpoints and capabilities.samplers and capabilities.schedulers
     )
@@ -2282,6 +2585,12 @@ def _capability_updates(
             label=generation.lora_category_filter.label,
             interactive=bool(category_options),
         ),
+        gr.Dropdown(
+            choices=detector_choices,
+            value=preserve_selection(current_detector, tuple(detector_choices)),
+            label=generation.face_detector_model.label,
+            interactive=bool(detector_choices),
+        ),
     )
 
 
@@ -2305,6 +2614,7 @@ def _empty_updates(generation: GenerationTabComponents) -> tuple[object, ...]:
         None,
         *rendered,
         gr.Dropdown([], label=generation.lora_category_filter.label, interactive=False),
+        gr.Dropdown([], label=generation.face_detector_model.label, interactive=False),
     )
 
 

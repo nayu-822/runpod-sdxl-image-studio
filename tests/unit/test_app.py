@@ -78,8 +78,29 @@ def test_startup_restore_event_wires_all_hires_form_outputs() -> None:
         component_id("Hires denoise"),
         component_id("4x upscale"),
     ]
+    face_output_ids = [
+        component_id("顔を補正"),
+        component_id("Face Positive"),
+        component_id("Face Negative"),
+        component_id("denoise"),
+        component_id("steps"),
+        component_id("Face CFG"),
+        component_id("sampler"),
+        component_id("scheduler"),
+        component_id("guide size"),
+        component_id("max size"),
+        component_id("bbox threshold"),
+        component_id("bbox dilation"),
+        component_id("bbox crop factor"),
+        component_id("feather"),
+    ]
+    face_details_id = component_id("顔補正の詳細")
 
-    assert dependency["outputs"][-(len(hires_output_ids) + 2) : -2] == hires_output_ids
+    expected_form_outputs = hires_output_ids + face_output_ids + [face_details_id]
+    form_start = dependency["outputs"].index(hires_output_ids[0])
+    assert dependency["outputs"][form_start : form_start + len(expected_form_outputs)] == (
+        expected_form_outputs
+    )
     assert all(
         components[component_id]["type"] == "state" for component_id in dependency["outputs"][-2:]
     )

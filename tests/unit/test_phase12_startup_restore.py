@@ -252,7 +252,7 @@ async def test_startup_handler_applies_exact_form_and_visible_lora_rows_after_re
 
     capability_count = len(capability_refresh_outputs(generation))
     component_count = len(component_outputs(generation.lora_editor))
-    component_start = 2 + capability_count - component_count - 2
+    component_start = 2 + capability_count - component_count - 3
     first_row = component_start
     row_output_count = component_count // len(generation.lora_editor.rows)
     second_row = component_start + row_output_count

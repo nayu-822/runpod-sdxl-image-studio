@@ -9,12 +9,14 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from runpod_sdxl_image_studio.domain.detailer import DetailerSettings
 from runpod_sdxl_image_studio.domain.lora import LoraSetting
 
 RANDOM_SEED = -1
 MAX_SEED = 2**63 - 1
 LEGACY_WORKFLOW_TEMPLATE_VERSION = "2.0"
-CURRENT_WORKFLOW_TEMPLATE_VERSION = "2.1"
+CURRENT_WORKFLOW_TEMPLATE_VERSION = "2.2"
+PIXEL_HIRES_WORKFLOW_VERSIONS = frozenset({"2.1", CURRENT_WORKFLOW_TEMPLATE_VERSION})
 LEGACY_DEFAULT_FINAL_UPSCALE_MODEL = "4x-UltraSharp.pth"
 
 
@@ -48,6 +50,7 @@ class GenerationSettings(BaseModel):
     checkpoint_name: str = Field(min_length=1)
     vae_name: str | None = None
     loras: tuple[LoraSetting, ...] = ()
+    detailers: tuple[DetailerSettings, ...] = ()
     workflow_template_id: str = Field(default="sdxl_txt2img", min_length=1)
     workflow_template_version: str = Field(default=CURRENT_WORKFLOW_TEMPLATE_VERSION, min_length=1)
 
@@ -124,6 +127,12 @@ class GenerationSettings(BaseModel):
         orders = [lora.order for lora in self.loras]
         if len(orders) != len(set(orders)):
             raise ValueError("LoRA order values must be unique")
+        detailer_orders = [detailer.order for detailer in self.detailers]
+        if len(detailer_orders) != len(set(detailer_orders)):
+            raise ValueError("Detailer order values must be unique")
+        detailer_kinds = [detailer.kind for detailer in self.detailers]
+        if len(detailer_kinds) != len(set(detailer_kinds)):
+            raise ValueError("The same Detailer kind cannot be selected more than once")
         return self
 
 
@@ -132,6 +141,7 @@ __all__ = [
     "LEGACY_DEFAULT_FINAL_UPSCALE_MODEL",
     "LEGACY_WORKFLOW_TEMPLATE_VERSION",
     "MAX_SEED",
+    "PIXEL_HIRES_WORKFLOW_VERSIONS",
     "RANDOM_SEED",
     "GenerationSettings",
 ]

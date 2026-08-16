@@ -87,6 +87,12 @@ def parse_capabilities(object_info: ComfyUIObjectInfo) -> ComfyUICapabilities:
         ("KSampler", "scheduler", "schedulers", "scheduler"),
         ("LoraLoader", "lora_name", "loras", "LoRA"),
         ("UpscaleModelLoader", "model_name", "upscale_models", "upscaler"),
+        (
+            "UltralyticsDetectorProvider",
+            "model_name",
+            "detector_models",
+            "face detector",
+        ),
     )
     extracted: dict[str, tuple[str, ...]] = {
         "checkpoints": (),
@@ -95,19 +101,27 @@ def parse_capabilities(object_info: ComfyUIObjectInfo) -> ComfyUICapabilities:
         "schedulers": (),
         "loras": (),
         "upscale_models": (),
+        "detector_models": (),
     }
     warnings: list[str] = []
 
     for node_name, input_name, result_name, display_name in node_specs:
         node_payload = object_info.nodes.get(node_name)
         if node_payload is None:
-            warning = (
-                f"{node_name} ノードが /object_info にありません（{display_name}一覧は空です）"
-            )
-            if warning not in warnings:
-                warnings.append(warning)
+            if result_name != "detector_models":
+                warning = (
+                    f"{node_name} ノードが /object_info にありません（{display_name}一覧は空です）"
+                )
+                if warning not in warnings:
+                    warnings.append(warning)
             continue
-        extracted[result_name] = _extract_choices(node_payload, input_name, warnings, node_name)
+        extracted[result_name] = _extract_choices(
+            node_payload,
+            input_name,
+            warnings,
+            node_name,
+            strict_relative=result_name == "detector_models",
+        )
 
     available_node_classes = frozenset(object_info.nodes)
     return ComfyUICapabilities(
@@ -119,6 +133,7 @@ def parse_capabilities(object_info: ComfyUIObjectInfo) -> ComfyUICapabilities:
         upscale_models=extracted["upscale_models"],
         available_node_classes=available_node_classes,
         warnings=tuple(warnings),
+        detector_models=extracted["detector_models"],
     )
 
 
@@ -293,6 +308,8 @@ def _extract_choices(
     input_name: str,
     warnings: list[str],
     node_name: str,
+    *,
+    strict_relative: bool = False,
 ) -> tuple[str, ...]:
     input_payload = _mapping_value(node_payload, "input")
     if input_payload is None:
@@ -307,13 +324,16 @@ def _extract_choices(
         return ()
 
     candidates = _candidate_strings(raw_choices)
-    safe_choices = sorted(
-        {candidate.strip() for candidate in candidates if _is_safe_reference(candidate)},
-        key=str.casefold,
-    )
-    rejected_count = sum(
-        1 for candidate in candidates if candidate.strip() and not _is_safe_reference(candidate)
-    )
+    is_safe = _is_safe_relative_reference if strict_relative else _is_safe_reference
+    safe_choice_set: set[str] = set()
+    rejected_count = 0
+    for candidate in candidates:
+        normalized = candidate.strip().replace("\\", "/") if strict_relative else candidate.strip()
+        if normalized and is_safe(normalized):
+            safe_choice_set.add(normalized)
+        elif candidate.strip():
+            rejected_count += 1
+    safe_choices = sorted(safe_choice_set, key=str.casefold)
     if rejected_count:
         warnings.append(f"{node_name}.{input_name} に不正または空の選択肢があります")
     return tuple(safe_choices)
@@ -336,6 +356,13 @@ def _candidate_strings(value: object) -> list[str]:
 def _is_safe_reference(value: str) -> bool:
     normalized = value.strip()
     return bool(normalized) and not posixpath.isabs(normalized) and not ntpath.isabs(normalized)
+
+
+def _is_safe_relative_reference(value: str) -> bool:
+    normalized = value.strip().replace("\\", "/")
+    return _is_safe_reference(normalized) and all(
+        part not in {"", ".", ".."} for part in normalized.split("/")
+    )
 
 
 def _mapping_value(payload: Mapping[str, object], key: str) -> Mapping[str, object] | None:

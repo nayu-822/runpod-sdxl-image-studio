@@ -690,7 +690,7 @@ txt2img workflowでは複数LoRA、CLIP skip、Hires.fix、任意の最終4x ups
 ComfyUIのbatch sizeを固定templateの範囲内で扱います。Hires.fixは
 `KSampler -> VAEDecode -> ImageScaleBy(lanczos) -> VAEEncode -> Hires KSampler ->
 VAEDecode`のグラフで、scale、resize method、steps、CFG、sampler、scheduler、
-denoiseをsnapshotへ保存します。新規生成はworkflow version 2.1を使い、旧い
+denoiseをsnapshotへ保存します。新規生成はworkflow version 2.2を使い、旧い
 version 2.0 snapshotのHires.fixは従来のLatentUpscaleグラフで再現します。
 ブラウザのローカル日付は対話的開始クリック
 ごとにブラウザから取得し、`generations/YYYY-MM-DD/000001.png`の6桁連番を
@@ -728,7 +728,7 @@ Positive/Negative promptにはブラウザ側ClipboardのPaste/Copyを用意し�
 権限やAPIが使えない場合は現在のpromptを保持し、`クリップボードを利用できませんでした`
 と表示します。Galleryで選択した画像の設定復元は、run IDとdisplay orderをserver側で
 検証したうえで、LoRA、Hires/final upscale、元のbatch size、workflow versionを復元します。
-新規手入力はworkflow 2.1、legacy snapshotはworkflow 2.0を維持します。Final 4x upscaleを
+新規手入力はworkflow 2.2、legacy snapshotはworkflow 2.0を維持します。Final 4x upscaleを
 使う場合はupscalerの明示選択が必須です。未選択またはComfyUIのcapabilityにないモデル、
 `UpscaleModelLoader` / `ImageUpscaleWithModel`不足の場合はpreflightで停止し、既定モデルを
 暗黙選択しません。Interactive runがactiveまたはcancellingの間は、Historyや旧resultからの
@@ -791,3 +791,21 @@ lookupできない場合は生成を開始せず安全なメッセージを表�
 positive promptはGeneration snapshot、sidecar、Historyの正本です。retryは保存済みsnapshotを使い、
 現在のmetadataを再解決しません。Form Stateにはcheckboxの選択をadditiveに保存し、旧stateではOFFとして
 復元します。Alembic migrationは追加していません。
+
+## Phase D-B: Face Detailerと拡張可能なDetailer基盤
+
+生成設定にtypedなDetailer registryを追加し、現在はFaceDetailerだけを登録しています。
+Face補正は「顔を補正」toggleで任意に有効化でき、検出モデル、専用Positive / Negative、
+denoise、steps、CFG、sampler、schedulerと検出設定は閉じた詳細Accordionから編集できます。
+UIの詳細設定はForm Stateへ保存され、Faceを含む実行条件はGeneration snapshotへ保存されるため、
+History restore、retry、reloadでも過去のFace設定を再現します。旧snapshot schema 1は
+`detailers=()`として読み続け、新規snapshotだけschema 2を使います。
+
+repository-controlled workflow 2.2は、Base generation → Hires.fix（任意）→ Detailer
+pipeline（任意）→ Final 4x upscale（任意）→ SaveImageの順で画像リンクを接続します。
+FaceDetailerへはLoRA chain後のMODEL、CLIP skip後のCLIP、外部VAEを含む実効VAEを渡し、
+Face専用conditioningはメインpromptと分離します。`FaceDetailer`と
+`UltralyticsDetectorProvider`、選択された安全なrelative detector modelはFace有効時だけ
+preflightで確認し、不足時は実行を開始しません。detector自動download、SAM、Hand / Foot、
+maskやcropのdebug Artifactは対象外です。workflow 2.0のlatent Hiresと2.1のpixel Hiresは
+既存snapshotの値を維持し、Alembic migrationは追加していません。

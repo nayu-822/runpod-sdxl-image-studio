@@ -11,9 +11,13 @@ from runpod_sdxl_image_studio.adapters.comfyui.exceptions import (
     WorkflowTemplateError,
     WorkflowValidationError,
 )
+from runpod_sdxl_image_studio.domain.detailer import (
+    DEFAULT_DETAILER_REGISTRY,
+    DetailerSettings,
+)
 from runpod_sdxl_image_studio.domain.generation_settings import (
-    CURRENT_WORKFLOW_TEMPLATE_VERSION,
     LEGACY_WORKFLOW_TEMPLATE_VERSION,
+    PIXEL_HIRES_WORKFLOW_VERSIONS,
     GenerationSettings,
 )
 
@@ -24,6 +28,7 @@ POSITIVE_CLIP_NODE_ID = "6"
 NEGATIVE_CLIP_NODE_ID = "7"
 VAE_DECODE_NODE_ID = "8"
 EXTERNAL_VAE_NODE_ID = "vae_external"
+DETAILER_NODE_PREFIX = "detailer_"
 DEFAULT_REQUIRED_NODE_CLASSES = (
     "CheckpointLoaderSimple",
     "CLIPTextEncode",
@@ -121,17 +126,28 @@ def build_txt2img_workflow(
     _apply_external_vae(workflow, settings.vae_name)
     _apply_lora_chain(workflow, settings)
     _apply_clip_skip(workflow, settings.clip_skip)
+    image_source: object = [VAE_DECODE_NODE_ID, 0]
     if settings.hires_fix:
         if settings.workflow_template_version == LEGACY_WORKFLOW_TEMPLATE_VERSION:
-            _apply_legacy_hires_fix(workflow, settings)
-        elif settings.workflow_template_version == CURRENT_WORKFLOW_TEMPLATE_VERSION:
-            _apply_hires_fix(workflow, settings)
+            image_source = _apply_legacy_hires_fix(workflow, settings)
+        elif settings.workflow_template_version in PIXEL_HIRES_WORKFLOW_VERSIONS:
+            image_source = _apply_hires_fix(workflow, settings)
         else:
             raise WorkflowTemplateError(
                 "Hires.fix is unavailable for the requested workflow version"
             )
+    for detailer in sorted(
+        (item for item in settings.detailers if item.enabled),
+        key=lambda item: item.order,
+    ):
+        image_source = _apply_detailer(workflow, detailer, image_source)
     if settings.final_upscale:
-        _apply_final_upscale(workflow, settings.final_upscale_model)
+        image_source = _apply_final_upscale(
+            workflow,
+            settings.final_upscale_model,
+            image_source=image_source,
+        )
+    _set_binding(workflow, ("9", "inputs", "images"), image_source)
 
     try:
         json.dumps(workflow)
@@ -198,7 +214,7 @@ def _apply_clip_skip(workflow: dict[str, object], clip_skip: int) -> None:
     _set_binding(workflow, (NEGATIVE_CLIP_NODE_ID, "inputs", "clip"), link)
 
 
-def _apply_hires_fix(workflow: dict[str, object], settings: GenerationSettings) -> None:
+def _apply_hires_fix(workflow: dict[str, object], settings: GenerationSettings) -> list[object]:
     """Apply the 2.1 pixel-space Hires.fix graph."""
 
     reserved = ("hires_scale", "hires_encode", "hires_sampler", "hires_decode")
@@ -244,10 +260,12 @@ def _apply_hires_fix(workflow: dict[str, object], settings: GenerationSettings) 
             "vae": _get_input(workflow, VAE_DECODE_NODE_ID, "vae"),
         },
     }
-    _set_binding(workflow, ("9", "inputs", "images"), ["hires_decode", 0])
+    return ["hires_decode", 0]
 
 
-def _apply_legacy_hires_fix(workflow: dict[str, object], settings: GenerationSettings) -> None:
+def _apply_legacy_hires_fix(
+    workflow: dict[str, object], settings: GenerationSettings
+) -> list[object]:
     """Preserve the 2.0 latent-space Hires.fix graph for old snapshots."""
 
     reserved = ("hires_latent", "hires_sampler")
@@ -282,9 +300,15 @@ def _apply_legacy_hires_fix(workflow: dict[str, object], settings: GenerationSet
         },
     }
     _set_binding(workflow, (VAE_DECODE_NODE_ID, "inputs", "samples"), ["hires_sampler", 0])
+    return [VAE_DECODE_NODE_ID, 0]
 
 
-def _apply_final_upscale(workflow: dict[str, object], model_name: str | None) -> None:
+def _apply_final_upscale(
+    workflow: dict[str, object],
+    model_name: str | None,
+    *,
+    image_source: object | None = None,
+) -> list[object]:
     if "final_upscale_loader" in workflow or "final_upscale" in workflow:
         raise WorkflowTemplateError("reserved final upscale node id is already in use")
     if model_name is None or not model_name.strip():
@@ -297,10 +321,91 @@ def _apply_final_upscale(workflow: dict[str, object], model_name: str | None) ->
         "class_type": "ImageUpscaleWithModel",
         "inputs": {
             "upscale_model": ["final_upscale_loader", 0],
-            "image": ["hires_decode" if "hires_decode" in workflow else VAE_DECODE_NODE_ID, 0],
+            "image": image_source
+            if image_source is not None
+            else ["hires_decode" if "hires_decode" in workflow else VAE_DECODE_NODE_ID, 0],
         },
     }
-    _set_binding(workflow, ("9", "inputs", "images"), ["final_upscale", 0])
+    result = ["final_upscale", 0]
+    if image_source is None:
+        _set_binding(workflow, ("9", "inputs", "images"), result)
+    return result
+
+
+def _apply_detailer(
+    workflow: dict[str, object],
+    settings: DetailerSettings,
+    image_source: object,
+) -> list[object]:
+    """Append one registry-defined image Detailer stage and return its IMAGE link."""
+
+    definition = DEFAULT_DETAILER_REGISTRY.require(settings.kind)
+    stem = f"{DETAILER_NODE_PREFIX}{settings.kind.value}"
+    node_ids = {
+        "provider": f"{stem}_detector",
+        "positive": f"{stem}_positive",
+        "negative": f"{stem}_negative",
+        "detailer": stem,
+    }
+    if any(node_id in workflow for node_id in node_ids.values()):
+        raise WorkflowTemplateError("reserved Detailer node id is already in use")
+
+    effective_model = _get_input(workflow, KSampler_NODE_ID, "model")
+    effective_clip = _get_input(workflow, POSITIVE_CLIP_NODE_ID, "clip")
+    effective_vae = _get_input(workflow, VAE_DECODE_NODE_ID, "vae")
+    workflow[node_ids["provider"]] = {
+        "class_type": definition.detector_provider_class,
+        "inputs": {"model_name": settings.detector_model},
+    }
+    workflow[node_ids["positive"]] = {
+        "class_type": "CLIPTextEncode",
+        "inputs": {"text": settings.positive_prompt, "clip": effective_clip},
+    }
+    workflow[node_ids["negative"]] = {
+        "class_type": "CLIPTextEncode",
+        "inputs": {"text": settings.negative_prompt, "clip": effective_clip},
+    }
+    workflow[node_ids["detailer"]] = {
+        "class_type": definition.node_class,
+        "inputs": {
+            "image": image_source,
+            "model": effective_model,
+            "clip": effective_clip,
+            "vae": effective_vae,
+            "positive": [node_ids["positive"], 0],
+            "negative": [node_ids["negative"], 0],
+            "bbox_detector": [node_ids["provider"], 0],
+            "guide_size": settings.guide_size,
+            "guide_size_for": settings.guide_size_for,
+            "max_size": settings.max_size,
+            "seed": settings.seed,
+            "steps": settings.steps,
+            "cfg": settings.cfg_scale,
+            "sampler_name": settings.sampler_name,
+            "scheduler": settings.scheduler_name,
+            "denoise": settings.denoise,
+            "feather": settings.feather,
+            "noise_mask": settings.noise_mask,
+            "force_inpaint": settings.force_inpaint,
+            "bbox_threshold": settings.bbox_threshold,
+            "bbox_dilation": settings.bbox_dilation,
+            "bbox_crop_factor": settings.bbox_crop_factor,
+            "sam_detection_hint": settings.sam_detection_hint,
+            "sam_dilation": settings.sam_dilation,
+            "sam_threshold": settings.sam_threshold,
+            "sam_bbox_expansion": settings.sam_bbox_expansion,
+            "sam_mask_hint_threshold": settings.sam_mask_hint_threshold,
+            "sam_mask_hint_use_negative": settings.sam_mask_hint_use_negative,
+            "drop_size": settings.drop_size,
+            "wildcard": settings.wildcard,
+            "cycle": settings.cycle,
+            "inpaint_model": settings.inpaint_model,
+            "noise_mask_feather": settings.noise_mask_feather,
+            "tiled_encode": settings.tiled_encode,
+            "tiled_decode": settings.tiled_decode,
+        },
+    }
+    return [node_ids["detailer"], 0]
 
 
 def _get_input(workflow: dict[str, object], node_id: str, input_name: str) -> object:

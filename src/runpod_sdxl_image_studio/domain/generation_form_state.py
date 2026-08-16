@@ -9,6 +9,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from runpod_sdxl_image_studio.domain.detailer import DetailerKind, DetailerSettings
 from runpod_sdxl_image_studio.domain.generation import Generation
 from runpod_sdxl_image_studio.domain.generation_settings import MAX_SEED
 from runpod_sdxl_image_studio.domain.generation_snapshot import LoraSettingSnapshot
@@ -72,6 +73,8 @@ class GenerationFormStateSnapshot(BaseModel):
     upscaler_name: str | None = Field(default=None, max_length=500)
     loras: tuple[LoraSettingSnapshot, ...] = ()
     auto_trigger_lora_names: tuple[str, ...] = ()
+    face_detailer_enabled: bool = False
+    face_detailer: DetailerSettings | None = None
     updated_at: datetime
 
     @field_validator("seed_mode", mode="before")
@@ -113,6 +116,8 @@ class GenerationFormStateSnapshot(BaseModel):
         upscaler_name: str | None = None,
         loras: tuple[LoraSetting, ...] | list[LoraSetting] = (),
         auto_trigger_lora_names: tuple[str, ...] | list[str] = (),
+        face_detailer_enabled: bool = False,
+        face_detailer: DetailerSettings | None = None,
         clip_skip: int = 1,
         hires_fix: bool = False,
         hires_scale: float = 1.5,
@@ -125,6 +130,17 @@ class GenerationFormStateSnapshot(BaseModel):
         final_upscale: bool = False,
         updated_at: datetime | None = None,
     ) -> GenerationFormStateSnapshot:
+        resolved_face_detailer = face_detailer
+        if resolved_face_detailer is None and face_detailer_enabled:
+            resolved_face_detailer = DetailerSettings()
+        if resolved_face_detailer is not None:
+            detailer_values = resolved_face_detailer.model_dump()
+            detailer_values.update(
+                kind=DetailerKind.FACE,
+                enabled=bool(face_detailer_enabled),
+                order=0,
+            )
+            resolved_face_detailer = DetailerSettings.model_validate(detailer_values)
         return cls(
             positive_prompt=positive_prompt or "",
             negative_prompt=negative_prompt or "",
@@ -163,6 +179,8 @@ class GenerationFormStateSnapshot(BaseModel):
                     str(name).strip() for name in auto_trigger_lora_names if str(name).strip()
                 )
             ),
+            face_detailer_enabled=bool(face_detailer_enabled),
+            face_detailer=resolved_face_detailer,
             updated_at=updated_at or datetime.now(UTC),
         )
 
@@ -176,6 +194,10 @@ class GenerationFormStateSnapshot(BaseModel):
         """Build the safe old-DB fallback using the resolved execution seed."""
 
         snapshot = generation.settings_snapshot
+        face_detailer = next(
+            (item for item in snapshot.detailers if item.kind is DetailerKind.FACE),
+            None,
+        )
         return cls(
             positive_prompt=snapshot.positive_prompt,
             negative_prompt=snapshot.negative_prompt,
@@ -202,6 +224,8 @@ class GenerationFormStateSnapshot(BaseModel):
             upscaler_name=upscaler_name,
             loras=snapshot.loras,
             auto_trigger_lora_names=(),
+            face_detailer_enabled=bool(face_detailer and face_detailer.enabled),
+            face_detailer=face_detailer,
             updated_at=generation.updated_at,
         )
 

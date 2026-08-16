@@ -783,6 +783,22 @@ def _apply_outputs(
         settings.hires_scheduler_name,
         settings.hires_denoise,
         settings.final_upscale,
+        False,
+        None,
+        "",
+        "",
+        0.22,
+        20,
+        5.0,
+        "euler_ancestral",
+        "normal",
+        768,
+        1024,
+        0.5,
+        10,
+        2.0,
+        5,
+        gr.Accordion(visible=False),
         *lora_updates,
         gr.skip(),
         gr.skip(),
@@ -808,7 +824,7 @@ def _preserve_apply(
         )
     return (
         message,
-        *(gr.skip() for _ in range(23)),
+        *(gr.skip() for _ in range(23 + 16)),
         *lora_outputs,
         gr.skip(),
         gr.skip(),
@@ -834,7 +850,7 @@ def preset_apply_output_count(max_loras: int) -> int:
     """Preset適用イベントの正常系・異常系で共有する出力数。"""
 
     lora_output_count = 2 + component_output_count_for_rows(max_loras)
-    return 1 + 23 + lora_output_count + 2
+    return 1 + 23 + 16 + lora_output_count + 2
 
 
 def _management_outputs(

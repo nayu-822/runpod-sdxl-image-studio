@@ -7,13 +7,15 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from runpod_sdxl_image_studio.domain.detailer import DetailerSettings
 from runpod_sdxl_image_studio.domain.generation_settings import (
     LEGACY_DEFAULT_FINAL_UPSCALE_MODEL,
     MAX_SEED,
     GenerationSettings,
 )
 
-CURRENT_SNAPSHOT_SCHEMA_VERSION = 1
+CURRENT_SNAPSHOT_SCHEMA_VERSION = 2
+SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS = frozenset({1, CURRENT_SNAPSHOT_SCHEMA_VERSION})
 
 
 class SnapshotError(ValueError):
@@ -60,6 +62,7 @@ class GenerationSettingsSnapshot(BaseModel):
     checkpoint_name: str = Field(min_length=1)
     vae_name: str | None = None
     loras: tuple[LoraSettingSnapshot, ...] = ()
+    detailers: tuple[DetailerSettings, ...] = ()
     workflow_template_id: str = Field(min_length=1)
     workflow_template_version: str = Field(min_length=1)
 
@@ -101,6 +104,7 @@ class GenerationSettingsSnapshot(BaseModel):
                 )
                 for lora in settings.loras
             ),
+            detailers=settings.detailers,
             workflow_template_id=settings.workflow_template_id,
             workflow_template_version=settings.workflow_template_version,
         )
@@ -111,8 +115,10 @@ class GenerationSettingsSnapshot(BaseModel):
             parsed: Any = json.loads(payload)
             if not isinstance(parsed, dict):
                 raise SnapshotError("snapshot JSON must be an object")
-            if parsed.get("schema_version") != CURRENT_SNAPSHOT_SCHEMA_VERSION:
+            if parsed.get("schema_version") not in SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS:
                 raise SnapshotError("unsupported snapshot schema version")
+            if parsed.get("schema_version") == 1 and "detailers" not in parsed:
+                parsed = {**parsed, "detailers": ()}
             return cls.model_validate(parsed)
         except SnapshotError:
             raise
@@ -161,6 +167,7 @@ class GenerationSettingsSnapshot(BaseModel):
                     }
                     for lora in self.loras
                 ),
+                detailers=self.detailers,
                 workflow_template_id=self.workflow_template_id,
                 workflow_template_version=self.workflow_template_version,
             )
