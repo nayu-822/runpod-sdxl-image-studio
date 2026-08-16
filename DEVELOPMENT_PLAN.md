@@ -761,7 +761,10 @@ FaceDetailerの補助出力は通常Artifactに保存しません。
 
 ComfyUI `/object_info`からdetector choicesを抽出し、detectorは安全なrelative pathだけを受け付けます。
 Face有効時のnode class、detector model、workflow compatibilityはpreflightと実行直前の両方で
-fail-closedに確認します。Face OFFではImpact Pack等のcustom nodeを要求しません。旧workflow 2.0
+fail-closedに確認します。利用できない保存済みdetectorは表示上も保持し、暗黙に別モデルへ
+置換しません。Face OFFではImpact Pack等のcustom nodeを要求しません。旧workflow 2.0
 latent Hires、2.1 pixel Hires、旧Generation snapshot schema 1は維持し、新規snapshot schema 2に
-Detailer設定を保存します。Form Stateはadditive defaultで、旧stateはFace OFFとして復元します。
+Detailer設定を保存します。2.1からのFace有効化は2.2へ明示的に昇格し、2.0へのDetailer追加は拒否します。
+Faceなしのretryは保存済みworkflow versionを使います。Form Stateはraw promptとtrigger checkboxを保存し、
+Generation snapshot/sidecar/Historyはeffective promptを保存します。旧stateはFace OFFとして復元します。
 Hand、Foot、SAM、detector自動download、migration、debug Artifactは対象外です。

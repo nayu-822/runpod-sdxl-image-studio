@@ -24,6 +24,7 @@ from runpod_sdxl_image_studio.domain.detailer import (
     DetailerKind,
 )
 from runpod_sdxl_image_studio.domain.generation_settings import (
+    CURRENT_WORKFLOW_TEMPLATE_VERSION,
     LEGACY_WORKFLOW_TEMPLATE_VERSION,
     PIXEL_HIRES_WORKFLOW_VERSIONS,
     GenerationSettings,
@@ -319,6 +320,15 @@ class GenerationPreflightService:
                 "upscaler_missing",
                 "Selected upscaler is not available",
                 errors,
+            )
+        if any(detailer.enabled for detailer in generation_settings.detailers) and (
+            generation_settings.workflow_template_version != CURRENT_WORKFLOW_TEMPLATE_VERSION
+        ):
+            errors.append(
+                _error(
+                    "detailer_workflow_version_unsupported",
+                    "Detailer stages require workflow template version 2.2",
+                )
             )
         for detailer in generation_settings.detailers:
             if not detailer.enabled:

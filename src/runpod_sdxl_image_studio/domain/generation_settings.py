@@ -121,6 +121,10 @@ class GenerationSettings(BaseModel):
     def validate_lora_collection(self) -> GenerationSettings:
         if self.final_upscale and self.final_upscale_model is None:
             raise ValueError("final_upscale_model is required when final_upscale is enabled")
+        if any(detailer.enabled for detailer in self.detailers) and (
+            self.workflow_template_version != CURRENT_WORKFLOW_TEMPLATE_VERSION
+        ):
+            raise ValueError("Enabled Detailer stages require workflow template version 2.2")
         names = [lora.name for lora in self.loras]
         if len(names) != len(set(names)):
             raise ValueError("The same LoRA cannot be selected more than once")

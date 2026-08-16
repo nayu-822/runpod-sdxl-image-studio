@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+import gradio as gr
 import pytest
 
 from runpod_sdxl_image_studio.adapters.comfyui.models import ComfyUICapabilities
@@ -26,6 +27,13 @@ from runpod_sdxl_image_studio.domain.lora import LoraSetting
 from runpod_sdxl_image_studio.domain.system_status import ComfyUIStatus
 from runpod_sdxl_image_studio.services.generation_preflight_service import (
     GenerationPreflightService,
+)
+from runpod_sdxl_image_studio.ui.tabs.history_tab import make_restore_handler
+from runpod_sdxl_image_studio.ui.tabs.system_tab import (
+    _capability_updates,
+    _face_detailers_from_ui,
+    _workflow_version_for_detailers,
+    build_generation_tab,
 )
 from runpod_sdxl_image_studio.workflows.loader import load_txt2img_template
 
@@ -112,6 +120,112 @@ def test_detailer_defaults_are_registry_owned_and_detector_path_is_safe() -> Non
         DetailerSettings(detector_model="C:/models/face.pt")
     with pytest.raises(ValueError):
         DetailerSettings(detector_model="bbox//face.pt")
+
+
+def test_detailer_requires_workflow_22_and_impact_boolean_api_values() -> None:
+    with pytest.raises(ValueError, match="workflow template version 2.2"):
+        _settings(workflow_template_version="2.1", detailers=(_face(),))
+    with pytest.raises(ValueError, match="workflow template version 2.2"):
+        _settings(workflow_template_version="2.0", detailers=(_face(),))
+    assert _face().sam_mask_hint_use_negative == "False"
+    with pytest.raises(ValueError):
+        DetailerSettings(sam_mask_hint_use_negative="Normal")  # type: ignore[arg-type]
+    assert _workflow_version_for_detailers("2.1", (_face(),)) == "2.2"
+    assert _workflow_version_for_detailers("2.0", ()) == "2.0"
+
+
+def test_face_ui_does_not_fallback_when_detector_is_unavailable() -> None:
+    with pytest.raises(ValueError, match="検出モデルを選択"):
+        _face_detailers_from_ui(
+            True,
+            None,
+            None,
+            None,
+            0.22,
+            20,
+            5.0,
+            "euler_ancestral",
+            "normal",
+            768,
+            1024,
+            0.5,
+            10,
+            2.0,
+            5,
+        )
+
+
+def test_detector_restore_preserves_unavailable_and_exact_default_only() -> None:
+    with gr.Blocks():
+        generation = build_generation_tab()
+        base_values = (
+            "checkpoints/base.safetensors",
+            None,
+            "euler",
+            "normal",
+            None,
+            "bbox/custom_face.pt",
+        )
+        unavailable = _capability_updates(
+            _capabilities(detectors=(FACE_DEFAULT_DETECTOR_MODEL,)),
+            base_values,
+            generation,
+            preserve_unavailable=True,
+        )
+        assert unavailable[-1].value == "bbox/custom_face.pt"
+        assert ("bbox/custom_face.pt（現在利用不可）", "bbox/custom_face.pt") in unavailable[
+            -1
+        ].choices
+
+        exact_default = _capability_updates(
+            _capabilities(detectors=(FACE_DEFAULT_DETECTOR_MODEL,)),
+            (*base_values[:5], None),
+            generation,
+        )
+        assert exact_default[-1].value == FACE_DEFAULT_DETECTOR_MODEL
+
+        no_default = _capability_updates(
+            _capabilities(detectors=("bbox/other_face.pt",)),
+            (*base_values[:5], None),
+            generation,
+        )
+        assert no_default[-1].value is None
+
+        unsafe_saved = _capability_updates(
+            _capabilities(detectors=(FACE_DEFAULT_DETECTOR_MODEL,)),
+            (*base_values[:5], "C:/private/face.pt"),
+            generation,
+            preserve_unavailable=True,
+        )
+        assert unsafe_saved[-1].value is None
+
+
+def test_history_restore_keeps_safe_unavailable_detector_without_fallback() -> None:
+    class History:
+        def restore_settings(self, *_args: object, **_kwargs: object) -> object:
+            return type(
+                "RestoreResult",
+                (),
+                {
+                    "settings": _settings(detailers=(_face(detector_model="bbox/custom_face.pt"),)),
+                    "warnings": (),
+                    "parent_generation_id": None,
+                },
+            )()
+
+    with gr.Blocks():
+        handler = make_restore_handler(History(), max_loras=2)  # type: ignore[arg-type]
+        result = handler(
+            "00000000-0000-0000-0000-000000000001",
+            ["checkpoints/base.safetensors"],
+            ["vae/base.safetensors"],
+            ["loras/style.safetensors"],
+            [FACE_DEFAULT_DETECTOR_MODEL],
+        )
+
+    detector = result[25]
+    assert detector.value == "bbox/custom_face.pt"
+    assert ("bbox/custom_face.pt（現在利用不可）", "bbox/custom_face.pt") in detector.choices
 
 
 def test_capabilities_extract_detector_choices_and_reject_unsafe_paths() -> None:

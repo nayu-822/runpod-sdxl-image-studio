@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 import gradio as gr
 
-from runpod_sdxl_image_studio.domain.detailer import DetailerKind
+from runpod_sdxl_image_studio.domain.detailer import DetailerKind, DetailerSettings
 from runpod_sdxl_image_studio.domain.generation import GenerationKind, GenerationStatus
 from runpod_sdxl_image_studio.domain.generation_diff import GenerationDiff, PromptTokenChange
 from runpod_sdxl_image_studio.domain.generation_history import (
@@ -548,6 +548,7 @@ def make_restore_handler(
         checkpoint_choices: object = None,
         vae_choices: object = None,
         lora_choices: object = None,
+        detector_choices: object = None,
     ) -> tuple[object, ...]:
         if not selected:
             return (
@@ -575,6 +576,7 @@ def make_restore_handler(
                     "lora_name": lora.name,
                     "model_strength": lora.model_strength,
                     "clip_strength": lora.clip_strength,
+                    "auto_add_trigger_words": False,
                 }
                 for index, lora in enumerate(settings.loras)
             ] or [
@@ -583,6 +585,7 @@ def make_restore_handler(
                     "lora_name": None,
                     "model_strength": 1.0,
                     "clip_strength": 1.0,
+                    "auto_add_trigger_words": False,
                 }
             ]
             lora_updates = render_state_updates(
@@ -596,6 +599,18 @@ def make_restore_handler(
                 "現在のComfyUI一覧を取得していないため、モデルの存在確認は行っていません。"
             )
             blocking = any(item != unverified_warning for item in restored.warnings)
+            detector_value = face_detailer.detector_model if face_detailer else None
+            detector_values = _string_choices(detector_choices) or ()
+            detector_display_choices: list[str | tuple[str, str]] = list(detector_values)
+            if detector_value is not None:
+                try:
+                    DetailerSettings(detector_model=detector_value)
+                except (TypeError, ValueError):
+                    detector_value = None
+                if detector_value is not None and detector_value not in detector_values:
+                    detector_display_choices.append(
+                        (f"{detector_value}（現在利用不可）", detector_value)
+                    )
             return (
                 "設定を復元しました。" + (f" 警告: {warning}" if warning else ""),
                 settings.positive_prompt,
@@ -625,7 +640,12 @@ def make_restore_handler(
                 settings.hires_denoise,
                 settings.final_upscale,
                 bool(face_detailer and face_detailer.enabled),
-                face_detailer.detector_model if face_detailer else None,
+                gr.Dropdown(
+                    choices=detector_display_choices,
+                    value=detector_value,
+                    label="検出モデル",
+                    interactive=bool(detector_display_choices),
+                ),
                 face_detailer.positive_prompt if face_detailer else "",
                 face_detailer.negative_prompt if face_detailer else "",
                 face_detailer.denoise if face_detailer else 0.22,

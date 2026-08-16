@@ -788,9 +788,10 @@ Generation側の各LoRAには「トリガーワードを自動追加」を追加
 生成開始時に正規化済み相対`file_name`でmetadataをexact lookupし、既存の`append_trigger_words()`で
 LoRAの順序どおりにPositiveへ一度だけ追加します。Negativeや入力中のTextboxは変更しません。
 lookupできない場合は生成を開始せず安全なメッセージを表示します。実際にComfyUIへ送ったeffective
-positive promptはGeneration snapshot、sidecar、Historyの正本です。retryは保存済みsnapshotを使い、
-現在のmetadataを再解決しません。Form Stateにはcheckboxの選択をadditiveに保存し、旧stateではOFFとして
-復元します。Alembic migrationは追加していません。
+positive promptはGeneration snapshot、sidecar、Historyの正本です。Form Stateにはmetadata解決前の
+raw Positive promptとcheckboxの選択を保存し、reload時だけtrigger設定を再適用します。History restoreは
+保存済みeffective promptを表示し、trigger checkboxをOFFにします。retryは保存済みsnapshotを使い、
+現在のmetadataを再解決しません。Alembic migrationは追加していません。
 
 ## Phase D-B: Face Detailerと拡張可能なDetailer基盤
 
@@ -806,6 +807,10 @@ pipeline（任意）→ Final 4x upscale（任意）→ SaveImageの順で画像
 FaceDetailerへはLoRA chain後のMODEL、CLIP skip後のCLIP、外部VAEを含む実効VAEを渡し、
 Face専用conditioningはメインpromptと分離します。`FaceDetailer`と
 `UltralyticsDetectorProvider`、選択された安全なrelative detector modelはFace有効時だけ
-preflightで確認し、不足時は実行を開始しません。detector自動download、SAM、Hand / Foot、
-maskやcropのdebug Artifactは対象外です。workflow 2.0のlatent Hiresと2.1のpixel Hiresは
-既存snapshotの値を維持し、Alembic migrationは追加していません。
+preflightで確認し、不足時は実行を開始しません。保存済みdetectorが現在利用できない場合は
+`（現在利用不可）`と明示して値を保持し、暗黙の別モデルへ置換しません。新規フォームだけは
+`bbox/face_yolov8m.pt`が能力一覧に完全一致するときに限って既定値を選びます。detector自動download、
+SAM、Hand / Foot、maskやcropのdebug Artifactは対象外です。workflow 2.0はlegacy latent Hires、
+2.1はpixel Hires、2.2はDetailer対応です。2.1のフォームでユーザーがFaceを明示的に有効化した場合だけ
+2.2へ昇格し、2.0へDetailerを暗黙追加せず拒否します。Faceを持たないretry/re-generationは
+保存済みworkflow versionを維持します。Alembic migrationは追加していません。

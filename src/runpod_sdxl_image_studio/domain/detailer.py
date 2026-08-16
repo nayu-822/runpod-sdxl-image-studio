@@ -70,7 +70,9 @@ class DetailerSettings(BaseModel):
     sam_threshold: float = Field(default=0.93, ge=0.0, le=1.0)
     sam_bbox_expansion: int = Field(default=0, ge=0, le=2048)
     sam_mask_hint_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
-    sam_mask_hint_use_negative: Literal["False", "Small", "Normal", "Large"] = "False"
+    # The repository-controlled Impact Pack graph currently accepts only the
+    # boolean-string value.  Do not advertise values that object_info rejects.
+    sam_mask_hint_use_negative: Literal["False"] = "False"
     drop_size: int = Field(default=10, ge=0, le=4096)
     wildcard: str = Field(default="", max_length=10_000)
     cycle: int = Field(default=1, ge=1, le=100)

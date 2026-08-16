@@ -22,6 +22,7 @@ from runpod_sdxl_image_studio.config import Settings
 from runpod_sdxl_image_studio.domain.generation import GenerationStatus
 from runpod_sdxl_image_studio.domain.generation_history import GenerationHistoryItem
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
+from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
 from runpod_sdxl_image_studio.services.generation_history_service import GenerationHistoryError
 from runpod_sdxl_image_studio.services.generation_queue_service import (
     GenerationQueueService,
@@ -138,6 +139,7 @@ class _FakeEnqueueService:
         self.detail_calls = 0
         self.enqueue_calls = 0
         self.parent_generation_ids: list[UUID | None] = []
+        self.enqueued_settings: object | None = None
 
     def get_job_detail(self, generation_id: UUID) -> object | None:
         self.detail_calls += 1
@@ -155,6 +157,7 @@ class _FakeEnqueueService:
         if admission_check is not None:
             admission_check()
         self.enqueue_calls += 1
+        self.enqueued_settings = _settings
         self.parent_generation_ids.append(parent_generation_id)
         if self.enqueue_item is None:
             raise AssertionError("enqueue should not be called without a result item")
@@ -168,9 +171,10 @@ class _FakeBatchService:
     def __init__(self) -> None:
         self.calls = 0
         self.batch_id = uuid4()
+        self.settings: object | None = None
 
     def enqueue_batch(self, *args: object, **kwargs: object) -> object:
-        del args, kwargs
+        self.settings = args[0] if args else kwargs.get("settings")
         self.calls += 1
         return SimpleNamespace(
             batch=SimpleNamespace(id=self.batch_id),
@@ -675,6 +679,147 @@ def test_batch_enqueue_and_timer_poll_keep_active_generation_state() -> None:
     assert "生成中" in active_result[0]
     assert str(active_id) not in active_result[0]
     assert str(newer_id)[:12] not in active_result[0]
+
+
+def test_form_state_keeps_raw_prompt_while_queue_uses_effective_trigger_prompt() -> None:
+    batch_service = _FakeBatchService()
+    saved: list[object] = []
+
+    class Catalog:
+        def get_by_file_name(self, file_name: str) -> object:
+            assert file_name == "style.safetensors"
+            return SimpleNamespace(
+                file_name=file_name, is_missing=False, trigger_words=("trigger",)
+            )
+
+    handler = make_batch_enqueue_handler(
+        batch_service,
+        max_loras=2,
+        form_state_saver=saved.append,
+        lora_catalog_service=Catalog(),  # type: ignore[arg-type]
+    )
+    result = asyncio.run(
+        handler(
+            "checkpoint.safetensors",
+            "raw prompt",
+            "negative",
+            1024,
+            1024,
+            "Fixed",
+            123,
+            28,
+            5.5,
+            "euler",
+            "normal",
+            None,
+            [
+                {
+                    "row_id": "one",
+                    "lora_name": "style.safetensors",
+                    "model_strength": 1.0,
+                    "clip_strength": 1.0,
+                    "auto_add_trigger_words": True,
+                }
+            ],
+            1,
+            "sequential",
+            123,
+            1,
+            "Batch",
+        )
+    )
+
+    assert batch_service.calls == 1
+    assert result[0].interactive is True
+    assert len(saved) == 1
+    assert saved[0].positive_prompt == "raw prompt"
+    assert saved[0].auto_trigger_lora_names == ("style.safetensors",)
+    assert batch_service.settings.positive_prompt == "raw prompt, trigger"
+
+
+def test_regeneration_uses_saved_snapshot_without_trigger_metadata_lookup() -> None:
+    parent_id = uuid4()
+    new_id = uuid4()
+    parent = _queue_item(parent_id, sequence=1, status=GenerationStatus.COMPLETED)
+    parent.generation.settings_snapshot = GenerationSettingsSnapshot.from_settings(
+        GenerationSettings(
+            positive_prompt="stored effective prompt",
+            negative_prompt="negative",
+            checkpoint_name="checkpoint.safetensors",
+            sampler_name="euler",
+            scheduler_name="normal",
+            seed=123,
+            width=1024,
+            height=1024,
+            steps=28,
+            cfg_scale=5.5,
+            workflow_template_version="2.1",
+        )
+    )
+    queued = _queue_item(new_id, sequence=2, status=GenerationStatus.PENDING)
+    service = _FakeEnqueueService(parent, enqueue_item=queued)
+
+    class Catalog:
+        def get_by_file_name(self, _file_name: str) -> object:
+            raise AssertionError("retry must not resolve trigger metadata")
+
+    handler = make_enqueue_handler(
+        service,
+        max_loras=2,
+        lora_catalog_service=Catalog(),  # type: ignore[arg-type]
+    )
+    result = asyncio.run(
+        handler(
+            *_enqueue_inputs(
+                parent_id,
+                regeneration_valid=True,
+                regeneration_requested=True,
+            )
+        )
+    )
+
+    assert service.enqueue_calls == 1
+    assert result[5] == str(new_id)
+    assert service.enqueued_settings.positive_prompt == "stored effective prompt"
+    assert service.enqueued_settings.workflow_template_version == "2.1"
+
+
+def test_history_derived_enqueue_preserves_saved_workflow_version_without_face_edit() -> None:
+    parent_id = uuid4()
+    new_id = uuid4()
+    parent = _queue_item(parent_id, sequence=1, status=GenerationStatus.COMPLETED)
+    parent.generation.settings_snapshot = GenerationSettingsSnapshot.from_settings(
+        GenerationSettings(
+            positive_prompt="stored prompt",
+            negative_prompt="negative",
+            checkpoint_name="checkpoint.safetensors",
+            sampler_name="euler",
+            scheduler_name="normal",
+            seed=123,
+            width=1024,
+            height=1024,
+            steps=28,
+            cfg_scale=5.5,
+            workflow_template_version="2.1",
+        )
+    )
+    queued = _queue_item(new_id, sequence=2, status=GenerationStatus.PENDING)
+    service = _FakeEnqueueService(parent, enqueue_item=queued)
+    handler = make_enqueue_handler(service, max_loras=2)
+
+    result = asyncio.run(
+        handler(
+            *_enqueue_inputs(
+                parent_id,
+                regeneration_valid=True,
+                regeneration_requested=False,
+            )
+        )
+    )
+
+    assert service.enqueue_calls == 1
+    assert result[5] == str(new_id)
+    assert service.enqueued_settings.workflow_template_version == "2.1"
 
 
 def test_latest_status_candidate_uses_sequence_26_for_reload_after_more_than_20_jobs() -> None:

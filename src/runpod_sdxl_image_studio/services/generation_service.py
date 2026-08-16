@@ -78,6 +78,7 @@ from runpod_sdxl_image_studio.domain.generation_queue import (
     ReconciliationOutcome,
 )
 from runpod_sdxl_image_studio.domain.generation_settings import (
+    CURRENT_WORKFLOW_TEMPLATE_VERSION,
     LEGACY_WORKFLOW_TEMPLATE_VERSION,
     MAX_SEED,
     PIXEL_HIRES_WORKFLOW_VERSIONS,
@@ -1607,6 +1608,10 @@ def _validate_generation(
             raise WorkflowError("A final upscale model must be selected")
         if final_model not in getattr(capabilities, "upscale_models", ()):
             raise WorkflowError("Selected final upscale model is unavailable")
+    if any(detailer.enabled for detailer in settings.detailers) and (
+        settings.workflow_template_version != CURRENT_WORKFLOW_TEMPLATE_VERSION
+    ):
+        raise WorkflowError("Enabled Detailer stages require workflow template version 2.2")
     if settings.vae_name is not None and "VAELoader" not in node_classes:
         raise WorkflowError("External VAE loading is unavailable in ComfyUI")
     missing_loras = [lora.name for lora in settings.loras if lora.name not in loras]

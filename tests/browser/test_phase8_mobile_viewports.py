@@ -34,7 +34,7 @@ TAB_CONTROLS = {
         "生成",
     ),
     "履歴": ("履歴を検索", "実使用seed（選択してコピー）"),
-    "LoRA": ("ComfyUI一覧と同期", "検索"),
+    "LoRA": ("ComfyUI一覧を更新", "検索"),
     "設定": ("システム", "キュー", "アップスケール", "プリセット"),
 }
 SETTINGS_TAB_CONTROLS = {
@@ -289,5 +289,50 @@ def test_phase_c_initial_generation_surface_is_dark_and_progressive() -> None:
             assert colors["containerBackground"] not in {"rgb(255, 255, 255)", "white"}
             assert colors["buttonBackground"] not in {"rgb(255, 255, 255)", "white"}
             _assert_no_horizontal_overflow(page)
+        finally:
+            browser.close()
+
+
+def test_phase_d_lora_gallery_and_generation_detailer_are_reachable_on_mobile() -> None:
+    """Verify the Phase D surfaces without requiring ComfyUI model data."""
+
+    from playwright.sync_api import sync_playwright
+
+    url = os.environ["IMAGE_STUDIO_BROWSER_URL"]
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page()
+        try:
+            for width in (320, 375, 390, 430):
+                page.set_viewport_size({"width": width, "height": 844})
+                page.goto(url, wait_until="domcontentloaded")
+                page.wait_for_selector("button", state="visible")
+
+                _click_tab(page, "LoRA")
+                assert page.locator(".lora-catalog-gallery").is_visible()
+                assert _has_visible_text(page, "検索")
+                assert _has_visible_text(page, "選択中LoRAの詳細・管理")
+                assert not _has_visible_text(page, "生成に追加")
+                assert _click_visible(
+                    page,
+                    page.get_by_text("選択中LoRAの詳細・管理", exact=True),
+                )
+                assert _has_visible_text(page, "生成に追加")
+
+                _click_tab(page, "生成")
+                assert _has_visible_text(page, "顔を補正")
+                assert _has_visible_text(page, "生成")
+                assert not _has_visible_text(page, "顔補正の詳細")
+                face_toggle = page.get_by_label("顔を補正", exact=True)
+                assert face_toggle.count() > 0
+                face_toggle.first.check()
+                page.wait_for_timeout(100)
+                assert _click_visible(page, page.get_by_text("高度な設定", exact=True))
+                page.wait_for_timeout(100)
+                assert _has_visible_text(page, "顔補正の詳細")
+                assert _has_visible_text(page, "Face Positive")
+                assert _has_visible_text(page, "生成")
+                _assert_no_horizontal_overflow(page)
         finally:
             browser.close()

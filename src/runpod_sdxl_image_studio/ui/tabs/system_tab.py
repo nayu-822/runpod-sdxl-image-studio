@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from runpod_sdxl_image_studio.adapters.comfyui.models import ComfyUICapabilities
 from runpod_sdxl_image_studio.domain.detailer import (
     DEFAULT_DETAILER_REGISTRY,
+    FACE_DEFAULT_DETECTOR_MODEL,
     DetailerKind,
     DetailerSettings,
 )
@@ -123,6 +124,7 @@ class GenerationTabComponents:
     scheduler: gr.Dropdown
     upscaler: gr.Dropdown
     face_detector_model: gr.Dropdown
+    face_detector_choices: gr.State
     lora_list: gr.Markdown
     lora_summary: gr.Markdown
     lora_editor: LoraEditorComponents
@@ -247,6 +249,7 @@ def capability_refresh_outputs(generation: GenerationTabComponents) -> tuple[Any
         generation.generate_button,
         generation.lora_editor.choices,
         generation.lora_editor.state,
+        generation.face_detector_choices,
         *component_outputs(generation.lora_editor),
         generation.lora_editor.add_button,
         generation.lora_category_filter,
@@ -620,6 +623,7 @@ def build_generation_tab(
             elem_classes=["face-detailer-section"],
         ) as face_detailer_details:
             face_detector_model = gr.Dropdown([], label="検出モデル", interactive=False)
+            face_detector_choices = gr.State([])
             with gr.Row(elem_classes=["size-dimensions"]):
                 face_positive_prompt = gr.Textbox(
                     value=DEFAULT_DETAILER_REGISTRY.default_settings(
@@ -711,6 +715,7 @@ def build_generation_tab(
         scheduler=scheduler,
         upscaler=upscaler,
         face_detector_model=face_detector_model,
+        face_detector_choices=face_detector_choices,
         lora_list=lora_list,
         lora_summary=lora_summary,
         lora_editor=lora_editor,
@@ -1156,11 +1161,13 @@ def _face_detailers_from_ui(
 ) -> tuple[DetailerSettings, ...]:
     if not enabled:
         return ()
+    if detector_model is None or not detector_model.strip():
+        raise ValueError("顔補正を使う場合は検出モデルを選択してください。")
     defaults = DEFAULT_DETAILER_REGISTRY.default_settings(DetailerKind.FACE)
     detailer_values = defaults.model_dump()
     detailer_values.update(
         enabled=True,
-        detector_model=detector_model or defaults.detector_model,
+        detector_model=detector_model,
         positive_prompt=defaults.positive_prompt if positive_prompt is None else positive_prompt,
         negative_prompt=defaults.negative_prompt if negative_prompt is None else negative_prompt,
         denoise=float(denoise),
@@ -1177,6 +1184,18 @@ def _face_detailers_from_ui(
     )
     detailer = DetailerSettings.model_validate(detailer_values)
     return (detailer,)
+
+
+def _workflow_version_for_detailers(
+    workflow_template_version: str | None,
+    detailers: tuple[DetailerSettings, ...],
+) -> str:
+    """Promote the explicitly edited pixel-Hires form to the Detailer graph."""
+
+    resolved = workflow_template_version or CURRENT_WORKFLOW_TEMPLATE_VERSION
+    if detailers and resolved == "2.1":
+        return CURRENT_WORKFLOW_TEMPLATE_VERSION
+    return resolved
 
 
 def make_generate_handler(
@@ -1453,54 +1472,119 @@ def make_enqueue_handler(
                 gr.skip(),
             )
 
+        parent_id: UUID | None = None
+        parent_item: object | None = None
+        parent_generation: object | None = None
+        restored_workflow_template_version: str | None = None
+        if regeneration_requested:
+            if not restored_from_generation_id:
+                return failure("履歴設定の復元に失敗したため、キューへ追加しませんでした。")
+            if not regeneration_valid:
+                return failure("利用できない設定があるため、キューへ追加しませんでした。")
+            try:
+                parent_id = UUID(restored_from_generation_id)
+            except ValueError:
+                return failure("復元元Generationが不正です。")
+            try:
+                parent_item = service.get_job_detail(parent_id)
+            except GenerationQueueServiceError:
+                return failure("再生成元Generationを確認できないため、キューへ追加しませんでした。")
+            if parent_item is None:
+                return failure("再生成元Generationが見つからないため、キューへ追加しませんでした。")
+            parent_generation = getattr(parent_item, "generation", None)
+            if parent_generation is None:
+                return failure("再生成元Generationを確認できないため、キューへ追加しませんでした。")
+            if getattr(parent_generation, "status", None) is not GenerationStatus.COMPLETED:
+                return failure("完了済みGenerationだけを再生成できます。")
+        elif restored_from_generation_id:
+            try:
+                parent_id = UUID(restored_from_generation_id)
+            except ValueError:
+                return failure("復元元Generationが不正です。")
+            try:
+                restored_parent = service.get_job_detail(parent_id)
+            except GenerationQueueServiceError:
+                restored_parent = None
+            restored_generation = getattr(restored_parent, "generation", None)
+            restored_snapshot = getattr(restored_generation, "settings_snapshot", None)
+            candidate_version = getattr(restored_snapshot, "workflow_template_version", None)
+            if isinstance(candidate_version, str) and candidate_version:
+                restored_workflow_template_version = candidate_version
+
+        if seed_mode == "Previous seed" and not restored_from_generation_id:
+            return failure("復元元Generationがありません。")
+
         try:
-            loras = lora_settings_from_state(lora_state, max_loras=max_loras)
-            detailers = _face_detailers_from_ui(
-                face_detailer_enabled,
-                face_detector_model,
-                face_positive_prompt,
-                face_negative_prompt,
-                face_denoise,
-                face_steps,
-                face_cfg_scale,
-                face_sampler,
-                face_scheduler,
-                face_guide_size,
-                face_max_size,
-                face_bbox_threshold,
-                face_bbox_dilation,
-                face_bbox_crop_factor,
-                face_feather,
-            )
-            effective_positive_prompt = resolve_effective_positive_prompt(
-                positive_prompt or "", loras, lora_catalog_service
-            )
-            generation_settings = GenerationSettings(
-                positive_prompt=effective_positive_prompt,
-                negative_prompt=negative_prompt or "",
-                checkpoint_name=checkpoint or "",
-                sampler_name=sampler or "",
-                scheduler_name=scheduler or "",
-                vae_name=vae,
-                loras=loras,
-                detailers=detailers,
-                width=int(width),
-                height=int(height),
-                seed=-1 if seed_mode == "Random" else int(seed),
-                steps=int(steps),
-                cfg_scale=float(cfg_scale),
-                clip_skip=int(clip_skip),
-                hires_fix=bool(hires_fix),
-                hires_scale=float(hires_scale),
-                hires_resize_method=hires_resize_method,
-                hires_steps=int(hires_steps),
-                hires_cfg_scale=float(hires_cfg_scale),
-                hires_sampler_name=hires_sampler or "euler",
-                hires_scheduler_name=hires_scheduler or "normal",
-                hires_denoise=float(hires_denoise),
-                final_upscale=bool(final_upscale),
-                final_upscale_model=upscaler if final_upscale else None,
-            )
+            retry_settings = None
+            if regeneration_requested and parent_generation is not None:
+                snapshot = getattr(parent_generation, "settings_snapshot", None)
+                restore_settings = getattr(snapshot, "to_generation_settings", None)
+                if callable(restore_settings):
+                    retry_settings = restore_settings()
+            if retry_settings is not None:
+                # A retry is a snapshot operation.  In particular, do not
+                # re-resolve catalog trigger words against today's metadata.
+                generation_settings = retry_settings
+                loras = tuple(generation_settings.loras)
+                detailers = tuple(generation_settings.detailers)
+                effective_positive_prompt = generation_settings.positive_prompt
+            else:
+                loras = lora_settings_from_state(lora_state, max_loras=max_loras)
+                detailers = _face_detailers_from_ui(
+                    face_detailer_enabled,
+                    face_detector_model,
+                    face_positive_prompt,
+                    face_negative_prompt,
+                    face_denoise,
+                    face_steps,
+                    face_cfg_scale,
+                    face_sampler,
+                    face_scheduler,
+                    face_guide_size,
+                    face_max_size,
+                    face_bbox_threshold,
+                    face_bbox_dilation,
+                    face_bbox_crop_factor,
+                    face_feather,
+                )
+                effective_positive_prompt = (
+                    positive_prompt or ""
+                    if regeneration_requested
+                    else resolve_effective_positive_prompt(
+                        positive_prompt or "", loras, lora_catalog_service
+                    )
+                )
+                workflow_template_version = _workflow_version_for_detailers(
+                    restored_workflow_template_version,
+                    detailers,
+                )
+                generation_settings = GenerationSettings(
+                    positive_prompt=effective_positive_prompt,
+                    negative_prompt=negative_prompt or "",
+                    checkpoint_name=checkpoint or "",
+                    sampler_name=sampler or "",
+                    scheduler_name=scheduler or "",
+                    vae_name=vae,
+                    loras=loras,
+                    detailers=detailers,
+                    width=int(width),
+                    height=int(height),
+                    seed=-1 if seed_mode == "Random" else int(seed),
+                    steps=int(steps),
+                    cfg_scale=float(cfg_scale),
+                    clip_skip=int(clip_skip),
+                    hires_fix=bool(hires_fix),
+                    hires_scale=float(hires_scale),
+                    hires_resize_method=hires_resize_method,
+                    hires_steps=int(hires_steps),
+                    hires_cfg_scale=float(hires_cfg_scale),
+                    hires_sampler_name=hires_sampler or "euler",
+                    hires_scheduler_name=hires_scheduler or "normal",
+                    hires_denoise=float(hires_denoise),
+                    final_upscale=bool(final_upscale),
+                    final_upscale_model=upscaler if final_upscale else None,
+                    workflow_template_version=workflow_template_version,
+                )
         except LoraTriggerResolutionError as exc:
             return failure(str(exc))
         except (TypeError, ValueError, ValidationError):
@@ -1508,27 +1592,6 @@ def make_enqueue_handler(
                 final_upscale_validation_message(bool(final_upscale), upscaler)
                 or "入力値を確認してください。"
             )
-        if regeneration_requested and not restored_from_generation_id:
-            return failure("履歴設定の復元に失敗したため、キューへ追加しませんでした。")
-        if regeneration_requested and not regeneration_valid:
-            return failure("利用できない設定があるため、キューへ追加しませんでした。")
-        if seed_mode == "Previous seed" and not restored_from_generation_id:
-            return failure("復元元Generationがありません。")
-        parent_id: UUID | None = None
-        if restored_from_generation_id:
-            try:
-                parent_id = UUID(restored_from_generation_id)
-            except ValueError:
-                return failure("復元元Generationが不正です。")
-        if regeneration_requested and parent_id is not None:
-            try:
-                parent_item = service.get_job_detail(parent_id)
-            except GenerationQueueServiceError:
-                return failure("再生成元Generationを確認できないため、キューへ追加しませんでした。")
-            if parent_item is None:
-                return failure("再生成元Generationが見つからないため、キューへ追加しませんでした。")
-            if parent_item.generation.status is not GenerationStatus.COMPLETED:
-                return failure("完了済みGenerationだけを再生成できます。")
         preflight_warning = ""
         if preflight_service is not None:
             try:
@@ -1570,7 +1633,7 @@ def make_enqueue_handler(
             try:
                 form_state_saver(
                     GenerationFormStateSnapshot.from_ui(
-                        positive_prompt=effective_positive_prompt,
+                        positive_prompt=positive_prompt or "",
                         negative_prompt=negative_prompt,
                         seed_mode=seed_mode,
                         seed=-1 if seed_mode == "Random" else int(seed),
@@ -1785,7 +1848,7 @@ def make_batch_enqueue_handler(
             try:
                 form_state_saver(
                     GenerationFormStateSnapshot.from_ui(
-                        positive_prompt=effective_positive_prompt,
+                        positive_prompt=positive_prompt or "",
                         negative_prompt=negative_prompt,
                         seed_mode=seed_mode,
                         seed=-1 if seed_mode == "Random" else int(seed),
@@ -1909,6 +1972,10 @@ def make_interactive_start_handler(
             effective_positive_prompt = resolve_effective_positive_prompt(
                 positive_prompt or "", loras, lora_catalog_service
             )
+            resolved_workflow_template_version = _workflow_version_for_detailers(
+                workflow_template_version,
+                detailers,
+            )
             settings = GenerationSettings(
                 positive_prompt=effective_positive_prompt,
                 negative_prompt=negative_prompt or "",
@@ -1935,8 +2002,7 @@ def make_interactive_start_handler(
                 final_upscale=bool(final_upscale),
                 final_upscale_model=upscaler if final_upscale else None,
                 workflow_template_id=workflow_template_id or "sdxl_txt2img",
-                workflow_template_version=workflow_template_version
-                or CURRENT_WORKFLOW_TEMPLATE_VERSION,
+                workflow_template_version=resolved_workflow_template_version,
             )
             if preflight_service is not None:
                 preflight = (
@@ -1974,7 +2040,7 @@ def make_interactive_start_handler(
             with suppress(Exception):
                 form_state_saver(
                     GenerationFormStateSnapshot.from_ui(
-                        positive_prompt=effective_positive_prompt,
+                        positive_prompt=positive_prompt or "",
                         negative_prompt=negative_prompt,
                         seed_mode=seed_mode,
                         seed=-1 if seed_mode == "Random" else int(seed),
@@ -2206,6 +2272,7 @@ def make_interactive_gallery_restore_handler(
         checkpoint_choices: object = None,
         vae_choices: object = None,
         lora_choices: object = None,
+        detector_choices: object = None,
     ) -> tuple[object, ...]:
         try:
             if (
@@ -2219,11 +2286,21 @@ def make_interactive_gallery_restore_handler(
                 UUID(run_id), UUID(selected_generation_id), selected_index
             )
             return restore_handler(
-                str(generation_id), checkpoint_choices, vae_choices, lora_choices
+                str(generation_id),
+                checkpoint_choices,
+                vae_choices,
+                lora_choices,
+                detector_choices,
             )
         except (InteractiveGenerationError, ValueError):
             # The existing restore handler has a stable safe failure shape.
-            return restore_handler(None, checkpoint_choices, vae_choices, lora_choices)
+            return restore_handler(
+                None,
+                checkpoint_choices,
+                vae_choices,
+                lora_choices,
+                detector_choices,
+            )
 
     return handler
 
@@ -2531,6 +2608,27 @@ def _capability_updates(
         if isinstance(generation.face_detector_model.value, str)
         else None
     )
+    detector_was_invalid = False
+    if current_detector is not None:
+        try:
+            DetailerSettings(detector_model=current_detector)
+        except (TypeError, ValueError):
+            current_detector = None
+            detector_was_invalid = True
+    detector_display_choices: list[str | tuple[str, str]] = list(detector_choices)
+    if (
+        preserve_unavailable
+        and current_detector is not None
+        and current_detector not in detector_choices
+    ):
+        detector_display_choices.append((f"{current_detector}（現在利用不可）", current_detector))
+    detector_values = _choice_values(detector_display_choices)
+    if current_detector is None and not detector_was_invalid:
+        detector_value = (
+            FACE_DEFAULT_DETECTOR_MODEL if FACE_DEFAULT_DETECTOR_MODEL in detector_choices else None
+        )
+    else:
+        detector_value = current_detector if current_detector in detector_values else None
     can_generate = bool(
         capabilities.checkpoints and capabilities.samplers and capabilities.schedulers
     )
@@ -2578,6 +2676,7 @@ def _capability_updates(
         lora_markdown(capabilities),
         gr.Button(value="生成", interactive=can_generate),
         selected_options,
+        list(detector_values),
         *rendered,
         gr.Dropdown(
             choices=list(category_options),
@@ -2586,10 +2685,10 @@ def _capability_updates(
             interactive=bool(category_options),
         ),
         gr.Dropdown(
-            choices=detector_choices,
-            value=preserve_selection(current_detector, tuple(detector_choices)),
+            choices=detector_display_choices,
+            value=detector_value,
             label=generation.face_detector_model.label,
-            interactive=bool(detector_choices),
+            interactive=bool(detector_display_choices),
         ),
     )
 
@@ -2612,6 +2711,7 @@ def _empty_updates(generation: GenerationTabComponents) -> tuple[object, ...]:
         "**LoRA list:** unavailable",
         gr.Button(value="生成", interactive=False),
         None,
+        [],
         *rendered,
         gr.Dropdown([], label=generation.lora_category_filter.label, interactive=False),
         gr.Dropdown([], label=generation.face_detector_model.label, interactive=False),

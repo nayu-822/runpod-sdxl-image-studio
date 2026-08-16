@@ -1151,7 +1151,10 @@ def build_app(
             queue=False,
         )
         generation.face_detailer_enabled.change(
-            fn=lambda enabled: gr.Accordion(visible=bool(enabled)),
+            fn=lambda enabled: gr.Accordion(
+                visible=bool(enabled),
+                open=bool(enabled),
+            ),
             inputs=[generation.face_detailer_enabled],
             outputs=[generation.face_detailer_details],
             queue=False,
@@ -2610,8 +2613,15 @@ def build_app(
             checkpoint_choices: object = None,
             vae_choices: object = None,
             lora_choices: object = None,
+            detector_choices: object = None,
         ) -> tuple[object, ...]:
-            base = gallery_restore_base(selected, checkpoint_choices, vae_choices, lora_choices)
+            base = gallery_restore_base(
+                selected,
+                checkpoint_choices,
+                vae_choices,
+                lora_choices,
+                detector_choices,
+            )
             if not selected or base[-1] is not True:
                 return (*base, gr.skip(), gr.skip(), gr.skip(), gr.skip())
             try:
@@ -2677,6 +2687,7 @@ def build_app(
                 generation.checkpoint_choices,
                 generation.vae_choices,
                 generation.lora_editor.choices,
+                generation.face_detector_choices,
             ],
             outputs=restore_outputs,
         )
@@ -2692,6 +2703,7 @@ def build_app(
                 generation.checkpoint_choices,
                 generation.vae_choices,
                 generation.lora_editor.choices,
+                generation.face_detector_choices,
             ],
             outputs=[
                 *restore_outputs,
@@ -2760,6 +2772,7 @@ def build_app(
                 generation.checkpoint_choices,
                 generation.vae_choices,
                 generation.lora_editor.choices,
+                generation.face_detector_choices,
             ],
             outputs=restore_outputs,
         )
@@ -2794,6 +2807,7 @@ def build_app(
                 generation.checkpoint_choices,
                 generation.vae_choices,
                 generation.lora_editor.choices,
+                generation.face_detector_choices,
             ],
             outputs=restore_outputs,
             concurrency_limit=1,
@@ -2821,6 +2835,7 @@ def build_app(
                 generation.checkpoint_choices,
                 generation.vae_choices,
                 generation.lora_editor.choices,
+                generation.face_detector_choices,
             ],
             outputs=restore_outputs,
             concurrency_limit=1,
