@@ -14,11 +14,15 @@ import pytest
 from PIL import Image
 from sqlalchemy import create_engine
 
+from runpod_sdxl_image_studio.adapters.catalog.upscaler_catalog import UpscalerCatalog
 from runpod_sdxl_image_studio.adapters.database.engine import create_session_factory, session_scope
 from runpod_sdxl_image_studio.adapters.database.models import Base, DriveManifestJobModel
 from runpod_sdxl_image_studio.adapters.database.repositories.drive_sync_repository import (
     DriveSyncRepository,
     DriveSyncRepositoryError,
+)
+from runpod_sdxl_image_studio.adapters.database.repositories.generation_dispatch_queue_repository import (  # noqa: E501
+    GenerationDispatchQueueRepository,
 )
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_repository import (
     GenerationArtifactRepository,
@@ -27,6 +31,9 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_reposito
 )
 from runpod_sdxl_image_studio.adapters.database.repositories.generation_start_repository import (
     GenerationStartRepository,
+)
+from runpod_sdxl_image_studio.adapters.database.repositories.upscale_settings_repository import (
+    UpscaleSettingsRepository,
 )
 from runpod_sdxl_image_studio.adapters.drive.google_drive_adapter import GoogleDriveAdapter
 from runpod_sdxl_image_studio.config import Settings
@@ -37,6 +44,7 @@ from runpod_sdxl_image_studio.domain.drive_sync import (
     DriveSyncErrorCode,
     DriveSyncProgress,
     DriveSyncStatus,
+    build_google_drive_output_folder,
     validate_remote_base_path,
     validate_remote_name,
 )
@@ -44,13 +52,18 @@ from runpod_sdxl_image_studio.domain.generation import GenerationKind
 from runpod_sdxl_image_studio.domain.generation_artifact import ArtifactType, GenerationArtifact
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
-from runpod_sdxl_image_studio.domain.upscale import UpscaleMethod, UpscaleSizingMode
+from runpod_sdxl_image_studio.domain.upscale import (
+    UpscaleMethod,
+    UpscaleSettings,
+    UpscaleSizingMode,
+)
 from runpod_sdxl_image_studio.domain.upscale_snapshot import UpscaleSettingsSnapshot
 from runpod_sdxl_image_studio.jobs.drive_sync_worker import DriveSyncWorker
 from runpod_sdxl_image_studio.services.drive_sync_service import (
     DriveSyncService,
     DriveSyncServiceError,
 )
+from runpod_sdxl_image_studio.services.upscale_enqueue_service import UpscaleEnqueueService
 from runpod_sdxl_image_studio.ui.tabs.drive_sync_tab import (
     make_drive_manifest_handler,
     make_drive_resync_handler,
@@ -98,9 +111,9 @@ def test_active_manifest_check_is_unbounded_and_does_not_list_jobs() -> None:
     assert repository.has_active_manifest_jobs()
 
 
-def _png() -> bytes:
+def _png(size: tuple[int, int] = (64, 64)) -> bytes:
     output = BytesIO()
-    Image.new("RGB", (64, 64), "white").save(output, format="PNG")
+    Image.new("RGB", size, "white").save(output, format="PNG")
     return output.getvalue()
 
 
@@ -311,6 +324,130 @@ def _fixture(
     return service, DriveSyncRepository(factory), generation_id, image_path, metadata_path, fake
 
 
+def _actual_upscale_drive_record(tmp_path: Path, scale_factor: float):
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    factory = create_session_factory(engine)
+    settings = Settings(
+        _env_file=None,
+        data_dir=tmp_path,
+        upscaler_dir=tmp_path / "upscalers",
+        rclone_remote="drive",
+        rclone_base_path="studio",
+        max_width=256,
+        max_height=256,
+        max_output_image_bytes=1_000_000,
+        max_metadata_sidecar_bytes=1_000_000,
+    )
+    generations = GenerationRepository(factory)
+    artifacts = GenerationArtifactRepository(factory)
+    now = datetime(2026, 8, 7, 15, 30, tzinfo=UTC)
+
+    parent_id, parent_job_id = uuid4(), uuid4()
+    GenerationStartRepository(factory).create_pending(
+        GenerationSettingsSnapshot.from_settings(_settings(final_upscale=True)),
+        generation_id=parent_id,
+        job_id=parent_job_id,
+        kind=GenerationKind.STANDARD,
+        parent_generation_id=None,
+        created_at=now,
+    )
+    parent_path = tmp_path / "generations" / "2026-08-08" / "generated" / "parent.png"
+    parent_path.parent.mkdir(parents=True)
+    parent_bytes = _png()
+    parent_path.write_bytes(parent_bytes)
+    parent_artifact = GenerationArtifact(
+        id=uuid4(),
+        generation_id=parent_id,
+        artifact_type=ArtifactType.IMAGE,
+        local_path="generations/2026-08-08/generated/parent.png",
+        sha256=hashlib.sha256(parent_bytes).hexdigest(),
+        size_bytes=len(parent_bytes),
+        width=64,
+        height=64,
+        mime_type="image/png",
+        created_at=now,
+    )
+    artifacts.add(parent_artifact)
+    GenerationCompletionRepository(factory).complete_generation(
+        parent_id, parent_job_id, parent_artifact, now
+    )
+
+    enqueue = UpscaleEnqueueService(
+        generations,
+        artifacts,
+        GenerationDispatchQueueRepository(factory),
+        settings,
+        catalog=UpscalerCatalog(("4x.pth",)),
+    )
+    item = enqueue.enqueue(
+        parent_id,
+        UpscaleSettings(
+            method=UpscaleMethod.IMAGE,
+            sizing_mode=UpscaleSizingMode.FACTOR,
+            scale_factor=scale_factor,
+            upscaler_name="4x.pth",
+        ),
+    )
+
+    child_size = int(64 * scale_factor)
+    child_path = (
+        tmp_path / "generations" / "2026-08-08" / "upscaled" / f"child-{int(scale_factor)}x.png"
+    )
+    child_path.parent.mkdir(parents=True)
+    child_bytes = _png((child_size, child_size))
+    child_path.write_bytes(child_bytes)
+    child_artifact = GenerationArtifact(
+        id=uuid4(),
+        generation_id=item.generation.id,
+        artifact_type=ArtifactType.IMAGE,
+        local_path=child_path.relative_to(tmp_path).as_posix(),
+        sha256=hashlib.sha256(child_bytes).hexdigest(),
+        size_bytes=len(child_bytes),
+        width=child_size,
+        height=child_size,
+        mime_type="image/png",
+        created_at=now,
+    )
+    artifacts.add(child_artifact)
+    completed_at = now + timedelta(minutes=1)
+    GenerationCompletionRepository(factory).complete_generation(
+        item.generation.id, item.job.id, child_artifact, completed_at
+    )
+    metadata_path = child_path.with_suffix(".json")
+    metadata_bytes = b'{"schema_version":1}'
+    metadata_path.write_bytes(metadata_bytes)
+    artifacts.add(
+        GenerationArtifact(
+            id=uuid4(),
+            generation_id=item.generation.id,
+            artifact_type=ArtifactType.METADATA,
+            local_path=metadata_path.relative_to(tmp_path).as_posix(),
+            sha256=hashlib.sha256(metadata_bytes).hexdigest(),
+            size_bytes=len(metadata_bytes),
+            width=None,
+            height=None,
+            mime_type="application/json",
+            created_at=now,
+        )
+    )
+
+    adapter = FakeDriveAdapter()
+    drive = DriveSyncService(
+        DriveSyncRepository(factory),
+        generations,
+        artifacts,
+        settings,
+        adapter,
+        upscale_settings_repository=UpscaleSettingsRepository(factory),
+    )
+    record = drive.enqueue_generation(item.generation.id)
+    persisted_child = generations.get_by_id(item.generation.id)
+    engine.dispose()
+    assert persisted_child is not None
+    return record, item, persisted_child
+
+
 def _add_second_image(service: DriveSyncService, generation_id: UUID, image_path: Path) -> Path:
     created_at = datetime(2026, 8, 7, 15, 30, tzinfo=UTC)
     second_bytes = _png()
@@ -388,22 +525,25 @@ def test_drive_sync_uses_final_upscale_snapshot_for_x4_folder(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize(
-    ("kind", "upscale_factor", "expected_folder"),
+    ("kind", "upscale_factor", "final_upscale", "expected_folder"),
     [
-        (GenerationKind.STANDARD, None, "20260808_x1"),
-        (GenerationKind.UPSCALE, 2.0, "20260808_x1"),
-        (GenerationKind.UPSCALE, 4.0, "20260808_x4"),
+        (GenerationKind.STANDARD, None, False, "20260808_x1"),
+        (GenerationKind.STANDARD, None, True, "20260808_x4"),
+        (GenerationKind.UPSCALE, 2.0, True, "20260808_x1"),
+        (GenerationKind.UPSCALE, 4.0, True, "20260808_x4"),
     ],
 )
 def test_drive_sync_classifies_persisted_generation_kind_and_upscale_factor(
     tmp_path: Path,
     kind: GenerationKind,
     upscale_factor: float | None,
+    final_upscale: bool,
     expected_folder: str,
 ) -> None:
     service, _, generation_id, _, _, _ = _fixture(
         tmp_path,
         kind=kind,
+        generation_settings=_settings(final_upscale=final_upscale),
         upscale_factor=upscale_factor,
     )
 
@@ -412,6 +552,50 @@ def test_drive_sync_classifies_persisted_generation_kind_and_upscale_factor(
     assert record is not None
     assert record.remote_image_path.startswith(f"{expected_folder}/")
     assert record.remote_metadata_path.startswith(f"{expected_folder}/")
+
+
+@pytest.mark.parametrize(
+    ("scale_factor", "expected_folder"),
+    [(2.0, "20260808_x1"), (4.0, "20260808_x4")],
+)
+def test_upscale_enqueue_child_uses_its_persisted_factor_for_drive_folder(
+    tmp_path: Path,
+    scale_factor: float,
+    expected_folder: str,
+) -> None:
+    record, item, persisted_child = _actual_upscale_drive_record(tmp_path, scale_factor)
+
+    assert item.generation.settings_snapshot.final_upscale is True
+    assert persisted_child.kind is GenerationKind.UPSCALE
+    assert persisted_child.settings_snapshot.final_upscale is True
+    assert record is not None
+    assert record.remote_image_path.startswith(f"{expected_folder}/")
+    assert record.remote_metadata_path.startswith(f"{expected_folder}/")
+
+
+@pytest.mark.parametrize(
+    ("target_width", "target_height", "expected_folder"),
+    [
+        (2048, 2048, "20260808_x1"),
+        (4096, 4096, "20260808_x4"),
+    ],
+)
+def test_drive_sync_classifies_upscale_dimensions_without_inherited_final_flag(
+    target_width: int,
+    target_height: int,
+    expected_folder: str,
+) -> None:
+    folder = build_google_drive_output_folder(
+        kind=GenerationKind.UPSCALE,
+        created_at=datetime(2026, 8, 7, 15, 30, tzinfo=UTC),
+        final_upscale=True,
+        source_width=1024,
+        source_height=1024,
+        target_width=target_width,
+        target_height=target_height,
+    )
+
+    assert folder == expected_folder
 
 
 def test_drive_sync_uses_tokyo_completion_date_not_upload_date_or_utc_date(

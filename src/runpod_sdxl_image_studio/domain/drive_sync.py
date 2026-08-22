@@ -320,9 +320,10 @@ def build_google_drive_output_folder(
     """Return the flat ``YYYYMMDD_x1`` or ``YYYYMMDD_x4`` folder name.
 
     Standard/derived generations use the persisted ``final_upscale`` flag,
-    whose product contract is Final 4x.  Upscale generations use their durable
-    factor or source/target dimensions.  Missing or non-4x evidence is classified
-    as ``x1`` rather than guessing from a current form value.
+    whose product contract is Final 4x.  Upscale generations use only their
+    durable factor or source/target dimensions; their inherited generation
+    snapshot flag is intentionally ignored.  Missing or non-4x evidence is
+    classified as ``x1`` rather than guessing from a current form value.
     """
 
     try:
@@ -330,8 +331,7 @@ def build_google_drive_output_folder(
     except Exception as exc:
         raise ValueError("configured timezone is invalid") from exc
     kind_value = getattr(kind, "value", kind)
-    is_x4 = bool(final_upscale)
-    if kind_value == "upscale" and not is_x4:
+    if kind_value == "upscale":
         is_x4 = _is_four_x_upscale(
             requested_scale_factor,
             source_width=source_width,
@@ -339,6 +339,8 @@ def build_google_drive_output_folder(
             target_width=target_width,
             target_height=target_height,
         )
+    else:
+        is_x4 = bool(final_upscale)
     suffix = "x4" if is_x4 else "x1"
     return f"{local_datetime:%Y%m%d}_{suffix}"
 
