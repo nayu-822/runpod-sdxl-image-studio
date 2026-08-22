@@ -508,6 +508,7 @@ def build_app(
         app_settings,
         drive_adapter,
         metadata_repair_handler=generation_service.repair_optional_artifacts,
+        upscale_settings_repository=upscale_settings_repository,
         work_gate=lifecycle_service,
     )
     generation_service.set_drive_sync_enqueue_handler(drive_sync_service.enqueue_generation)

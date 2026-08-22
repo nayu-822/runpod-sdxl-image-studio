@@ -29,6 +29,9 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_reposito
     GenerationArtifactRepositoryProtocol,
     GenerationRepositoryProtocol,
 )
+from runpod_sdxl_image_studio.adapters.database.repositories.upscale_settings_repository import (
+    UpscaleSettingsRepositoryProtocol,
+)
 from runpod_sdxl_image_studio.config import Settings
 from runpod_sdxl_image_studio.domain.drive_sync import (
     DriveCacheCandidate,
@@ -46,10 +49,15 @@ from runpod_sdxl_image_studio.domain.drive_sync import (
     DriveSyncStatus,
     build_remote_image_path,
     build_remote_paths,
+    remote_path_local_date,
     utc,
     validate_remote_relative_path,
 )
-from runpod_sdxl_image_studio.domain.generation import Generation, GenerationStatus
+from runpod_sdxl_image_studio.domain.generation import (
+    Generation,
+    GenerationKind,
+    GenerationStatus,
+)
 from runpod_sdxl_image_studio.domain.generation_artifact import ArtifactType, GenerationArtifact
 from runpod_sdxl_image_studio.services.pod_lifecycle_service import (
     PodLifecycleWorkBlockedError,
@@ -106,6 +114,7 @@ class DriveSyncService:
         *,
         rclone_adapter: DriveAdapterProtocol | None = None,
         metadata_repair_handler: MetadataRepairHandler | None = None,
+        upscale_settings_repository: UpscaleSettingsRepositoryProtocol | None = None,
         id_factory: Callable[[], UUID] = uuid4,
         work_gate: object | None = None,
     ) -> None:
@@ -120,6 +129,7 @@ class DriveSyncService:
         self._settings = settings
         self._adapter = selected_adapter
         self._metadata_repair_handler = metadata_repair_handler
+        self._upscale_settings_repository = upscale_settings_repository
         self._id_factory = id_factory
         self._work_gate = work_gate
 
@@ -147,12 +157,7 @@ class DriveSyncService:
             return existing
         artifacts = self._artifacts_with_repair(generation_id)
         images, metadata = _select_required_artifacts(artifacts)
-        paths = build_remote_paths(
-            generation.id,
-            generation.kind.value,
-            generation.created_at,
-            timezone_name=self._settings.timezone,
-        )
+        paths = self._build_remote_paths(generation)
         record, job = self._build_record_and_job(
             generation,
             images,
@@ -225,12 +230,7 @@ class DriveSyncService:
                 _verify_image_source(image, self._settings)
             if metadata is not None:
                 _verify_metadata_source(metadata, self._settings, generation.id)
-        paths = build_remote_paths(
-            generation.id,
-            generation.kind.value,
-            generation.created_at,
-            timezone_name=self._settings.timezone,
-        )
+        paths = self._build_remote_paths(generation)
         updated_record, job = self._build_record_and_job(
             generation,
             images,
@@ -534,7 +534,7 @@ class DriveSyncService:
             )
         try:
             self.enqueue_manifest_rebuild(
-                _local_date(generation.created_at, self._settings.timezone),
+                _local_date(_generation_timestamp(generation), self._settings.timezone),
                 destination=destination,
             )
         except Exception as exc:  # noqa: BLE001 - manifest is outside the sync transaction
@@ -823,6 +823,51 @@ class DriveSyncService:
                 retryable=False,
             )
         return generation
+
+    def _build_remote_paths(self, generation: Generation) -> DriveRemotePaths:
+        upscale_snapshot = None
+        if generation.kind is GenerationKind.UPSCALE:
+            if self._upscale_settings_repository is None:
+                raise DriveSyncServiceError(
+                    "upscale_settings_unavailable",
+                    "upscale settings repository is unavailable",
+                    retryable=False,
+                )
+            try:
+                upscale_snapshot = self._upscale_settings_repository.get_by_generation(
+                    generation.id
+                )
+            except Exception as exc:  # noqa: BLE001 - do not guess the Drive folder
+                raise DriveSyncServiceError(
+                    "upscale_settings_unavailable",
+                    "upscale settings could not be read",
+                    retryable=False,
+                ) from exc
+            if upscale_snapshot is None:
+                raise DriveSyncServiceError(
+                    "upscale_settings_missing",
+                    "upscale settings are missing",
+                    retryable=False,
+                )
+        return build_remote_paths(
+            generation.id,
+            generation.kind.value,
+            generation.created_at,
+            completed_at=generation.completed_at,
+            final_upscale=generation.settings_snapshot.final_upscale,
+            requested_scale_factor=(
+                upscale_snapshot.requested_scale_factor if upscale_snapshot is not None else None
+            ),
+            source_width=(upscale_snapshot.source_width if upscale_snapshot is not None else None),
+            source_height=(
+                upscale_snapshot.source_height if upscale_snapshot is not None else None
+            ),
+            target_width=(upscale_snapshot.target_width if upscale_snapshot is not None else None),
+            target_height=(
+                upscale_snapshot.target_height if upscale_snapshot is not None else None
+            ),
+            timezone_name=self._settings.timezone,
+        )
 
     def _artifacts_with_repair(self, generation_id: UUID) -> tuple[GenerationArtifact, ...]:
         artifacts = self._artifact_repository.list_by_generation(generation_id)
@@ -1192,27 +1237,25 @@ def _can_resume_metadata(
 def _paths_from_record_or_generation(
     record: DriveSyncRecord, generation: Generation, timezone_name: str
 ) -> DriveRemotePaths:
+    local_date = _local_date(_generation_timestamp(generation), timezone_name)
     return DriveRemotePaths(
-        local_date=_local_date(generation.created_at, timezone_name),
+        local_date=local_date,
         image_path=record.remote_image_path,
         metadata_path=record.remote_metadata_path,
-        manifest_path=(
-            f"{_local_date(generation.created_at, timezone_name)}/manifests/manifest.jsonl"
-        ),
+        manifest_path=f"{local_date}/manifests/manifest.jsonl",
     )
 
 
 def _manifest_local_date_from_record(record: DriveSyncRecord) -> str:
-    image_date = _remote_path_date_prefix(record.remote_image_path)
-    metadata_date = _remote_path_date_prefix(record.remote_metadata_path)
+    image_date = remote_path_local_date(record.remote_image_path)
+    metadata_date = remote_path_local_date(record.remote_metadata_path)
     if image_date != metadata_date:
         raise ValueError("sync record remote dates are inconsistent")
     return image_date
 
 
-def _remote_path_date_prefix(path: str) -> str:
-    prefix = path.replace("\\", "/").split("/", 1)[0]
-    return date.fromisoformat(prefix).isoformat()
+def _generation_timestamp(generation: Generation) -> datetime:
+    return generation.completed_at or generation.created_at
 
 
 def _resolve_artifact_path(artifact: GenerationArtifact, settings: Settings) -> Path:

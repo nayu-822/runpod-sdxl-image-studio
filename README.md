@@ -230,8 +230,8 @@ RunPod GPU Pod 上で ComfyUI を画像生成バックエンドとして使用�
 
 ### 7. 同期・保存
 
-- 生成した画像を日付別・種別別に Google Drive へ保存
-- 通常生成とアップスケールを別フォルダへ保存
+- Generation.completed_atのAsia/Tokyo日付と最終倍率でGoogle Driveの`YYYYMMDD_x1` / `YYYYMMDD_x4`へ保存
+- 4倍だけを`x4`、通常生成・2倍・4倍以外を`x1`へ保存
 - sidecar JSON も併せて保存
 - 画像ごとの同期状態表示
 - 同期失敗時の再試行
@@ -310,16 +310,18 @@ Gradio UI
 ```text
 Google Drive/
 └── RunPodSDXLImageStudio/
-    └── 2026-07-26/
-        ├── generated/
-        │   ├── 20260726_103512_ab12cd34.png
-        │   └── 20260726_103512_ab12cd34.json
-        ├── upscaled/
-        │   ├── 20260726_104201_ef56gh78.png
-        │   └── 20260726_104201_ef56gh78.json
-        └── manifests/
-            └── 20260726.jsonl
+    ├── 20260726_x1/
+    │   ├── 20260726_103512_ab12cd34.png
+    │   └── 20260726_103512_ab12cd34.json
+    └── 20260726_x4/
+        ├── 20260726_104201_ef56gh78.png
+        └── 20260726_104201_ef56gh78.json
 ```
+
+画像とsidecar JSONは同じGenerationの同じフォルダへ保存します。`YYYYMMDD`はアップロード時刻ではなく、
+Generation.completed_atを優先してAsia/Tokyoへ変換した完了日です。通常生成はFinal 4x upscaleだけを`x4`、
+それ以外（通常生成、2倍アップスケール、4倍以外の倍率）は`x1`へ分類します。既存の集約manifestは
+日付単位の同期対象として維持します。
 
 画像には可能な範囲で PNG metadata を埋め込み、同じ内容を sidecar JSON にも保存します。PNG metadata が欠落・削除された場合も sidecar JSON と SQLite から復元できる構成とします。
 
@@ -521,7 +523,8 @@ source選択の候補と確認状態は `0011_phase6_metadata_source_selection` 
 manifest再構築要求、ローカル容量と未同期容量を確認できます。manifest転送も独立したWorker Jobとして処理され、失敗した日付を再構築できます。
 Google Driveが未設定でも生成・履歴・ローカル保存は継続します。
 
-同期対象はcompleted Generationの主画像とsidecar JSONです。Asia/Tokyoの日付で`generated/`または`upscaled/`へ保存し、
+同期対象はcompleted Generationの主画像とsidecar JSONです。Generation.completed_atをAsia/Tokyoへ変換した日付と
+永続化された最終倍率で`YYYYMMDD_x1`または`YYYYMMDD_x4`へ保存し、
 画像・JSONの両方が成功した後にSQLiteのSyncRecordを`synced`へ確定します。転送はrclone `copyto`だけを使い、
 同期失敗時もローカルファイルとremote上の既存ファイルを削除しません。日次JSONL manifestは同期済みDB行から決定的に再構築します。
 `RCLONE_CONFIG`はrcloneの引数へだけ渡し、DB・UI・manifest・ログへ保存しません。

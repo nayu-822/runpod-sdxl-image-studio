@@ -274,15 +274,14 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 
 ### 目的
 
-生成結果を日付別・種別別に Google Drive へ安全に保存する。
+生成結果をGenerationのAsia/Tokyo基準の完了日と最終倍率で`YYYYMMDD_x1` / `YYYYMMDD_x4`へ安全に保存する。
 
 ### 対応
 
 - rclone アダプター
 - 接続確認
-- 日付フォルダ
-- `generated/`
-- `upscaled/`
+- `YYYYMMDD_x1` フォルダ
+- `YYYYMMDD_x4` フォルダ
 - `manifests/`
 - 画像と JSON の copy
 - 転送進捗
@@ -298,7 +297,7 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 
 ### 完了条件
 
-- 画像と metadata が同じ日付・種別フォルダへ保存される
+- 画像と metadata がGenerationのAsia/Tokyo基準の完了日と最終倍率で同じ`YYYYMMDD_x1`または`YYYYMMDD_x4`へ保存される
 - 同期失敗時もローカル画像が残る
 - 再試行できる
 - `rclone sync` を使用しない
@@ -308,7 +307,8 @@ checkpoint と複数 LoRA を UI から安全に選択できるようにする�
 
 フェーズ7を実装済みです。rcloneの引数配列Adapter、SQLiteの`drive_sync_records`／`drive_sync_jobs`／`drive_manifest_jobs`、
 単一Workerのlease・heartbeat・stale復旧、生成完了後のenqueue、起動時のbounded discovery、手動retry／resync、
-Asia/Tokyoの日付別manifest、destination snapshot、転送中progress/PID/log、ローカル容量・未同期容量・削除候補表示、同期・設定UIを追加しました。
+Generation.completed_atを優先したAsia/Tokyo基準の`YYYYMMDD_x1`／`YYYYMMDD_x4`保存先、永続upscale snapshotによる4倍判定、
+日付別manifest、destination snapshot、転送中progress/PID/log、ローカル容量・未同期容量・削除候補表示、同期・設定UIを追加しました。
 画像とsidecar JSONは検証後に`copyto`で順に保存し、partial failureでもローカルを削除しません。
 `rclone sync`、remote削除、複数Worker、自動retry、Driveからのdownloadは実装していません。
 0014はmanifest再構築要求の追加だけを行い、0013以前のGeneration／Artifact／MetadataImportデータを変更しません。

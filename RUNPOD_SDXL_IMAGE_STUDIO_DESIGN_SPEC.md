@@ -24,7 +24,7 @@ ComfyUI は高い柔軟性を持つ一方、スマートフォンから日常的
 - 生成キューを扱える
 - 同一条件・seed からアップスケールできる
 - 画像 metadata から条件を復元できる
-- 日付別、通常生成・アップスケール別に Google Drive へ保存する
+- Generation の Asia/Tokyo 基準の完了日と最終倍率により、Google Drive 直下を `YYYYMMDD_x1` / `YYYYMMDD_x4` に分類して保存する
 - 同期状態、ディスク容量、システム状態を確認できる
 - ブラウザ切断やアプリ再読込に耐える
 
@@ -514,13 +514,17 @@ data/
 
 ```text
 remote:RunPodSDXLImageStudio/
-└── YYYY-MM-DD/
-    ├── generated/
-    ├── upscaled/
-    └── manifests/
+├── YYYYMMDD_x1/
+│   └── <画像・sidecar JSON>
+└── YYYYMMDD_x4/
+    └── <画像・sidecar JSON>
 ```
 
-日付は Asia/Tokyo で決定する。
+画像とsidecar JSONは同じGenerationの同じフォルダへ保存する。フォルダの日付は
+アップロード時刻ではなく、Generation.completed_atを優先し、Asia/Tokyoへ変換して決定する。
+通常生成はFinal 4x upscaleだけを`x4`、それ以外を`x1`とし、アップスケールGenerationは
+永続化された倍率または入出力寸法が4倍の場合だけ`x4`へ分類する。2倍など4倍以外の倍率は`x1`とする。
+既存の集約manifestは従来どおり日付単位の同期対象として扱い、画像・sidecarの分類を変更しない。
 
 ### 14.3 ファイル名
 
@@ -744,7 +748,7 @@ runpod-sdxl-image-studio/
 - プリセットが使える
 - 生成キューが使える
 - 過去画像または metadata からアップスケールできる
-- 通常生成とアップスケールが日付別・別フォルダで GDrive に保存される
+- Google Drive上で完了日と最終倍率により`YYYYMMDD_x1` / `YYYYMMDD_x4`へ保存される
 - 同期失敗時にローカル画像を失わない
 - 横スクロールなしで主要操作が行える
 - システム状態と生成前チェックを確認できる

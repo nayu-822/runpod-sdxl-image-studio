@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
+from math import isclose
 from pathlib import PurePosixPath
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -260,19 +261,124 @@ def build_remote_paths(
     created_at: datetime,
     *,
     timezone_name: str = "Asia/Tokyo",
+    completed_at: datetime | None = None,
+    final_upscale: bool = False,
+    requested_scale_factor: float | None = None,
+    source_width: int | None = None,
+    source_height: int | None = None,
+    target_width: int | None = None,
+    target_height: int | None = None,
 ) -> DriveRemotePaths:
+    """Build deterministic remote paths from persisted generation evidence.
+
+    The folder date is based on the terminal completion time when available, while
+    the existing file-name timestamp continues to use ``created_at``.  The
+    ``x1``/``x4`` classification is deliberately derived from persisted snapshot
+    values supplied by the caller, never from current UI state.
+    """
+
     try:
-        local_datetime = utc(created_at).astimezone(ZoneInfo(timezone_name))
+        created_local_datetime = utc(created_at).astimezone(ZoneInfo(timezone_name))
+        folder_local_datetime = utc(completed_at or created_at).astimezone(ZoneInfo(timezone_name))
     except Exception as exc:
         raise ValueError("configured timezone is invalid") from exc
-    local_date = local_datetime.date().isoformat()
-    folder = "upscaled" if kind == "upscale" else "generated"
-    stem = f"{local_datetime:%Y%m%d_%H%M%S}_{generation_id.hex[:8]}"
+    local_date = folder_local_datetime.date().isoformat()
+    folder = build_google_drive_output_folder(
+        kind=kind,
+        created_at=created_at,
+        completed_at=completed_at,
+        final_upscale=final_upscale,
+        requested_scale_factor=requested_scale_factor,
+        source_width=source_width,
+        source_height=source_height,
+        target_width=target_width,
+        target_height=target_height,
+        timezone_name=timezone_name,
+    )
+    stem = f"{created_local_datetime:%Y%m%d_%H%M%S}_{generation_id.hex[:8]}"
     return DriveRemotePaths(
         local_date=local_date,
-        image_path=f"{local_date}/{folder}/{stem}.png",
-        metadata_path=f"{local_date}/{folder}/{stem}.json",
+        image_path=f"{folder}/{stem}.png",
+        metadata_path=f"{folder}/{stem}.json",
         manifest_path=f"{local_date}/manifests/manifest.jsonl",
+    )
+
+
+def build_google_drive_output_folder(
+    *,
+    kind: str,
+    created_at: datetime,
+    completed_at: datetime | None = None,
+    final_upscale: bool = False,
+    requested_scale_factor: float | None = None,
+    source_width: int | None = None,
+    source_height: int | None = None,
+    target_width: int | None = None,
+    target_height: int | None = None,
+    timezone_name: str = "Asia/Tokyo",
+) -> str:
+    """Return the flat ``YYYYMMDD_x1`` or ``YYYYMMDD_x4`` folder name.
+
+    Standard/derived generations use the persisted ``final_upscale`` flag,
+    whose product contract is Final 4x.  Upscale generations use their durable
+    factor or source/target dimensions.  Missing or non-4x evidence is classified
+    as ``x1`` rather than guessing from a current form value.
+    """
+
+    try:
+        local_datetime = utc(completed_at or created_at).astimezone(ZoneInfo(timezone_name))
+    except Exception as exc:
+        raise ValueError("configured timezone is invalid") from exc
+    kind_value = getattr(kind, "value", kind)
+    is_x4 = bool(final_upscale)
+    if kind_value == "upscale" and not is_x4:
+        is_x4 = _is_four_x_upscale(
+            requested_scale_factor,
+            source_width=source_width,
+            source_height=source_height,
+            target_width=target_width,
+            target_height=target_height,
+        )
+    suffix = "x4" if is_x4 else "x1"
+    return f"{local_datetime:%Y%m%d}_{suffix}"
+
+
+def remote_path_local_date(path: str) -> str:
+    """Extract an ISO local date from old and current remote path formats."""
+
+    prefix = path.replace("\\", "/").split("/", 1)[0]
+    if re.fullmatch(r"\d{8}_x[14]", prefix):
+        compact_date = f"{prefix[:4]}-{prefix[4:6]}-{prefix[6:8]}"
+        try:
+            return date.fromisoformat(compact_date).isoformat()
+        except ValueError as exc:
+            raise ValueError("remote path date is invalid") from exc
+    try:
+        return date.fromisoformat(prefix).isoformat()
+    except ValueError as exc:
+        raise ValueError("remote path date is invalid") from exc
+
+
+def _is_four_x_upscale(
+    requested_scale_factor: float | None,
+    *,
+    source_width: int | None,
+    source_height: int | None,
+    target_width: int | None,
+    target_height: int | None,
+) -> bool:
+    if requested_scale_factor is not None:
+        return isclose(requested_scale_factor, 4.0, rel_tol=0.0, abs_tol=1e-9)
+    if None in {source_width, source_height, target_width, target_height}:
+        return False
+    assert source_width is not None
+    assert source_height is not None
+    assert target_width is not None
+    assert target_height is not None
+    if source_width <= 0 or source_height <= 0:
+        return False
+    return isclose(target_width / source_width, 4.0, rel_tol=0.0, abs_tol=1e-9) and isclose(
+        target_height / source_height, 4.0, rel_tol=0.0, abs_tol=1e-9
     )
 
 
@@ -321,8 +427,10 @@ __all__ = [
     "DriveSyncRecord",
     "DriveSyncStatus",
     "SyncRecord",
+    "build_google_drive_output_folder",
     "build_remote_paths",
     "build_remote_image_path",
+    "remote_path_local_date",
     "validate_remote_base_path",
     "validate_remote_name",
     "validate_remote_relative_path",

@@ -44,6 +44,8 @@ from runpod_sdxl_image_studio.domain.generation import GenerationKind
 from runpod_sdxl_image_studio.domain.generation_artifact import ArtifactType, GenerationArtifact
 from runpod_sdxl_image_studio.domain.generation_settings import GenerationSettings
 from runpod_sdxl_image_studio.domain.generation_snapshot import GenerationSettingsSnapshot
+from runpod_sdxl_image_studio.domain.upscale import UpscaleMethod, UpscaleSizingMode
+from runpod_sdxl_image_studio.domain.upscale_snapshot import UpscaleSettingsSnapshot
 from runpod_sdxl_image_studio.jobs.drive_sync_worker import DriveSyncWorker
 from runpod_sdxl_image_studio.services.drive_sync_service import (
     DriveSyncService,
@@ -102,7 +104,7 @@ def _png() -> bytes:
     return output.getvalue()
 
 
-def _settings() -> GenerationSettings:
+def _settings(*, final_upscale: bool = False) -> GenerationSettings:
     return GenerationSettings(
         positive_prompt="a cat",
         negative_prompt="",
@@ -114,6 +116,8 @@ def _settings() -> GenerationSettings:
         sampler_name="euler",
         scheduler_name="normal",
         checkpoint_name="sdxl.safetensors",
+        final_upscale=final_upscale,
+        final_upscale_model="4x-UltraSharp.pth" if final_upscale else None,
     )
 
 
@@ -189,7 +193,24 @@ class FakeDriveAdapter:
         self.remote_files[(destination, relative_remote_path)] = local_path.read_bytes()
 
 
-def _fixture(tmp_path: Path, *, adapter: FakeDriveAdapter | None = None):
+class FakeUpscaleSettingsRepository:
+    def __init__(self, snapshot: UpscaleSettingsSnapshot) -> None:
+        self.snapshot = snapshot
+
+    def get_by_generation(self, generation_id: UUID) -> UpscaleSettingsSnapshot | None:
+        return self.snapshot if self.snapshot.source_generation_id == generation_id else None
+
+
+def _fixture(
+    tmp_path: Path,
+    *,
+    adapter: FakeDriveAdapter | None = None,
+    kind: GenerationKind = GenerationKind.STANDARD,
+    created_at: datetime | None = None,
+    completed_at: datetime | None = None,
+    generation_settings: GenerationSettings | None = None,
+    upscale_factor: float | None = None,
+):
     engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
     factory = create_session_factory(engine)
@@ -201,13 +222,15 @@ def _fixture(tmp_path: Path, *, adapter: FakeDriveAdapter | None = None):
         max_output_image_bytes=1_000_000,
         max_metadata_sidecar_bytes=1_000_000,
     )
-    created_at = datetime(2026, 8, 7, 15, 30, tzinfo=UTC)
+    created_at = created_at or datetime(2026, 8, 7, 15, 30, tzinfo=UTC)
+    completed_at = completed_at or created_at
+    generation_settings = generation_settings or _settings()
     generation_id, job_id = uuid4(), uuid4()
     GenerationStartRepository(factory).create_pending(
-        GenerationSettingsSnapshot.from_settings(_settings()),
+        GenerationSettingsSnapshot.from_settings(generation_settings),
         generation_id=generation_id,
         job_id=job_id,
-        kind=GenerationKind.STANDARD,
+        kind=kind,
         parent_generation_id=None,
         created_at=created_at,
     )
@@ -230,12 +253,12 @@ def _fixture(tmp_path: Path, *, adapter: FakeDriveAdapter | None = None):
     artifacts = GenerationArtifactRepository(factory)
     artifacts.add(image)
     GenerationCompletionRepository(factory).complete_generation(
-        generation_id, job_id, image, created_at
+        generation_id, job_id, image, completed_at
     )
     metadata_payload = {
         "schema_version": 1,
         "generation_id": str(generation_id),
-        "kind": "standard",
+        "kind": kind.value,
         "settings": {"seed": 42},
     }
     metadata_bytes = json.dumps(metadata_payload, separators=(",", ":")).encode("utf-8")
@@ -255,12 +278,35 @@ def _fixture(tmp_path: Path, *, adapter: FakeDriveAdapter | None = None):
     )
     artifacts.add(metadata)
     fake = adapter or FakeDriveAdapter()
+    upscale_settings_repository = None
+    if kind is GenerationKind.UPSCALE:
+        if upscale_factor is None:
+            raise ValueError("upscale_factor is required for upscale fixture")
+        target_size = int(64 * upscale_factor)
+        upscale_settings_repository = FakeUpscaleSettingsRepository(
+            UpscaleSettingsSnapshot(
+                method=UpscaleMethod.IMAGE,
+                sizing_mode=UpscaleSizingMode.FACTOR,
+                requested_scale_factor=upscale_factor,
+                target_width=target_size,
+                target_height=target_size,
+                upscaler_name="upscalers/test.pth",
+                source_generation_id=generation_id,
+                source_artifact_id=image.id,
+                source_sha256=image.sha256,
+                source_width=image.width,
+                source_height=image.height,
+                workflow_template_id="sdxl_image_upscale",
+                workflow_template_version="1.0",
+            )
+        )
     service = DriveSyncService(
         DriveSyncRepository(factory),
         GenerationRepository(factory),
         artifacts,
         settings,
         fake,
+        upscale_settings_repository=upscale_settings_repository,
     )
     return service, DriveSyncRepository(factory), generation_id, image_path, metadata_path, fake
 
@@ -308,8 +354,8 @@ def test_drive_sync_success_copies_image_metadata_and_manifest(tmp_path: Path) -
     assert asyncio.run(service.process_manifest_job(manifest_job, "worker-1")) is not None
 
     assert [path for _, _, path in adapter.calls] == [
-        "2026-08-08/generated/20260808_003000_" + generation_id.hex[:8] + ".png",
-        "2026-08-08/generated/20260808_003000_" + generation_id.hex[:8] + ".json",
+        "20260808_x1/20260808_003000_" + generation_id.hex[:8] + ".png",
+        "20260808_x1/20260808_003000_" + generation_id.hex[:8] + ".json",
         "2026-08-08/manifests/manifest.jsonl",
     ]
     assert image_path.exists()
@@ -318,6 +364,96 @@ def test_drive_sync_success_copies_image_metadata_and_manifest(tmp_path: Path) -
     assert manifest.exists()
     assert str(generation_id) in manifest.read_text(encoding="utf-8")
     assert "prompt" not in manifest.read_text(encoding="utf-8")
+
+
+def test_drive_sync_uses_final_upscale_snapshot_for_x4_folder(tmp_path: Path) -> None:
+    service, repository, generation_id, _, _, adapter = _fixture(
+        tmp_path,
+        generation_settings=_settings(final_upscale=True),
+    )
+
+    record = service.enqueue_generation(generation_id)
+
+    assert record is not None
+    expected_stem = "20260808_003000_" + generation_id.hex[:8]
+    assert record.remote_image_path == f"20260808_x4/{expected_stem}.png"
+    assert record.remote_metadata_path == f"20260808_x4/{expected_stem}.json"
+    claimed = repository.claim_next("worker-1", 120)
+    assert claimed is not None
+    assert asyncio.run(service.process_job(claimed, "worker-1")) is not None
+    assert [path for _, _, path in adapter.calls[:2]] == [
+        record.remote_image_path,
+        record.remote_metadata_path,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("kind", "upscale_factor", "expected_folder"),
+    [
+        (GenerationKind.STANDARD, None, "20260808_x1"),
+        (GenerationKind.UPSCALE, 2.0, "20260808_x1"),
+        (GenerationKind.UPSCALE, 4.0, "20260808_x4"),
+    ],
+)
+def test_drive_sync_classifies_persisted_generation_kind_and_upscale_factor(
+    tmp_path: Path,
+    kind: GenerationKind,
+    upscale_factor: float | None,
+    expected_folder: str,
+) -> None:
+    service, _, generation_id, _, _, _ = _fixture(
+        tmp_path,
+        kind=kind,
+        upscale_factor=upscale_factor,
+    )
+
+    record = service.enqueue_generation(generation_id)
+
+    assert record is not None
+    assert record.remote_image_path.startswith(f"{expected_folder}/")
+    assert record.remote_metadata_path.startswith(f"{expected_folder}/")
+
+
+def test_drive_sync_uses_tokyo_completion_date_not_upload_date_or_utc_date(
+    tmp_path: Path,
+) -> None:
+    service, _, generation_id, _, _, _ = _fixture(
+        tmp_path,
+        created_at=datetime(2026, 8, 21, 15, 30, tzinfo=UTC),
+        completed_at=datetime(2026, 8, 21, 15, 45, tzinfo=UTC),
+    )
+
+    record = service.enqueue_generation(generation_id)
+
+    assert record is not None
+    assert record.remote_image_path.startswith("20260822_x1/")
+    assert record.remote_metadata_path.startswith("20260822_x1/")
+    assert "20260821_" not in record.remote_image_path
+
+
+def test_drive_sync_retry_and_resync_keep_the_same_generation_folder(tmp_path: Path) -> None:
+    service, repository, generation_id, _, _, adapter = _fixture(
+        tmp_path,
+        created_at=datetime(2026, 8, 21, 15, 30, tzinfo=UTC),
+        completed_at=datetime(2026, 8, 21, 15, 45, tzinfo=UTC),
+    )
+    initial = service.enqueue_generation(generation_id)
+    assert initial is not None
+    assert initial.remote_image_path.startswith("20260822_x1/")
+    first_job = repository.claim_next("worker-1", 120)
+    assert first_job is not None
+    assert asyncio.run(service.process_job(first_job, "worker-1")) is not None
+    manifest_job = repository.claim_next_manifest("worker-1", 120)
+    assert manifest_job is not None
+    assert asyncio.run(service.process_manifest_job(manifest_job, "worker-1")) is not None
+
+    retried, retry_job = service.retry_generation(generation_id, resync=True)
+
+    assert retry_job is not None
+    assert retried.remote_image_path == initial.remote_image_path
+    assert retried.remote_metadata_path == initial.remote_metadata_path
+    assert retried.remote_image_path.startswith("20260822_x1/")
+    assert adapter.calls[-1][2] == manifest_job.remote_manifest_path
 
 
 def test_drive_sync_transfers_all_ordered_images_and_manifest_entries(tmp_path: Path) -> None:
@@ -404,6 +540,8 @@ def test_drive_sync_retry_resumes_after_partial_multi_image_failure(tmp_path: Pa
     retried, retry_job = service.retry_generation(generation_id)
     assert retried.status is DriveSyncStatus.PENDING
     assert retry_job is not None
+    assert retried.remote_image_path == pending.remote_image_path
+    assert retried.remote_metadata_path == pending.remote_metadata_path
     claimed_retry = repository.claim_next("worker-1", 120)
     assert claimed_retry is not None
     completed = asyncio.run(service.process_job(claimed_retry, "worker-1"))
@@ -573,7 +711,7 @@ def test_rclone_adapter_uses_argument_array_copyto_without_sync(tmp_path: Path) 
     command = GoogleDriveAdapter(settings).build_copy_command(
         tmp_path / "image.png",
         DriveDestination("drive", "studio"),
-        "2026-08-08/generated/image.png",
+        "20260808_x1/image.png",
     )
     assert command[0] == "rclone"
     assert "--config" in command
@@ -1197,7 +1335,7 @@ def test_connection_timeout_is_separate_from_transfer_and_progress_is_streamed(
         adapter.copy_file(
             tmp_path / "image.png",
             DriveDestination("drive", "studio"),
-            "2026-08-08/generated/image.png",
+            "20260808_x1/image.png",
             progress_callback=progress.append,
             total_bytes=4,
             process_started_callback=started.append,

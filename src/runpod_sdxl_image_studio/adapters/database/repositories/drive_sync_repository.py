@@ -34,6 +34,7 @@ from runpod_sdxl_image_studio.domain.drive_sync import (
     DriveSyncProgress,
     DriveSyncRecord,
     DriveSyncStatus,
+    remote_path_local_date,
     utc,
 )
 from runpod_sdxl_image_studio.domain.generation import GenerationStatus
@@ -792,7 +793,11 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
                 ).all()
                 for row in rows:
                     generation = session.get(GenerationModel, row.generation_id)
-                    if generation is None or _tokyo_date(generation.created_at) != local_date:
+                    if (
+                        generation is None
+                        or _tokyo_date(generation.completed_at or generation.created_at)
+                        != local_date
+                    ):
                         continue
                     if summary is None:
                         if row.error_code == "drive_manifest_failed":
@@ -864,6 +869,7 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
                         DriveSyncRecordModel.remote_name,
                         DriveSyncRecordModel.remote_base_path,
                         GenerationModel.created_at,
+                        GenerationModel.completed_at,
                     )
                     .join(
                         GenerationModel,
@@ -874,8 +880,8 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
                         DriveSyncRecordModel.error_code == "drive_manifest_failed",
                     )
                 ).all()
-                for remote_name, remote_base_path, created_at in warning_rows:
-                    local_date = _tokyo_date(created_at)
+                for remote_name, remote_base_path, created_at, completed_at in warning_rows:
+                    local_date = _tokyo_date(completed_at or created_at)
                     key = (local_date, remote_name, remote_base_path)
                     targets.setdefault(
                         key,
@@ -1109,6 +1115,7 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
                         DriveSyncRecordModel,
                         GenerationModel.kind,
                         GenerationModel.created_at,
+                        GenerationModel.completed_at,
                     )
                     .join(
                         GenerationModel,
@@ -1122,8 +1129,8 @@ class DriveSyncRepository(DriveSyncRepositoryProtocol):
                     .order_by(GenerationModel.created_at.asc(), GenerationModel.id.asc())
                 ).all()
                 result: list[DriveManifestRecord] = []
-                for record, kind, created_at in rows:
-                    local = _utc(created_at).astimezone(_tokyo()).date().isoformat()
+                for record, kind, created_at, completed_at in rows:
+                    local = _tokyo_date(completed_at or created_at)
                     if (
                         local != local_date
                         or record.metadata_sha256 is None
@@ -1286,19 +1293,14 @@ def _manifest_state_in_session(
 
 
 def _manifest_local_date_from_record(row: DriveSyncRecordModel) -> str:
-    image_date = _remote_path_date_prefix(row.remote_image_path)
-    metadata_date = _remote_path_date_prefix(row.remote_metadata_path)
+    try:
+        image_date = remote_path_local_date(row.remote_image_path)
+        metadata_date = remote_path_local_date(row.remote_metadata_path)
+    except ValueError as exc:
+        raise DriveManifestRebuildRequired("sync record remote date is invalid") from exc
     if image_date != metadata_date:
         raise DriveManifestRebuildRequired("sync record remote dates are inconsistent")
     return image_date
-
-
-def _remote_path_date_prefix(path: str) -> str:
-    prefix = path.replace("\\", "/").split("/", 1)[0]
-    try:
-        return date.fromisoformat(prefix).isoformat()
-    except ValueError as exc:
-        raise DriveManifestRebuildRequired("sync record remote date is invalid") from exc
 
 
 def _record_model(record: DriveSyncRecord) -> DriveSyncRecordModel:
