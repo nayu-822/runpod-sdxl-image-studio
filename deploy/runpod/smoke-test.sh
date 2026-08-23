@@ -35,6 +35,15 @@ if major >= 6:
 
 command -v rclone >/dev/null 2>&1 || fail "rclone is unavailable"
 rclone version >/dev/null 2>&1 || fail "rclone could not report its version"
+if ! rclone help flags --name use-json-log | grep -F -- "--use-json-log" >/dev/null; then
+    fail "rclone does not support --use-json-log"
+fi
+if ! rclone help flags --name stats | grep -F -- "--stats Duration" >/dev/null; then
+    fail "rclone does not support --stats"
+fi
+if rclone help flags --name stats | grep -F -- "--stats-one-line-json" >/dev/null; then
+    fail "unsupported --stats-one-line-json flag is available instead of the JSON log mode"
+fi
 
 temporary_root="$(mktemp -d)" || fail "temporary directory could not be created"
 trap 'rm -rf -- "$temporary_root"' EXIT

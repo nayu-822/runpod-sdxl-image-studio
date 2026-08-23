@@ -314,6 +314,40 @@ def test_state_backup_failure_does_not_leave_local_snapshot(tmp_path: Path) -> N
     engine.dispose()
 
 
+def test_state_backup_advances_version_only_after_all_uploads_succeed(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, state_sync_debounce_seconds=600)
+    engine, _ = _create_state_database(settings)
+    storage = _FakeStateStorage()
+    service = StateSyncService(
+        settings,
+        storage=storage,  # type: ignore[arg-type]
+        snapshot_service=StateSnapshotService(settings, now_factory=lambda: NOW),
+        now_factory=lambda: NOW,
+    )
+
+    service.mark_dirty()
+    first = asyncio.run(service.backup())
+
+    assert first.status is StateSyncStatus.SYNCED
+    assert service.dirty_version == 1
+    assert service.backed_up_version == 1
+    assert service.is_clean is True
+
+    _change_state_probe(settings, "failed-second-backup")
+    service.mark_dirty()
+    storage.fail_upload = True
+    result = asyncio.run(service.backup())
+
+    assert result.status is StateSyncStatus.FAILED
+    assert service.dirty_version == 2
+    assert service.backed_up_version == 1
+    assert service.is_clean is False
+
+    storage.fail_upload = False
+    service.close()
+    engine.dispose()
+
+
 def test_second_backup_metadata_failure_preserves_previous_restore_point(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     engine, _ = _create_state_database(settings)

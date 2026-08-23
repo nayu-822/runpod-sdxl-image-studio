@@ -20,6 +20,7 @@ from runpod_sdxl_image_studio.adapters.database.repositories.model_transfer_repo
 from runpod_sdxl_image_studio.adapters.rclone.remote_model_catalog import (
     RemoteModelAdapterError,
     RemoteModelCatalogAdapter,
+    _progress_from_line,
 )
 from runpod_sdxl_image_studio.config import Settings
 from runpod_sdxl_image_studio.domain.model_transfer import (
@@ -198,6 +199,22 @@ def test_remote_catalog_filters_unsafe_and_non_model_entries(tmp_path: Path) -> 
     ]
     assert "drive:SDXLModels/loras/characters/example.safetensors" in commands[0]
     assert "drive:SDXLModels/loras/styles/example.safetensors" in commands[1]
+    for command in commands:
+        assert "--stats-one-line-json" not in command
+        assert "--use-json-log" in command
+        assert command[-2:] == ("--stats", "1s")
+
+
+def test_remote_model_progress_parser_supports_rclone_json_log_stats() -> None:
+    result = _progress_from_line(
+        '{"level":"notice","stats":{"bytes":100,"totalBytes":200}}',
+        1000,
+    )
+
+    assert result is not None
+    assert result.progress_bytes == 100
+    assert result.total_bytes == 200
+    assert result.progress_percentage == 50.0
 
 
 def test_remote_catalog_treats_missing_category_as_empty_but_not_auth_failure(

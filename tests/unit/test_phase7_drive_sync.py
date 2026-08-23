@@ -35,7 +35,11 @@ from runpod_sdxl_image_studio.adapters.database.repositories.generation_start_re
 from runpod_sdxl_image_studio.adapters.database.repositories.upscale_settings_repository import (
     UpscaleSettingsRepository,
 )
-from runpod_sdxl_image_studio.adapters.drive.google_drive_adapter import GoogleDriveAdapter
+from runpod_sdxl_image_studio.adapters.drive.google_drive_adapter import (
+    GoogleDriveAdapter,
+    GoogleDriveAdapterError,
+    _progress_from_line,
+)
 from runpod_sdxl_image_studio.config import Settings
 from runpod_sdxl_image_studio.domain.drive_sync import (
     DriveConnectionStatus,
@@ -902,7 +906,42 @@ def test_rclone_adapter_uses_argument_array_copyto_without_sync(tmp_path: Path) 
     assert str(settings.rclone_config) in command
     assert "copyto" in command
     assert "sync" not in command
-    assert "--stats-one-line-json" in command
+    assert "--stats-one-line-json" not in command
+    assert "--use-json-log" in command
+    assert command[-2:] == ("--stats", "1s")
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        (
+            '{"level":"notice","msg":"stats","stats":{"bytes":100,"totalBytes":200}}',
+            (100, 200, 50.0),
+        ),
+        ('{"bytes":100,"totalBytes":200,"percentage":25}', (100, 200, 25.0)),
+        ('{"level":"info","msg":"Copied (new)"}', None),
+        ("not json", None),
+        ('{"stats":{"bytes":"100","totalBytes":200}}', None),
+        ('{"stats":{"bytes":-1,"totalBytes":200}}', None),
+        ('{"stats":{"bytes":100}}', (100, 1000, 10.0)),
+        ('{"stats":{"bytes":300,"totalBytes":200}}', (300, 300, 100.0)),
+        ('{"stats":{"bytes":100,"totalBytes":200,"percentage":150}}', (100, 200, 100.0)),
+        ('{"stats":{"bytes":100,"totalBytes":200,"percentage":-10}}', (100, 200, 0.0)),
+        ('{"stats":{"bytes":100,"totalBytes":200,"percentage":NaN}}', None),
+        ('{"stats":{"bytes":100,"totalBytes":200,"percentage":Infinity}}', None),
+    ],
+)
+def test_rclone_json_progress_parser_supports_nested_and_legacy_stats(
+    line: str, expected: tuple[int, int, float] | None
+) -> None:
+    result = _progress_from_line(line, 1000, "image")
+    if expected is None:
+        assert result is None
+        return
+
+    assert result is not None
+    assert (result.progress_bytes, result.total_bytes, result.progress_percentage) == expected
+    assert result.current_artifact == "image"
 
 
 def test_pending_job_uses_destination_snapshot_after_settings_change(tmp_path: Path) -> None:
@@ -1486,6 +1525,122 @@ class _SlowProcess:
     def kill(self) -> None:
         self.killed = True
         self.returncode = -9
+
+
+class _CompletedProcess:
+    def __init__(
+        self,
+        *,
+        returncode: int,
+        stdout_lines: tuple[bytes, ...] = (),
+        stderr_lines: tuple[bytes, ...] = (),
+    ) -> None:
+        self.pid = 9899
+        self.returncode = returncode
+        self.stdout = _FakeStream(stdout_lines)
+        self.stderr = _FakeStream(stderr_lines)
+        self.killed = False
+
+    async def wait(self) -> int:
+        return self.returncode
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+
+def _drive_adapter_settings(tmp_path: Path) -> Settings:
+    return Settings(
+        _env_file=None,
+        data_dir=tmp_path,
+        rclone_remote="drive",
+        rclone_base_path="studio",
+        rclone_config=tmp_path / "rclone.conf",
+    )
+
+
+def test_copy_file_nonzero_rclone_exit_raises_safe_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    process = _CompletedProcess(
+        returncode=1,
+        stderr_lines=(b"Error: unknown flag: --stats-one-line-json\n",),
+    )
+
+    async def create_process(*args, **kwargs):
+        del args, kwargs
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    adapter = GoogleDriveAdapter(_drive_adapter_settings(tmp_path))
+
+    with pytest.raises(GoogleDriveAdapterError) as caught:
+        asyncio.run(
+            adapter.copy_file(
+                tmp_path / "image.png",
+                DriveDestination("drive", "studio"),
+                "20260808_x1/image.png",
+            )
+        )
+
+    assert caught.value.code == DriveSyncErrorCode.TRANSFER_FAILED.value
+
+
+def test_copy_file_executable_not_found_raises_stable_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def create_process(*args, **kwargs):
+        del args, kwargs
+        raise FileNotFoundError("rclone")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    adapter = GoogleDriveAdapter(_drive_adapter_settings(tmp_path))
+
+    with pytest.raises(GoogleDriveAdapterError) as caught:
+        asyncio.run(
+            adapter.copy_file(
+                tmp_path / "image.png",
+                DriveDestination("drive", "studio"),
+                "20260808_x1/image.png",
+            )
+        )
+
+    assert caught.value.code == DriveSyncErrorCode.RCLONE_NOT_FOUND.value
+
+
+def test_progress_callback_failure_does_not_fail_successful_transfer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    process = _CompletedProcess(
+        returncode=0,
+        stdout_lines=(b'{"level":"notice","stats":{"bytes":1,"totalBytes":4}}\n',),
+    )
+
+    async def create_process(*args, **kwargs):
+        del args, kwargs
+        return process
+
+    callback_calls: list[DriveSyncProgress] = []
+
+    def progress_callback(progress: DriveSyncProgress) -> None:
+        callback_calls.append(progress)
+        raise RuntimeError("progress persistence failed")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    adapter = GoogleDriveAdapter(_drive_adapter_settings(tmp_path))
+
+    asyncio.run(
+        adapter.copy_file(
+            tmp_path / "image.png",
+            DriveDestination("drive", "studio"),
+            "20260808_x1/image.png",
+            progress_callback=progress_callback,
+            total_bytes=4,
+        )
+    )
+
+    assert len(callback_calls) == 1
+    assert process.returncode == 0
 
 
 def test_connection_timeout_is_separate_from_transfer_and_progress_is_streamed(

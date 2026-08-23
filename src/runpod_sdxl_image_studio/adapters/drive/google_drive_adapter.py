@@ -7,7 +7,7 @@ import contextlib
 import json
 import logging
 import math
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path, PurePosixPath
 
 from runpod_sdxl_image_studio.config import Settings
@@ -59,7 +59,7 @@ class GoogleDriveAdapter:
             "copyto",
             str(local_path),
             self._remote_path(destination, safe_relative),
-            "--stats-one-line-json",
+            "--use-json-log",
             "--stats",
             "1s",
         )
@@ -373,48 +373,63 @@ def _progress_from_line(
         value = json.loads(line)
     except (TypeError, ValueError, json.JSONDecodeError):
         return None
-    if not isinstance(value, dict):
+    if not isinstance(value, Mapping):
         return None
-    raw_bytes = value.get("bytes")
-    raw_total = value.get("totalBytes")
-    raw_percentage = value.get("percentage")
-    if not isinstance(raw_bytes, (int, float)) or isinstance(raw_bytes, bool):
+
+    raw_stats = value.get("stats")
+    if raw_stats is None:
+        stats: Mapping[str, object] = value
+    elif isinstance(raw_stats, Mapping):
+        stats = raw_stats
+    else:
+        return None
+
+    raw_bytes = stats.get("bytes")
+    progress_bytes = _coerce_counter(raw_bytes)
+    if progress_bytes is None:
+        return None
+
+    raw_total = stats.get("totalBytes")
+    resolved_total_from_stats: int | None = None
+    if isinstance(raw_total, (int, float)) and not isinstance(raw_total, bool):
+        resolved_total_from_stats = _coerce_counter(raw_total)
+        if resolved_total_from_stats is None:
+            return None
+
+    raw_percentage = stats.get("percentage")
+    percentage: float | None = None
+    if isinstance(raw_percentage, (int, float)) and not isinstance(raw_percentage, bool):
+        try:
+            percentage = float(raw_percentage)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(percentage):
+            return None
+
+    resolved_total = resolved_total_from_stats or max(total_bytes, 0)
+    resolved_total = max(resolved_total, progress_bytes)
+    if percentage is None:
+        percentage = progress_bytes * 100.0 / resolved_total if resolved_total else 0.0
+    return DriveSyncProgress(
+        progress_bytes,
+        resolved_total,
+        max(0.0, min(100.0, percentage)),
+        current_artifact,
+    )
+
+
+def _coerce_counter(value: object) -> int | None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
         return None
     try:
-        numeric_values = [raw_bytes]
-        if isinstance(raw_total, (int, float)) and not isinstance(raw_total, bool):
-            numeric_values.append(raw_total)
-        if isinstance(raw_percentage, (int, float)) and not isinstance(raw_percentage, bool):
-            numeric_values.append(raw_percentage)
-        if any(isinstance(value, float) and not math.isfinite(value) for value in numeric_values):
+        if isinstance(value, float) and not math.isfinite(value):
             return None
-        progress_bytes = int(raw_bytes)
-        if progress_bytes < 0:
-            return None
-        resolved_total = (
-            int(raw_total)
-            if isinstance(raw_total, (int, float)) and not isinstance(raw_total, bool)
-            else total_bytes
-        )
-        if resolved_total <= 0:
-            resolved_total = max(total_bytes, progress_bytes)
-        resolved_total = max(resolved_total, progress_bytes)
-        percentage = (
-            float(raw_percentage)
-            if isinstance(raw_percentage, (int, float)) and not isinstance(raw_percentage, bool)
-            else min(100.0, progress_bytes * 100.0 / resolved_total)
-            if resolved_total
-            else 0.0
-        )
-        return DriveSyncProgress(
-            progress_bytes,
-            resolved_total,
-            max(0.0, min(100.0, percentage)),
-            current_artifact,
-        )
+        converted = int(value)
     except (TypeError, ValueError, OverflowError):
-        # Malformed progress must never turn an otherwise valid transfer into a failure.
         return None
+    if converted < 0 or converted != value:
+        return None
+    return converted
 
 
 _SAFE_ERROR_CODES = frozenset(

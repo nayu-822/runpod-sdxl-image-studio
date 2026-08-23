@@ -65,7 +65,7 @@ class RemoteModelCatalogAdapter:
             "copyto",
             self._remote_file_path(entry.kind, relative),
             str(destination),
-            "--stats-one-line-json",
+            "--use-json-log",
             "--stats",
             "1s",
         )
@@ -447,11 +447,13 @@ def _progress_from_line(line: str, total_bytes: int) -> ModelTransferProgress | 
     except json.JSONDecodeError:
         value = None
     if isinstance(value, Mapping):
-        progress_bytes = _int_value(value, "bytes", "bytesTransferred", "transferred")
-        percentage_value = value.get("percent", value.get("percentage"))
+        nested_stats = value.get("stats")
+        stats = nested_stats if isinstance(nested_stats, Mapping) else value
+        progress_bytes = _int_value(stats, "bytes", "bytesTransferred", "transferred")
+        percentage_value = stats.get("percent", stats.get("percentage"))
         if isinstance(percentage_value, (int, float)) and not isinstance(percentage_value, bool):
             percentage = float(percentage_value)
-        total_value = _int_value(value, "totalBytes", "total")
+        total_value = _int_value(stats, "totalBytes", "total")
         if total_value is not None and total_value > 0:
             total_bytes = total_value
     if percentage is None:
