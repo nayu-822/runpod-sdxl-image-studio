@@ -92,12 +92,41 @@ def test_smoke_test_covers_runtime_rclone_progress_flags() -> None:
 def test_deploy_workflow_is_fail_closed_for_untrusted_events() -> None:
     workflow = _read(DEPLOY_WORKFLOW)
 
+    assert "concurrency:" in workflow
+    assert "group: runpod-production-deploy" in workflow
+    assert "cancel-in-progress: true" in workflow
     assert "github.event_name == 'workflow_dispatch'" in workflow
     assert "github.ref == 'refs/heads/main'" in workflow
     assert "github.event.workflow_run.conclusion == 'success'" in workflow
     assert "github.event.workflow_run.event == 'push'" in workflow
     assert "github.event.workflow_run.head_branch == 'main'" in workflow
     assert "github.event.workflow_run.head_repository.full_name == github.repository" in workflow
+
+    freshness_index = workflow.index("\njobs:\n  freshness:")
+    verify_index = workflow.index("\n      - name: Verify deploy commit is current main")
+    deploy_index = workflow.index("\n  deploy:\n")
+    checkout_index = workflow.index("\n      - name: Check out repository")
+    login_index = workflow.index("\n      - name: Log in to Docker Hub")
+    build_index = workflow.index("\n      - name: Build and push Docker image")
+    template_index = workflow.index("\n      - name: Update RunPod template image")
+    assert freshness_index < verify_index < deploy_index < checkout_index
+    assert checkout_index < login_index < build_index < template_index
+
+    assert (
+        'main_ref_url="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/git/ref/heads/main"' in workflow
+    )
+    assert "TARGET_SHA: ${{ steps.version.outputs.sha }}" in workflow
+    assert 'echo "deploy=false" >> "$GITHUB_OUTPUT"' in workflow
+    assert "curl --fail --silent --show-error" in workflow
+    assert "set -Eeuo pipefail" in workflow
+    assert "needs: freshness" in workflow
+    assert "needs.freshness.outputs.deploy == 'true'" in workflow
+    assert "ref: ${{ needs.freshness.outputs.sha }}" in workflow
+
+    before_verify = workflow[:verify_index]
+    assert "DOCKERHUB_TOKEN" not in before_verify
+    assert "RUNPOD_API_KEY" not in before_verify
+    assert "docker/login-action" not in before_verify
 
 
 def test_dockerignore_excludes_runtime_state_and_models_but_keeps_examples() -> None:
