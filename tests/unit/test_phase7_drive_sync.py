@@ -908,7 +908,13 @@ def test_rclone_adapter_uses_argument_array_copyto_without_sync(tmp_path: Path) 
     assert "sync" not in command
     assert "--stats-one-line-json" not in command
     assert "--use-json-log" in command
-    assert command[-2:] == ("--stats", "1s")
+    assert command[-5:] == (
+        "--use-json-log",
+        "--stats",
+        "1s",
+        "--stats-log-level",
+        "NOTICE",
+    )
 
 
 @pytest.mark.parametrize(

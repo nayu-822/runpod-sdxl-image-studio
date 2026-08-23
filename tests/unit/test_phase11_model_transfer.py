@@ -201,8 +201,13 @@ def test_remote_catalog_filters_unsafe_and_non_model_entries(tmp_path: Path) -> 
     assert "drive:SDXLModels/loras/styles/example.safetensors" in commands[1]
     for command in commands:
         assert "--stats-one-line-json" not in command
-        assert "--use-json-log" in command
-        assert command[-2:] == ("--stats", "1s")
+        assert command[-5:] == (
+            "--use-json-log",
+            "--stats",
+            "1s",
+            "--stats-log-level",
+            "NOTICE",
+        )
 
 
 def test_remote_model_progress_parser_supports_rclone_json_log_stats() -> None:

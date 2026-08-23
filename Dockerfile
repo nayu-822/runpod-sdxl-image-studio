@@ -44,6 +44,10 @@ RUN set -eux; \
     rclone version; \
     rm -rf /tmp/rclone
 
+# Fail the image build if the installed runtime, migrations, or rclone
+# compatibility checks do not pass.
+RUN /opt/image-studio/deploy/runpod/smoke-test.sh
+
 EXPOSE 7860
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30m --retries=3 \

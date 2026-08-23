@@ -62,6 +62,8 @@ class GoogleDriveAdapter:
             "--use-json-log",
             "--stats",
             "1s",
+            "--stats-log-level",
+            "NOTICE",
         )
 
     def build_copy_from_remote_command(

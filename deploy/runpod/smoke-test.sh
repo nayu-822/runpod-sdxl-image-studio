@@ -41,8 +41,8 @@ fi
 if ! rclone help flags --name stats | grep -F -- "--stats Duration" >/dev/null; then
     fail "rclone does not support --stats"
 fi
-if rclone help flags --name stats | grep -F -- "--stats-one-line-json" >/dev/null; then
-    fail "unsupported --stats-one-line-json flag is available instead of the JSON log mode"
+if ! rclone help flags --name stats-log-level | grep -F -- "--stats-log-level" >/dev/null; then
+    fail "rclone does not support --stats-log-level"
 fi
 
 temporary_root="$(mktemp -d)" || fail "temporary directory could not be created"

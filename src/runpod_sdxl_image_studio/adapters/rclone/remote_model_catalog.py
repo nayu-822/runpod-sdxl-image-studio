@@ -68,6 +68,8 @@ class RemoteModelCatalogAdapter:
             "--use-json-log",
             "--stats",
             "1s",
+            "--stats-log-level",
+            "NOTICE",
         )
 
     async def list_catalog(self) -> RemoteModelCatalog:

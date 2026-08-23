@@ -14,6 +14,7 @@ DOCKERIGNORE = REPOSITORY_ROOT / ".dockerignore"
 BOOTSTRAP = REPOSITORY_ROOT / "deploy" / "runpod" / "bootstrap.sh"
 SMOKE_TEST = REPOSITORY_ROOT / "deploy" / "runpod" / "smoke-test.sh"
 TEMPLATE = REPOSITORY_ROOT / "deploy" / "runpod" / "template.env.example"
+DEPLOY_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "deploy-docker.yml"
 
 
 def _read(path: Path) -> str:
@@ -76,6 +77,27 @@ def test_dockerfile_clears_base_entrypoint_and_starts_bootstrap() -> None:
     assert "COPY . " not in dockerfile
     assert "http://127.0.0.1:7860/" in dockerfile
     assert "--start-period=30m" in dockerfile
+    assert "RUN /opt/image-studio/deploy/runpod/smoke-test.sh" in dockerfile
+
+
+def test_smoke_test_covers_runtime_rclone_progress_flags() -> None:
+    smoke_test = _read(SMOKE_TEST)
+
+    assert "--use-json-log" in smoke_test
+    assert "--stats Duration" in smoke_test
+    assert "--stats-log-level" in smoke_test
+    assert "--stats-one-line-json" not in smoke_test
+
+
+def test_deploy_workflow_is_fail_closed_for_untrusted_events() -> None:
+    workflow = _read(DEPLOY_WORKFLOW)
+
+    assert "github.event_name == 'workflow_dispatch'" in workflow
+    assert "github.ref == 'refs/heads/main'" in workflow
+    assert "github.event.workflow_run.conclusion == 'success'" in workflow
+    assert "github.event.workflow_run.event == 'push'" in workflow
+    assert "github.event.workflow_run.head_branch == 'main'" in workflow
+    assert "github.event.workflow_run.head_repository.full_name == github.repository" in workflow
 
 
 def test_dockerignore_excludes_runtime_state_and_models_but_keeps_examples() -> None:
