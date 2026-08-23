@@ -11,10 +11,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: runpod-production-deploy
-  cancel-in-progress: true
-
 jobs:
   freshness:
     if: >-
@@ -92,6 +88,10 @@ jobs:
     if: >-
       needs.freshness.result == 'success' &&
       needs.freshness.outputs.deploy == 'true'
+
+    concurrency:
+      group: runpod-production-deploy
+      cancel-in-progress: true
 
     runs-on: ubuntu-latest
 

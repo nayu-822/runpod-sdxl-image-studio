@@ -92,9 +92,6 @@ def test_smoke_test_covers_runtime_rclone_progress_flags() -> None:
 def test_deploy_workflow_is_fail_closed_for_untrusted_events() -> None:
     workflow = _read(DEPLOY_WORKFLOW)
 
-    assert "concurrency:" in workflow
-    assert "group: runpod-production-deploy" in workflow
-    assert "cancel-in-progress: true" in workflow
     assert "github.event_name == 'workflow_dispatch'" in workflow
     assert "github.ref == 'refs/heads/main'" in workflow
     assert "github.event.workflow_run.conclusion == 'success'" in workflow
@@ -105,11 +102,24 @@ def test_deploy_workflow_is_fail_closed_for_untrusted_events() -> None:
     freshness_index = workflow.index("\njobs:\n  freshness:")
     verify_index = workflow.index("\n      - name: Verify deploy commit is current main")
     deploy_index = workflow.index("\n  deploy:\n")
+    jobs_header_index = workflow.index("\njobs:\n")
+    deploy_concurrency = (
+        "\n    concurrency:\n"
+        "      group: runpod-production-deploy\n"
+        "      cancel-in-progress: true\n"
+    )
+    deploy_concurrency_index = workflow.index(deploy_concurrency, deploy_index)
+    deploy_runs_on_index = workflow.index("\n    runs-on: ubuntu-latest", deploy_index)
     checkout_index = workflow.index("\n      - name: Check out repository")
     login_index = workflow.index("\n      - name: Log in to Docker Hub")
     build_index = workflow.index("\n      - name: Build and push Docker image")
     template_index = workflow.index("\n      - name: Update RunPod template image")
     assert freshness_index < verify_index < deploy_index < checkout_index
+    assert "concurrency:" not in workflow[:jobs_header_index]
+    assert "runpod-production-deploy" not in workflow[:jobs_header_index]
+    assert "concurrency:" not in workflow[freshness_index:deploy_index]
+    assert "runpod-production-deploy" not in workflow[freshness_index:deploy_index]
+    assert deploy_index < deploy_concurrency_index < deploy_runs_on_index
     assert checkout_index < login_index < build_index < template_index
 
     assert (
