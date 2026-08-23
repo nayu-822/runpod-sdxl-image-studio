@@ -1,0 +1,160 @@
+name: Publish Docker and update RunPod template
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_branch == 'main'
+      )
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve commit SHA
+        id: version
+        shell: bash
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_run" ]; then
+            SHA="${{ github.event.workflow_run.head_sha }}"
+          else
+            SHA="$GITHUB_SHA"
+          fi
+
+          SHORT_SHA="${SHA:0:7}"
+
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+
+          echo "Deploying commit $SHORT_SHA"
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.version.outputs.sha }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ vars.DOCKERHUB_USERNAME }}/${{ vars.DOCKERHUB_REPOSITORY }}:latest
+            ${{ vars.DOCKERHUB_USERNAME }}/${{ vars.DOCKERHUB_REPOSITORY }}:${{ steps.version.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Update RunPod template image
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          RUNPOD_TEMPLATE_ID: ${{ vars.RUNPOD_TEMPLATE_ID }}
+          IMAGE_NAME: ${{ vars.DOCKERHUB_USERNAME }}/${{ vars.DOCKERHUB_REPOSITORY }}:${{ steps.version.outputs.sha }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          api_key = os.environ["RUNPOD_API_KEY"]
+          template_id = os.environ["RUNPOD_TEMPLATE_ID"]
+          image_name = os.environ["IMAGE_NAME"]
+
+          base_url = "https://rest.runpod.io/v1/templates"
+
+          headers = {
+              "Authorization": f"Bearer {api_key}",
+              "Content-Type": "application/json",
+          }
+
+          # 現在のTemplateを取得する。
+          request = urllib.request.Request(
+              f"{base_url}/{template_id}",
+              headers=headers,
+          )
+
+          with urllib.request.urlopen(request, timeout=30) as response:
+              current = json.load(response)
+
+          # RunPod Templateの現在値を維持し、
+          # imageNameだけを新しいimmutable tagへ変更する。
+          fields = (
+              "containerDiskInGb",
+              "containerRegistryAuthId",
+              "dockerEntrypoint",
+              "dockerStartCmd",
+              "env",
+              "imageName",
+              "isPublic",
+              "name",
+              "ports",
+              "readme",
+              "volumeInGb",
+              "volumeMountPath",
+          )
+
+          payload = {
+              key: current[key]
+              for key in fields
+              if key in current and current[key] is not None
+          }
+
+          payload["imageName"] = image_name
+
+          data = json.dumps(
+              payload,
+              separators=(",", ":"),
+          ).encode("utf-8")
+
+          request = urllib.request.Request(
+              f"{base_url}/{template_id}/update",
+              data=data,
+              headers=headers,
+              method="POST",
+          )
+
+          with urllib.request.urlopen(request, timeout=30) as response:
+              updated = json.load(response)
+
+          if updated.get("imageName") != image_name:
+              raise RuntimeError(
+                  "RunPod template update returned an unexpected imageName"
+              )
+
+          print(
+              f"RunPod template {template_id} updated to {image_name}"
+          )
+          PY
+
+      - name: Deployment summary
+        run: |
+          echo "### Docker / RunPod deployment" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Commit: \`${{ steps.version.outputs.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Short SHA: \`${{ steps.version.outputs.short_sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Docker image: \`${{ vars.DOCKERHUB_USERNAME }}/${{ vars.DOCKERHUB_REPOSITORY }}:${{ steps.version.outputs.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Also published: \`:latest\`" >> "$GITHUB_STEP_SUMMARY"
